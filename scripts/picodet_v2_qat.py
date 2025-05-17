@@ -22,6 +22,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 
 # ───────────────────── reproducibility ────────────────────────
 SEED = 42
+IMG_SIZE = 224
 random.seed(SEED); torch.manual_seed(SEED)
 warnings.filterwarnings("ignore", category=UserWarning)
 
@@ -113,7 +114,7 @@ class PicoDetHead(nn.Module):
 
     # —— inference path ————————————————————————————————
     def _inference(self, cls_logits,obj_logits,reg_logits):
-        boxes,scores,labels = [],[],[]
+        boxes, scores, _ = [],[],[]
         for lv,(cl,ob,rg) in enumerate(zip(cls_logits,obj_logits,reg_logits)):
             s = self.strides[lv]
             B,C,H,W = cl.shape
@@ -175,7 +176,7 @@ def get_backbone(arch:str, ckpt:str):
             weights=tvm.MobileNet_V3_Small_Weights.IMAGENET1K_V1 if pretrained else None,
             width_mult=1.0, dropout=0.0
         )
-        feat_chs = (40,112,160)
+        feat_chs = (16, 40, 576)
     else:                       # mobilenet-v4 conv-small / medium
         import timm
         name = {"mnv4s":"mobilenetv4_conv_small",
@@ -183,6 +184,7 @@ def get_backbone(arch:str, ckpt:str):
         net = timm.create_model(name, pretrained=pretrained, num_classes=0,
                                 drop_rate=0.0, drop_path_rate=0.0)
         feat_chs = (40,112,160)        # same C3,C4,C5 dims
+    print(f"Using feature channels for {arch}: {feat_chs}")
     if ckpt is not None:
         net.load_state_dict(torch.load(ckpt, map_location="cpu"), strict=False)
     return net, feat_chs
@@ -190,7 +192,7 @@ def get_backbone(arch:str, ckpt:str):
 # ---------- 7.  Full detector -------------------------------------------------------
 class ResizeNorm(nn.Module):
     """Put resize + mean/std norm inside the exported graph."""
-    def __init__(self, size=(640,640)):
+    def __init__(self, size=(IMG_SIZE, IMG_SIZE)):
         super().__init__()
         self.size = size
         mean = torch.tensor([0.485,0.456,0.406]).view(1,3,1,1)
@@ -205,12 +207,12 @@ class ResizeNorm(nn.Module):
 class PicoDet(nn.Module):
     def __init__(self, backbone:nn.Module, feat_chs:Tuple[int,int,int], ncls=80):
         super().__init__()
-        self.pre = ResizeNorm()        # 640×640
+        self.pre = ResizeNorm()
         self.backbone = backbone
         self.neck = CSPPAN(feat_chs)
         self.head = PicoDetHead(ncls)
 
-    def forward(self,x):
+    def old_forward(self,x):
         x = self.pre(x)
         feats, h = [], x
         for i,(name,l) in enumerate(self.backbone.features._modules.items()):
@@ -219,19 +221,62 @@ class PicoDet(nn.Module):
         p3,p4,p5 = self.neck(*feats)
         return self.head((p3,p4,p5))
 
+    def forward(self,x):
+        x = self.pre(x)
+        feats, h = [], x
+        feature_layer_names = {"3","6","14"} # Changed from {"3","6","12"}
+        for i,(name,l) in enumerate(self.backbone.features._modules.items()):
+            h = l(h)
+            if name in feature_layer_names:
+                feats.append(h)
+
+        p3,p4,p5 = self.neck(*feats)
+        return self.head((p3,p4,p5))
+
 # ---------- 8.  Dataset / Dataloader ------------------------------------------------
+import torchvision.transforms.functional as F_tv # Import functional transforms
+
 def build_transforms(train):
-    tf = [T_v2.ToDtype(torch.float32, scale=True)]
+    tf = []
     if train:
-        tf.insert(0, T_v2.RandomHorizontalFlip())
-        tf.insert(0, T_v2.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1))
+        # These V2 transforms operate on PIL Images
+        tf.append(T_v2.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1))
+        tf.append(T_v2.RandomHorizontalFlip())
+        tf.append(T_v2.Resize((IMG_SIZE, IMG_SIZE), antialias=True))
+    if not tf:
+        # Add a dummy transform if no training-specific transforms were added
+        tf.append(T_v2.Resize((IMG_SIZE, IMG_SIZE), antialias=True))
+        tf.append(T_v2.Lambda(lambda x: x))
+    # Do NOT add Tensor conversion V2 transforms here.
+    # The output of this Compose will be a Pillow Image if transforms were applied,
+    # or the original Pillow Image if tf is empty.
     return T_v2.Compose(tf)
 
-def collate(b): imgs,tg=zip(*b); return torch.stack(imgs), list(tg)
+def collate(b):
+    # b is a list of tuples: [(img1, target1), (img2, target2), ...]
+    # img is a PIL Image because build_transforms returns a Compose that
+    # operates on/passes through PIL Images.
+    imgs, tg = zip(*b)
+
+    # Manually convert each PIL Image to a float32 Tensor scaled [0, 1]
+    img_tensors = []
+    for img in imgs:
+        # Convert PIL to uint8 Tensor (C, H, W), range [0, 255]
+        img_tensor_uint8 = F_tv.pil_to_tensor(img)
+        # Convert uint8 Tensor to float32 Tensor, range [0, 1]
+        img_tensor_float32 = F_tv.convert_image_dtype(img_tensor_uint8, dtype=torch.float32)
+        img_tensors.append(img_tensor_float32)
+
+    # Stack the float Tensors into a batch
+    stacked_imgs = torch.stack(img_tensors)
+
+    return stacked_imgs, list(tg)
 
 def get_loader(root, split, bsz, workers):
     ann_file=f"{root}/annotations/instances_{split}2017.json"
     imgs_dir=f"{root}/{split}2017"
+    # Pass the transform pipeline to CocoDetection. It will apply these
+    # transforms to the loaded PIL Image.
     ds = tvsets.CocoDetection(imgs_dir, ann_file, transform=build_transforms(split=="train"))
     return DataLoader(ds, bsz, split=="train", collate_fn=collate,
                       num_workers=workers, pin_memory=True, persistent_workers=bool(workers))
@@ -373,12 +418,12 @@ def qat_prepare(model, example):
 # ----------13.  Main ----------------------------------------------------------------
 def main(argv:List[str]|None=None):
     pa=argparse.ArgumentParser()
-    pa.add_argument("--coco_root", required=True)
-    pa.add_argument("--backbone_ckpt", default=None, required=True)
-    pa.add_argument("--arch", choices=["mnv3","mnv4s","mnv4m"], default="mnv4s")
+    pa.add_argument("--coco_root", default="/Volumes/T7 Shield/img_data/coco")
+    pa.add_argument("--backbone_ckpt", default=None)
+    pa.add_argument("--arch", choices=["mnv3","mnv4s","mnv4m"], default="mnv3")
     pa.add_argument("--epochs", type=int, default=120)
     pa.add_argument("--batch", type=int, default=32)
-    pa.add_argument("--workers", type=int, default=4)
+    pa.add_argument("--workers", type=int, default=0)
     pa.add_argument("--freeze", type=int, default=4, help="freeze first N backbone stages")
     pa.add_argument("--device", default="cuda")
     pa.add_argument("--out", default="picodet_int8_nms.onnx")
@@ -407,7 +452,7 @@ def main(argv:List[str]|None=None):
         print(f"Epoch {ep+1}/{cfg.epochs}  loss{l:.3f}  IoU{m:.3f}")
 
     # —— QAT fine-tune (no AMP) ————————————————————————
-    example=torch.rand(1,3,640,640)
+    example=torch.rand(1, 3, IMG_SIZE, IMG_SIZE)
     qat=qat_prepare(model, example).to(dev).train()
     opt_q=SGD(qat.parameters(),lr=0.004,momentum=0.9,weight_decay=1e-5)
     scaler_q=torch.amp.GradScaler(enabled=False)
