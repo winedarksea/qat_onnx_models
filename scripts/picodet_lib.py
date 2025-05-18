@@ -69,13 +69,13 @@ class CSPPAN(nn.Module):
     def forward(self, c3, c4, c5):
         # top-down ------------------------------------------------------------
         p5 = self.reduce[2](c5)                               # stride 32
-        print(f"Shape of c5: {c5.shape}")
-        print(f"Shape of p5 (after reduce[2]): {p5.shape}")
+        # print(f"Shape of c5: {c5.shape}")
+        # print(f"Shape of p5 (after reduce[2]): {p5.shape}")
         reduced_c4 = self.reduce[1](c4)
-        print(f"Shape of c4: {c4.shape}")
-        print(f"Shape of reduced_c4 (self.reduce[1](c4)): {reduced_c4.shape}")
+        # print(f"Shape of c4: {c4.shape}")
+        # print(f"Shape of reduced_c4 (self.reduce[1](c4)): {reduced_c4.shape}")
         interpolated_p5 = F.interpolate(p5, scale_factor=2, mode='nearest')
-        print(f"Shape of interpolated_p5: {interpolated_p5.shape}")
+        # print(f"Shape of interpolated_p5: {interpolated_p5.shape}")
         # p4 = self.reduce[1](c4) + F.interpolate(p5, 2, mode='nearest')  # s16
         p4 = reduced_c4 + interpolated_p5
         # p3 = self.reduce[0](c3) + F.interpolate(p4, 2, mode='nearest')  # s8
@@ -155,10 +155,40 @@ class PicoDetHead(nn.Module):
 
     # -------------------------- helpers --------------------------
     def _dfl_to_ltrb(self, x: torch.Tensor):
-        B, _, H, W = x.shape; M = self.reg_max
-        x = x.view(B, 4, M + 1, H, W).softmax(2)
-        proj = torch.arange(M + 1, device=x.device, dtype=x.dtype)
-        return (x * proj).sum(2)
+        # x input shape: (B, 4*(self.reg_max+1), H, W)
+        # e.g. (251, 32, 1, 1)
+        B, C_in, H, W = x.shape 
+        M = self.reg_max
+        
+        # Expected C_in is 4 * (M+1)
+        # print(f"[_dfl_to_ltrb DEBUG] Input x shape: {x.shape}, B={B}, C_in={C_in}, H={H}, W={W}, M={M}")
+
+        # Reshape to (B, 4, M+1, H, W)
+        x_reshaped = x.view(B, 4, M + 1, H, W)
+        # print(f"[_dfl_to_ltrb DEBUG] x_reshaped shape: {x_reshaped.shape}")
+
+        x_softmax = x_reshaped.softmax(dim=2) # Softmax over M+1 dimension
+        # print(f"[_dfl_to_ltrb DEBUG] x_softmax shape: {x_softmax.shape}")
+
+        proj = torch.arange(M + 1, device=x.device, dtype=x.dtype) # Shape (M+1,)
+        # print(f"[_dfl_to_ltrb DEBUG] proj shape: {proj.shape}, values: {proj}")
+
+        # Explicitly reshape proj for broadcasting
+        # Target shape for proj to broadcast with x_softmax: (1, 1, M+1, 1, 1)
+        proj_reshaped = proj.view(1, 1, M + 1, 1, 1)
+        # print(f"[_dfl_to_ltrb DEBUG] proj_reshaped shape: {proj_reshaped.shape}")
+        
+        # Multiply and sum
+        # (B, 4, M+1, H, W) * (1, 1, M+1, 1, 1) -> (B, 4, M+1, H, W)
+        weighted_sum_components = x_softmax * proj_reshaped
+        # print(f"[_dfl_to_ltrb DEBUG] weighted_sum_components shape: {weighted_sum_components.shape}")
+
+        # Sum over the M+1 dimension (dim=2)
+        # (B, 4, M+1, H, W) -> sum(dim=2) -> (B, 4, H, W)
+        out = weighted_sum_components.sum(dim=2)
+        # print(f"[_dfl_to_ltrb DEBUG] Output out shape: {out.shape}, numel: {out.numel()}")
+        
+        return out
 
     # ------------------------- inference -------------------------
     def _inference_single(self, feats_out: Tuple[torch.Tensor, ...]):
