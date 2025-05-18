@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-MobileNetV3-Small → QAT → INT8 ONNX (opset-18, full pipeline).
+MobileNetV3-Small → QAT → INT8 ONNX (opset-17, full pipeline).
 
 Generally tested on pytorch 2.7.0 (pip installed), CUDA 12.8 (mamba installed first with onnxruntime)
 """
@@ -21,6 +21,7 @@ from torch.utils.data import DataLoader
 from torch.amp import autocast
 
 # FX QAT imports
+import torch.nn.functional as F
 from torch.ao.quantization import get_default_qat_qconfig_mapping, QConfig
 from torch.ao.quantization.observer import MovingAveragePerChannelMinMaxObserver
 from torch.ao.quantization.quantize_fx import prepare_qat_fx as prepare_qat_fx_torch, convert_fx as convert_fx_torch
@@ -101,7 +102,7 @@ def get_backbone(arch: str, ncls: int, width: float,
             weights=tvm.MobileNet_V3_Small_Weights.IMAGENET1K_V1 if pretrained else None,
             width_mult=width, dropout=drop_rate)
         model.classifier[3] = nn.Linear(model.classifier[3].in_features, ncls)
-    if arch == "mnv2":
+    elif arch == "mnv2":
         # build the backbone
         model = tvm.mobilenet_v2(
             weights=tvm.MobileNet_V2_Weights.IMAGENET1K_V2 if pretrained else None,
@@ -129,8 +130,8 @@ def get_backbone(arch: str, ncls: int, width: float,
 
 def build_model(
         ncls, width_mult_val, dev, arch="mnv3",
-        pretrained: bool=False, drop_rate: float = 0.20,
-        drop_path_rate: float = 0.075,
+        pretrained: bool=False, drop_rate: float = 0.2,  # 0.20
+        drop_path_rate: float = 0.0,  # 0.075
     ):
     backbone = get_backbone(arch, ncls, width=width_mult_val,
                         pretrained=pretrained,
@@ -189,189 +190,127 @@ def get_qat_model_fx(model_fp32_cpu: nn.Module, example_inputs_cpu: tuple):
     prepared_model = prepare_qat_fx_torch(model_fp32_cpu, qconfig_mapping, example_inputs_cpu)
     return prepared_model
 
-# ───────────────────────────── main ─────────────────────────────
-def main(argv: List[str] | None = None):
-    p = argparse.ArgumentParser()
-    p.add_argument("--data_dir", default="filtered_imagenet2_native")
-    p.add_argument("--epochs", type=int, default=5)
-    p.add_argument("--qat_epochs", type=int, default=5)
-    p.add_argument("--batch", type=int, default=64)
-    p.add_argument("--lr", type=float, default=0.025)
-    p.add_argument("--qat_lr_factor", type=float, default=0.05)
-    p.add_argument("--width_mult", type=float, default=1.0)
-    p.add_argument("--device", default=None)
-    p.add_argument("--compile", action="store_true", help="Compile the final INT8 model with torch.compile.")
-    p.add_argument("--arch", default="mnv4s", choices=["mnv3", "mnv4s", "mnv4m"], help="Backbone: MobileNet-V3-Small, V4-Conv-Small, V4-Conv-Medium")
-    p.add_argument("--pretrained", default=True, action="store_true", help="Load ImageNet-1k weights if available (timm & torchvision).")
-    cfg = p.parse_args(argv); print(cfg)
+data_dir: str = "filtered_imagenet2_native"
+epochs: int = 5
+qat_epochs: int = 3
+batch: int = 64
+lr: float = 0.025
+qat_lr_factor: float = 0.05
+width_mult: float = 1.0
+device = None
+compile_model: bool = False
+arch: str = "mnv3"  # mnv4m, mnv3, mnv2, mnv4s
+pretrained: bool = True
 
-    if cfg.device is None:
-        cfg.device = "cuda" if torch.cuda.is_available() else (
-            "mps" if torch.backends.mps.is_available() else "cpu")
-    if cfg.device == "mps": os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
-    dev = torch.device(cfg.device); print(f"[INFO] device: {dev}")
+if device is None:
+    device = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
+if device == "mps":
+    os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+dev = torch.device(device)
+print(f"[INFO] device: {dev}")
 
-    # set export name
-    pretrain = "_pretrained" if cfg.pretrained else ""
-    pt_path = f"mobilenet_w{cfg.width_mult}_{cfg.arch}{pretrain}_int8_fullpipe.pt"
+pretrain_str = "_pretrained" if pretrained else ""
+pt_path = f"mobilenet_w{str(width_mult).replace('.', '_')}_{arch}{pretrain_str}_int8_fullpipe.pt"
 
-    with open(Path(cfg.data_dir) / "class_mapping.json") as f:
-        ncls = len(json.load(f)); print(f"[INFO] #classes = {ncls}")
+with open(Path(data_dir) / "class_mapping.json") as f:
+    ncls = len(json.load(f)); print(f"[INFO] #classes = {ncls}")
+print(f"[INFO] #classes = {ncls}")
 
-    # MODIFIED: Calls to get_loader simplified
-    tr = get_loader(cfg.data_dir, cfg.batch, True, dev)
-    vl = get_loader(cfg.data_dir, cfg.batch, False, dev)
+tr = get_loader(data_dir, batch, True, dev)
+vl = get_loader(data_dir, batch, False, dev)
 
-    model = build_model(ncls, cfg.width_mult, dev, arch=cfg.arch, pretrained=cfg.pretrained)
+model = build_model(ncls, width_mult, dev, arch=arch, pretrained=pretrained)
 
-    crit = nn.CrossEntropyLoss(label_smoothing=0.1)
-    scaler = torch.amp.GradScaler() if dev.type == "cuda" else torch.amp.GradScaler(enabled=False)
-    if False:
-        # mobilenet v4 conv medium hyperparameters from paper
-        lr = 0.004
-        opt = optim.AdamW(
-            model.parameters(),
-            lr=lr,
-            betas=(0.9, 0.999),
-            eps=1e-7,
-            weight_decay=0.1
-        )
-        from timm.scheduler import CosineLRScheduler
-        sched = CosineLRScheduler(
-            opt,
-            t_initial= 500 - 5,
-            lr_min=0.0,
-            warmup_t=5,
-            warmup_lr_init=lr * 0.1,   # linear warm-up
-        )
-        cfg.epochs = 505
-    else:
-        opt  = optim.SGD(model.parameters(), lr=cfg.lr, momentum=0.9, weight_decay=1e-4)
-        sched= CosineAnnealingLR(opt, T_max=cfg.epochs, eta_min=cfg.lr*0.01)
+crit = nn.CrossEntropyLoss(label_smoothing=0.1)
+scaler = torch.amp.GradScaler() if dev.type == "cuda" else torch.amp.GradScaler(enabled=False)
 
-    print("[INFO] Starting FP32 training...")
-    for ep in range(cfg.epochs):
-        l = train_epoch(model, tr, crit, opt, scaler, dev, ep, qat_mode_active=False)
-        a = evaluate(model, vl, dev); sched.step() # This call should now work
-        print(f"Epoch {ep+1}/{cfg.epochs}  loss {l:.4f}  val@1 {a*100:.2f}%  lr {opt.param_groups[0]['lr']:.5f}")
+opt = optim.SGD(model.parameters(), lr=lr, momentum=0.9, weight_decay=1e-4)
+sched = CosineAnnealingLR(opt, T_max=epochs, eta_min=lr * 0.01)
 
-    print("[INFO] Extracting FP32 backbone state_dict...")
+print("[INFO] Starting FP32 training...")
+for ep in range(epochs):
+    l = train_epoch(model, tr, crit, opt, scaler, dev, ep, qat_mode_active=False)
+    a = evaluate(model, vl, dev)
+    sched.step()
+    print(f"Epoch {ep+1}/{epochs}  loss {l:.4f}  val@1 {a*100:.2f}%  lr {opt.param_groups[0]['lr']:.5f}")
+
+print("[INFO] Extracting FP32 backbone state_dict...")
+try:
+    fp32_backbone_state_dict = {}
+    model.cpu()
+    full_sd = model.state_dict()
+
+    key_prefix = "2.classifier." if arch in ["mnv3", "mnv2"] else "2.head." if arch in ["mnv4s", "mnv4m"] else None
+    backbone_prefix = "2."
+
+    if key_prefix:
+        for k, v in full_sd.items():
+            if k.startswith(backbone_prefix) and not k.startswith(key_prefix):
+                fp32_backbone_state_dict[k[len(backbone_prefix):]] = v
+        if fp32_backbone_state_dict:
+            bpath = f"{pt_path}_fp32_backbone.pt"
+            Path(bpath).parent.mkdir(parents=True, exist_ok=True)
+            torch.save(fp32_backbone_state_dict, bpath)
+            print(f"[SAVE] FP32 PyTorch backbone state_dict → {bpath}")
+except Exception as e:
+    print("failed to export fp32 backbone: " + repr(e))
+
+print("[INFO] Preparing model for QAT...")
+qat_train_device = torch.device("cpu") if dev.type == "mps" else dev
+# patch to remove dropout
+_orig_dropout = F.dropout
+F.dropout = lambda x, p=0.0, training=False, inplace=False: x
+model_fp32_cpu = model.cpu()
+remove_dropout(model_fp32_cpu)
+example_inputs_cpu = (torch.randint(0, 256, (1, 3, DUMMY_H, DUMMY_W), dtype=torch.uint8),)
+qat_prepared_model = get_qat_model_fx(model_fp32_cpu, example_inputs_cpu)
+# ✅ Restore F.dropout so that actual QAT training uses real dropout (if needed)
+F.dropout = _orig_dropout
+qat_model = qat_prepared_model.to(qat_train_device)
+opt_q = optim.SGD(qat_model.parameters(), lr=lr * qat_lr_factor, momentum=0.9)
+
+print(f"[INFO] Starting QAT fine-tuning on {qat_train_device}")
+for qep in range(qat_epochs):
+    l_q = train_epoch(qat_model, tr, crit, opt_q, scaler, qat_train_device, qep, qat_mode_active=True)
+    val_acc_q = evaluate(qat_model, vl, qat_train_device)
+    print(f"[QAT] Epoch {qep+1}/{qat_epochs} loss {l_q:.4f} val@1 {val_acc_q*100:.2f}%")
+
+print("[INFO] Converting QAT model to INT8")
+qat_model.cpu().eval()
+int8_model_final = convert_fx_torch(qat_model)
+
+if compile_model:
+    print("[INFO] Compiling INT8 model with torch.compile...")
     try:
-        fp32_full_state_dict = model.cpu().state_dict() # Ensure on CPU for saving
-        fp32_backbone_state_dict = {}
-    
-        # this can be expanded with more automated introspection but fine for this set of archs
-        if cfg.arch in ["mnv3", "mnv2"]:
-            # torchvision MobileNetV3 classifier is usually named `classifier`
-            classifier_key_start = "2.classifier."
-        elif cfg.arch in {"mnv4s", "mnv4m"}:
-            # timm MobileNetV4 conv head is usually named `head`
-            classifier_key_start = "2.head."
-        else:
-            print(f"[WARN] Unknown architecture '{cfg.arch}', skipping FP32 backbone extraction.")
-    
-        if classifier_key_start:
-            # The prefix for the actual backbone module within the Sequential model's state dict keys
-            backbone_prefix = "2."
-            for key, value in fp32_full_state_dict.items():
-                # AND does *not* belong to the classifier/head module within the backbone
-                if key.startswith(backbone_prefix) and not key.startswith(classifier_key_start):
-                    # Remove the '2.' prefix from the key, match the keys of a standalone backbone module.
-                    fp32_backbone_state_dict[key[len(backbone_prefix):]] = value
-    
-            # Check if any backbone keys were successfully extracted
-            if fp32_backbone_state_dict:
-                fp32_backbone_pt_path = f"{pt_path}_fp32_backbone.pt"
-                Path(fp32_backbone_pt_path).parent.mkdir(parents=True, exist_ok=True)
-                torch.save(fp32_backbone_state_dict, fp32_backbone_pt_path)
-                print(f"[SAVE] FP32 PyTorch backbone state_dict → {fp32_backbone_pt_path}")
-            else:
-                print("[WARN] No FP32 backbone keys found after filtering. FP32 backbone state_dict not saved.")
-        else:
-            print("[INFO] FP32 backbone state_dict not saved due to unknown architecture or no keys found.")
+        base_model = int8_model_final.module() if hasattr(int8_model_final, 'module') else int8_model_final
+        int8_model_final = torch.compile(base_model.cpu(), mode="reduce-overhead")
     except Exception as e:
-        print("failed to export fp32 backbone" + repr(e))
+        print(f"[WARN] torch.compile() failed – {e}")
 
-    print("[INFO] Preparing model for QAT...")
-    qat_train_device = torch.device("cpu") if dev.type == "mps" else dev
-    model_for_qat_prep = model
-    model_fp32_cpu = model_for_qat_prep.cpu()
+final_model_state = int8_model_final.module() if hasattr(int8_model_final, 'module') else int8_model_final
+torch.save(final_model_state.cpu().state_dict(), pt_path)
+print(f"[SAVE] INT8 PyTorch model state_dict → {pt_path}")
 
-    example_inputs_cpu = (torch.randint(0, 256, (1, 3, DUMMY_H, DUMMY_W), dtype=torch.uint8),)
+onnx_path = pt_path.replace(".pt", ".onnx")
+print(f"[INFO] Exporting INT8 model to ONNX: {onnx_path}")
+dummy_input_onnx_cpu = torch.randint(0, 256, (1, 3, IMG_SIZE, IMG_SIZE), dtype=torch.uint8)
+model_for_export = int8_model_final.cpu().eval()
 
-    remove_dropout(model_fp32_cpu)
-    qat_prepared_model = get_qat_model_fx(model_fp32_cpu, example_inputs_cpu)
+try:
+    torch.onnx.export(
+        model_for_export,
+        (dummy_input_onnx_cpu,),
+        onnx_path,
+        input_names=["input_u8"],
+        output_names=["logits"],
+        dynamic_axes={"input_u8": {0: "batch", 2: "height", 3: "width"}, "logits": {0: "batch"}},
+        opset_version=17,
+        do_constant_folding=True
+    )
+    print(f"[SAVE] INT8 ONNX model → {onnx_path}")
+except Exception as e:
+    print(f"[ERROR] ONNX export failed: {repr(e)}")
+    import traceback
+    traceback.print_exc()
 
-
-    qat_model = qat_prepared_model.to(qat_train_device)
-    opt_q = optim.SGD(qat_model.parameters(), lr=cfg.lr * cfg.qat_lr_factor, momentum=0.9)
-
-    print(f"[INFO] Starting QAT fine-tuning on {qat_train_device}")
-    for qep in range(cfg.qat_epochs):
-        l_q = train_epoch(qat_model, tr, crit, opt_q, scaler, qat_train_device, qep, qat_mode_active=True)
-        val_acc_q = evaluate(qat_model, vl, qat_train_device)
-        print(f"[QAT] Epoch {qep+1}/{cfg.qat_epochs} loss {l_q:.4f} val@1 {val_acc_q*100:.2f}%")
-
-    print("[INFO] Converting QAT model to INT8")
-    qat_model.cpu().eval()
-    int8_model_final = convert_fx_torch(qat_model)
-
-
-    if cfg.compile:
-        print("[INFO] Compiling INT8 model with torch.compile...")
-        try:
-            model_to_compile = int8_model_final.module() if hasattr(int8_model_final, 'module') else int8_model_final
-            compiled_module = torch.compile(model_to_compile.cpu(), mode="reduce-overhead")
-            if hasattr(int8_model_final, 'module'):
-                print("[WARN] Post-QAT compilation with PT2E resulted in an nn.Module. Subsequent ONNX export will use this module.")
-                int8_model_final = compiled_module
-            else:
-                int8_model_final = compiled_module
-            print("[INFO] INT8 model compiled.")
-        except Exception as e:
-            print(f"[WARN] torch.compile() on INT8 model failed – {e}")
-
-    model_to_save_state = int8_model_final.module() if hasattr(int8_model_final, 'module') else int8_model_final
-    torch.save(model_to_save_state.cpu().state_dict(), pt_path)
-    print(f"[SAVE] INT8 PyTorch model state_dict → {pt_path}")
-
-    onnx_path = pt_path.replace(".pt", ".onnx")
-    print(f"[INFO] Exporting INT8 model to ONNX: {onnx_path}")
-    dummy_input_onnx_cpu = example_inputs_cpu[0].cpu()
-    model_for_export = int8_model_final
-    args_for_onnx_export = (dummy_input_onnx_cpu,)
-
-    if hasattr(model_for_export, 'graph_signature'): # It's an ExportedProgram
-        dummy_input_onnx_imgsize_cpu = torch.randint(0, 256, (1, 3, IMG_SIZE, IMG_SIZE), dtype=torch.uint8).cpu()
-        args_for_onnx_export = (dummy_input_onnx_imgsize_cpu,)
-        # If using ep.example_inputs: args_for_onnx_export = None if model_for_export.example_inputs else (dummy_input_onnx_imgsize_cpu,)
-    else: # nn.Module
-        model_for_export = model_for_export.cpu().eval()
-        dummy_input_onnx_imgsize_cpu = torch.randint(0, 256, (1, 3, IMG_SIZE, IMG_SIZE), dtype=torch.uint8).cpu()
-        args_for_onnx_export = (dummy_input_onnx_imgsize_cpu,)
-
-
-    dynamic_axes_onnx = {"input_u8": {0: "batch", 2: "height", 3: "width"}, "logits": {0: "batch"}}
-    try:
-        print(f"[INFO] Exporting to ONNX opset 17 from {'ExportedProgram' if hasattr(model_for_export, 'graph_signature') else 'nn.Module'}...")
-        torch.onnx.export(
-            model_for_export,
-            args_for_onnx_export, # Provide appropriately sized dummy input
-            onnx_path,
-            input_names=["input_u8"],
-            output_names=["logits"],
-            dynamic_axes=dynamic_axes_onnx,
-            opset_version=17,
-            do_constant_folding=True,
-            verbose=False
-        )
-        print(f"[SAVE] INT8 ONNX model → {onnx_path}")
-    except Exception as e:
-        print(f"[ERROR] ONNX export failed: {repr(e)}")
-        import traceback
-        traceback.print_exc()
-
-    print("[DONE]")
-
-if __name__ == "__main__":
-    main()
+print("[DONE]")
