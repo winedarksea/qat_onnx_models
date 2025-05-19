@@ -64,10 +64,10 @@ def get_loader(root_dir: str, batch_size: int, is_train: bool):
                       prefetch_factor=pf, drop_last=False) # Don't drop last batch for evaluation
 
 # ───────────────────────────── main ─────────────────────────────
-onnx_path = "mobilenetv3_w0.75_fx_int8_fullpipe.onnx"  # "mobilenetv3_w0.75_int8.onnx"
+onnx_path = "mobilenet_w1_0_mnv4s_pretrained_int8_fullpipe.onnx"  # "mobilenetv3_w0.75_int8.onnx"
 data_dir = "filtered_imagenet2_native"
 batch = 1
-provider = "CPUExecutionProvider",  # CPUExecutionProvider, CUDAExecutionProvider, DmlExecutionProvider
+provider = "CPUExecutionProvider"  # CPUExecutionProvider, CUDAExecutionProvider, DmlExecutionProvider
 
 if not os.path.exists(onnx_path):
     print(f"[ERROR] ONNX model not found at {onnx_path}")
