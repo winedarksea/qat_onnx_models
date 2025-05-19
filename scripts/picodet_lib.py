@@ -246,7 +246,7 @@ class PicoDetHead(nn.Module):
         return self._inference_single((cls_ls, obj_ls, reg_ls))
 
 # ──────────────────────── preprocess wrapper ──────────────────────
-class ResizeNorm(nn.Module):
+class ResizeNormOLD(nn.Module):
     def __init__(self, size: Tuple[int, int] = (224, 224)):
         super().__init__()
         self.size = size
@@ -259,6 +259,26 @@ class ResizeNorm(nn.Module):
         if x.shape[-2:] != self.size:
             x = F.interpolate(x, self.size, mode='bilinear', align_corners=False)
         return (x.float() / 255. - self.m) / self.s
+
+class ResizeNorm(nn.Module):
+    def __init__(self, size: Tuple[int, int], mean: Tuple[float, ...] = (0.485, 0.456, 0.406),
+                 std: Tuple[float, ...] = (0.229, 0.224, 0.225)):
+        super().__init__()
+        self.size = tuple(size) # e.g., (IMG_SIZE, IMG_SIZE)
+        # Register m and s as buffers so they are moved to device with the model
+        # and included in state_dict.
+        self.register_buffer('m', torch.tensor(mean).view(1, 3, 1, 1))
+        self.register_buffer('s', torch.tensor(std).view(1, 3, 1, 1))
+
+    def forward(self, x: torch.Tensor):
+        # FX-friendly: always interpolate to the target self.size.
+        # If input x is already self.size, F.interpolate is often a no-op or very fast.
+        # Using antialias=True is generally recommended for better image quality during resizing.
+        # It might require a newer PyTorch version. If it causes issues, you can remove it.
+        x = F.interpolate(x, self.size, mode='bilinear', align_corners=False, antialias=True) 
+        
+        # Normalization
+        return (x.float() / 255.0 - self.m) / self.s
 
 # ───────────────────────── backbone util ──────────────────────────
 from torchvision.models.feature_extraction import create_feature_extractor

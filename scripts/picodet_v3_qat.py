@@ -12,10 +12,14 @@ from torch.utils.data import DataLoader, Subset
 from torch.optim import SGD
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
-from picodet_lib import (
-    PicoDet, get_backbone, VarifocalLoss, dfl_loss,
-    build_dfl_targets
-)
+try: 
+    from picodet_lib import (
+        PicoDet, get_backbone, VarifocalLoss, dfl_loss,
+        build_dfl_targets
+    )
+except Exception:
+    # when running manually in console, these are already loaded
+    pass
 
 warnings.filterwarnings('ignore', category=UserWarning)
 SEED = 42; random.seed(SEED); torch.manual_seed(SEED)
@@ -301,10 +305,37 @@ def train_epoch(model: PicoDet, loader, opt, scaler, assigner: SimOTACache,
             joint_logits_fg = cls_p_fg + obj_p_fg.unsqueeze(-1)
             loss_cls = VarifocalLoss()(joint_logits_fg, cls_targets_fg)
 
-            strides_all_anchors = torch.cat([torch.full(((IMG_SIZE // s_val) ** 2,), float(s_val), device=device) for H_lvl, W_lvl, s_val in fmap_shapes], dim=0)
-            strides_fg = strides_all_anchors[fg_mask]
+            # strides_all_anchors = torch.cat([torch.full(((IMG_SIZE // s_val) ** 2,), float(s_val), device=device) for H_lvl, W_lvl, s_val in fmap_shapes], dim=0)
+            # strides_fg = strides_all_anchors[fg_mask]
+            # --- Corrected strides_all_anchors construction ---
+            strides_tensor_list = []
+            for H_level, W_level, s_level_val in fmap_shapes:
+                num_anchors_this_level = H_level * W_level
+                strides_tensor_list.append(
+                    torch.full((num_anchors_this_level,), float(s_level_val), device=device)
+                )
+            strides_all_anchors = torch.cat(strides_tensor_list, dim=0)
+            # Now, len(strides_all_anchors) will be sum(H_level * W_level) from fmap_shapes,
+            # which *must* match len(fg_mask) from SimOTACache because both use the same H_level, W_level.
+            
+            # fg_mask comes from assigner, and assigner uses fmap_shapes.
+            # Its length is A = sum of (H*W for each level in fmap_shapes).
+            # The new strides_all_anchors also has length A.
+            # So, strides_all_anchors[fg_mask] should now work.
+            if strides_all_anchors.shape[0] != fg_mask.shape[0]:
+                print(f"[CRITICAL ERROR in train_epoch] Mismatch after strides_all_anchors correction!")
+                print(f"  strides_all_anchors.shape: {strides_all_anchors.shape}")
+                print(f"  fg_mask.shape: {fg_mask.shape}")
+                print(f"  fmap_shapes used for both: {fmap_shapes}")
+                # This should ideally not happen with the fix.
+                # Example values from error: fg_mask is 1029, strides_all_anchors was 336.
+                # After fix, strides_all_anchors should also be 1029.
+            
+            strides_fg = strides_all_anchors[fg_mask] # This line was failing
             
             target_offsets_for_dfl = (box_targets_fg / strides_fg.unsqueeze(-1)).clamp(min=0., max=model.head.reg_max - 1e-6)
+
+            # target_offsets_for_dfl = (box_targets_fg / strides_fg.unsqueeze(-1)).clamp(min=0., max=model.head.reg_max - 1e-6)
             dfl_target_dist = build_dfl_targets(target_offsets_for_dfl, model.head.reg_max)
             loss_dfl = dfl_loss(reg_p_fg, dfl_target_dist)
 
@@ -446,6 +477,33 @@ def qat_prepare(model: nn.Module, example: torch.Tensor):
     qmap = qmap.set_module_name('pre', None)
     return prepare_qat_fx(model.cpu(), qmap, (example,))
 
+def unwrap_dataset(ds):
+    while isinstance(ds, torch.utils.data.Subset):
+        ds = ds.dataset
+    return ds
+
+def warn_missing_categories(coco_api, subset_indices, base_dataset):
+    """
+    Warn if some COCO categories are not present in the subset.
+    
+    Parameters:
+    - coco_api: COCO object (from dataset.coco)
+    - subset_indices: indices into the base COCO dataset (not subset)
+    - base_dataset: unwrapped base dataset (CocoDetection)
+    """
+    full_cat_ids = set(coco_api.getCatIds())
+
+    # Collect category IDs actually used in the subset annotations
+    used_cat_ids = set()
+    for ds_idx in subset_indices:
+        _, anns = base_dataset[ds_idx]  # ← base_dataset is the full CocoDetection dataset
+        used_cat_ids.update(ann['category_id'] for ann in anns)
+
+    missing = full_cat_ids - used_cat_ids
+    if missing:
+        print(f"[WARNING] {len(missing)} COCO categories are not present in the selected subset:")
+        print(f"   Missing category IDs: {sorted(missing)}")
+
 # ───────────────────── main ─────────────────────────────────────
 def main(argv: List[str] | None = None):
     pa = argparse.ArgumentParser()
@@ -466,23 +524,23 @@ def main(argv: List[str] | None = None):
     backbone, feat_chs = get_backbone(cfg.arch, ckpt=None)
     model = PicoDet(backbone, feat_chs).to(dev)
 
-    tr_loader = get_loader(cfg.coco_root, 'train', cfg.batch, cfg.workers, subset_size=1000)
-    vl_loader = get_loader(cfg.coco_root, 'val', cfg.batch, cfg.workers, subset_size=100)
+    tr_loader = get_loader(cfg.coco_root, 'train', cfg.batch, cfg.workers, subset_size=1200)
+    vl_loader = get_loader(cfg.coco_root, 'val', cfg.batch, cfg.workers, subset_size=200)
 
-    # --- Create COCO label map ---
-    if hasattr(tr_loader.dataset, 'coco') and tr_loader.dataset.coco is not None:
-        coco_label_map = create_coco_contiguous_label_map(tr_loader.dataset.coco)
-        # Ensure the model's class count is appropriate for the mapped labels.
-        # If coco_label_map has K_map entries, model.head.nc should ideally be K_map.
-        # Or, if model.head.nc is fixed (e.g., 80 for standard COCO), then we only use
-        # annotations whose mapped label < model.head.nc.
-        # This is handled in train_epoch.
+    train_base_ds = unwrap_dataset(tr_loader.dataset)
+    # val_base_ds = unwrap_dataset(vl_loader.dataset)
+    if hasattr(train_base_ds, 'coco') and train_base_ds.coco is not None:
+        coco_label_map = create_coco_contiguous_label_map(train_base_ds.coco)
+    
+        if isinstance(tr_loader.dataset, torch.utils.data.Subset):
+            warn_missing_categories(train_base_ds.coco, tr_loader.dataset.indices, train_base_ds)
+
         if len(coco_label_map) != model.head.nc:
             print(f"[main WARNING] Number of categories in generated map ({len(coco_label_map)}) "
                   f"does not match model.head.nc ({model.head.nc}). "
                   "Annotations will be filtered in train_epoch if mapped label >= model.head.nc.")
     else:
-        raise RuntimeError("Could not access COCO API (tr_loader.dataset.coco) to create label map. "
+        raise RuntimeError("Could not access COCO API to create label map. "
                            "Ensure CocoDetection dataset is used and initialized correctly.")
 
     opt = SGD(model.parameters(), lr=0.02, momentum=0.9, weight_decay=5e-5)
@@ -528,3 +586,5 @@ def main(argv: List[str] | None = None):
 
 if __name__ == '__main__':
     main()
+
+# Epoch 5/5  loss 19.858  IoU 0.197
