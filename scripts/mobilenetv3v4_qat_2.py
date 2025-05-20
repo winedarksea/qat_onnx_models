@@ -99,8 +99,43 @@ def get_backbone(arch: str, ncls: int, width: float,
             weights=tvm.MobileNet_V2_Weights.IMAGENET1K_V2 if pretrained else None,
             width_mult=width,
         )
+        # For MobileNetV2, dropout is often part of the classifier block.
+        # Ensure the dropout rate from args is used if replacing.
+        # The torchvision model already has a Dropout layer if not pretrained or if default.
+        # If we want to control it precisely:
+        in_features = model.classifier[1].in_features
+        model.classifier = nn.Sequential(
+            nn.Dropout(p=drop_rate if drop_rate is not None else 0.2, inplace=True),
+            nn.Linear(in_features, ncls)
+        )
+    elif arch == "mnv2_OLD":
+        model = tvm.mobilenet_v2(
+            weights=tvm.MobileNet_V2_Weights.IMAGENET1K_V2 if pretrained else None,
+            width_mult=width,
+        )
         model.classifier[0] = nn.Dropout(p=drop_rate if drop_rate is not None else 0.2, inplace=True)
         model.classifier[1] = nn.Linear(model.classifier[1].in_features, ncls)
+    elif arch == "mnv2_other":
+        model = tvm.mobilenet_v2(
+            weights=tvm.MobileNet_V2_Weights.IMAGENET1K_V2 if pretrained else None,
+            width_mult=width_mult,
+        )
+        
+        # 1. Get the input features for the final linear layer
+        # The default classifier is Sequential(Dropout, Linear)
+        # The in_features for the Linear layer is at classifier[1].in_features
+        in_features = model.classifier[1].in_features
+        
+        # 2. Reconstruct the classification head with inplace=False for Dropout
+        # This is the most robust way when replacing the head for fine-tuning
+        new_classifier_layers = []
+        if drop_rate is not None and drop_rate > 0.0:
+            # Use inplace=False explicitly for better tracing compatibility
+            new_classifier_layers.append(nn.Dropout(p=drop_rate, inplace=False))
+        
+        new_classifier_layers.append(nn.Linear(in_features, ncls))
+        
+        model.classifier = nn.Sequential(*new_classifier_layers)
     elif arch in {"mnv4s", "mnv4m"}:
         import timm
         timm_name = _mnv4_id(arch, width)
@@ -187,31 +222,56 @@ def get_qat_model_fx_old(model_fp32_eval_cpu: nn.Module, example_inputs_cpu: tup
     prepared_model = prepare_qat_fx_torch(model_fp32_eval_cpu, qconfig_mapping, example_inputs_cpu)
     return prepared_model
 
-def get_qat_model_fx(model_fp32_eval_cpu: nn.Module, example_inputs_cpu: tuple):
+def get_qat_model_fx(model_fp32_eval_cpu: torch.nn.Module, example_inputs_cpu: tuple):
     # model_fp32_eval_cpu is ALREADY in .eval() mode when passed here
     qconfig_mapping = get_default_qat_qconfig_mapping("x86")
 
-    # Customize global config (mainly for weight observer here)
-    weight_observer = MovingAveragePerChannelMinMaxObserver.with_args(
+    # 1. Check what the default mapping assigns to BatchNorm2d and Dropout (for your understanding)
+    # print(f"Default QConfig for nn.BatchNorm2d: {qconfig_mapping.object_type_qconfigs.get(torch.nn.BatchNorm2d, 'Not Set')}") # Should be None
+    # print(f"Default QConfig for nn.Dropout: {qconfig_mapping.object_type_qconfigs.get(torch.nn.Dropout, 'Not Set')}")       # Should be None
+
+    # 2. Create your custom QConfig for weights, using the default activation observer
+    #    This will be applied by set_global where no more specific rule exists.
+    #    Conv2d, Linear etc. usually have specific rules in the default map, so this global
+    #    customization might primarily affect how their weights are observed if their
+    #    default QConfig for weights is different from what you want.
+    
+    # Get the default activation qconfig factory from the mapping
+    default_activation_qconfig_factory = qconfig_mapping.global_qconfig.activation
+    
+    # Define your custom weight observer factory
+    custom_weight_observer_factory = MovingAveragePerChannelMinMaxObserver.with_args(
         dtype=torch.qint8, qscheme=torch.per_channel_symmetric
     )
-    custom_global_qconfig = QConfig(
-        activation=qconfig_mapping.global_qconfig.activation,
-        weight=weight_observer
+    
+    # Create a new global QConfig.
+    # This will be applied to modules that don't have a more specific rule
+    # in the qconfig_mapping (e.g. from object_type_qconfigs or module_name_qconfigs).
+    # For modules like Conv2d that DO have a specific rule, you'd typically
+    # modify that specific rule if you want to change only its weight observer.
+    
+    # A more targeted way to change only the weight part of existing qconfigs:
+    # Iterate through qconfig_mapping's existing qconfigs and update their weight attribute.
+    # However, set_global is simpler if you want this weight observer for most things.
+
+    new_global_qconfig = QConfig(
+        activation=default_activation_qconfig_factory,
+        weight=custom_weight_observer_factory
     )
-    qconfig_mapping = qconfig_mapping.set_global(custom_global_qconfig)
+    qconfig_mapping = qconfig_mapping.set_global(new_global_qconfig)
 
-    # Explicitly ensure Dropout is NOT quantized (default mapping should do this)
-    qconfig_mapping = qconfig_mapping.set_module_name_qconfig(torch.nn.Dropout, None)
-    # Also ensure BN is set for fusion
-    qconfig_mapping = qconfig_mapping.set_module_name_qconfig(torch.nn.BatchNorm2d, None)
-    qconfig_mapping = qconfig_mapping.set_module_name_qconfig(torch.nn.BatchNorm3d, None)
+    # The default mapping from get_default_qat_qconfig_mapping("x86")
+    # already sets BatchNorm2d, BatchNorm3d, and Dropout to None.
+    # So, explicitly setting them again with set_object_type_qconfig(..., None)
+    # is usually not necessary unless you suspect they were overridden.
+    # Your `set_global` call *should not* override these specific `None` settings
+    # because `object_type_qconfigs` (where these `None`s are) typically have higher precedence.
 
-    # For debugging QConfig for Dropout:
-    # print(f"[INFO] QConfig for nn.Dropout in get_qat_model_fx: {qconfig_mapping.module_name_qconfigs.get(torch.nn.Dropout, 'Not Set (should be None)')}")
+    # If you *really* want to be explicit and ensure they are None after set_global:
+    # qconfig_mapping = qconfig_mapping.set_object_type_qconfig(torch.nn.Dropout, None)
+    # qconfig_mapping = qconfig_mapping.set_object_type_qconfig(torch.nn.BatchNorm2d, None)
+    # qconfig_mapping = qconfig_mapping.set_object_type_qconfig(torch.nn.BatchNorm3d, None)
 
-    # model_fp32_eval_cpu is already .eval()
-    # F.dropout is patched to identity by the caller of this function
     prepared_model = prepare_qat_fx_torch(model_fp32_eval_cpu, qconfig_mapping, example_inputs_cpu)
     return prepared_model
 
@@ -298,19 +358,18 @@ qat_train_device = torch.device("cpu") if dev.type == "mps" else dev
 print(f"[INFO] QAT will run on: {qat_train_device}")
 
 # Store original F.dropout, patch it if necessary for tracing (user mentioned it was for MNV4)
-# _original_F_dropout = F.dropout
+_original_F_dropout = F.dropout
 # This lambda makes F.dropout an identity function during prepare_qat_fx tracing.
-# F.dropout = lambda x, p=0.0, training=False, inplace=False: x
+F.dropout = lambda x, p=0.0, training=False, inplace=False: x
 
 model_fp32_for_qat_prep = model.cpu() # Get a CPU copy of the trained model
-# CRITICAL: Set to eval mode for prepare_qat_fx.
 model_fp32_for_qat_prep.eval()
 
 example_inputs_cpu = (torch.randint(0, 256, (1, 3, DUMMY_H, DUMMY_W), dtype=torch.uint8),)
 qat_prepared_model = get_qat_model_fx(model_fp32_for_qat_prep, example_inputs_cpu)
 
 # Restore original F.dropout behavior for QAT fine-tuning phase
-# F.dropout = _original_F_dropout
+F.dropout = _original_F_dropout
 
 qat_model = qat_prepared_model.to(qat_train_device) # Move prepared model to QAT device
 # Optimizer for QAT model

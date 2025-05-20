@@ -103,6 +103,25 @@ def get_backbone(arch: str, ncls: int, width: float,
             width_mult=width, dropout=drop_rate)
         model.classifier[3] = nn.Linear(model.classifier[3].in_features, ncls)
     elif arch == "mnv2":
+        model = tvm.mobilenet_v2(
+            weights=tvm.MobileNet_V2_Weights.IMAGENET1K_V2 if pretrained else None,
+            width_mult=width_mult,
+        )
+        # 1. Get the input features for the final linear layer
+        # The default classifier is Sequential(Dropout, Linear)
+        # The in_features for the Linear layer is at classifier[1].in_features
+        in_features = model.classifier[1].in_features
+        # 2. Reconstruct the classification head with inplace=False for Dropout
+        # This is the most robust way when replacing the head for fine-tuning
+        new_classifier_layers = []
+        if drop_rate is not None and drop_rate > 0.0:
+            # Use inplace=False explicitly for better tracing compatibility
+            new_classifier_layers.append(nn.Dropout(p=drop_rate, inplace=False))
+        
+        new_classifier_layers.append(nn.Linear(in_features, ncls))
+        
+        model.classifier = nn.Sequential(*new_classifier_layers)
+    elif arch == "mnv2_old":
         # build the backbone
         model = tvm.mobilenet_v2(
             weights=tvm.MobileNet_V2_Weights.IMAGENET1K_V2 if pretrained else None,
@@ -191,16 +210,17 @@ def get_qat_model_fx(model_fp32_cpu: nn.Module, example_inputs_cpu: tuple):
     return prepared_model
 
 data_dir: str = "filtered_imagenet2_native"
-epochs: int = 5
-qat_epochs: int = 3
+epochs: int = 25
+qat_epochs: int = 5
 batch: int = 64
 lr: float = 0.025
 qat_lr_factor: float = 0.05
 width_mult: float = 1.0
 device = None
 compile_model: bool = False
-arch: str = "mnv3"  # mnv4m, mnv3, mnv2, mnv4s
+arch: str = "mnv2"  # mnv4m, mnv3, mnv2, mnv4s
 pretrained: bool = True
+drop_rate = 0.0
 
 if device is None:
     device = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
@@ -210,7 +230,7 @@ dev = torch.device(device)
 print(f"[INFO] device: {dev}")
 
 pretrain_str = "_pretrained" if pretrained else ""
-pt_path = f"mobilenet_w{str(width_mult).replace('.', '_')}_{arch}{pretrain_str}_int8_fullpipe.pt"
+pt_path = f"mobilenet_w{str(width_mult).replace('.', '_')}_{arch}{pretrain_str}_drp{drop_rate}_int8_fullpipe.pt"
 
 with open(Path(data_dir) / "class_mapping.json") as f:
     ncls = len(json.load(f)); print(f"[INFO] #classes = {ncls}")
@@ -219,7 +239,7 @@ print(f"[INFO] #classes = {ncls}")
 tr = get_loader(data_dir, batch, True, dev)
 vl = get_loader(data_dir, batch, False, dev)
 
-model = build_model(ncls, width_mult, dev, arch=arch, pretrained=pretrained)
+model = build_model(ncls, width_mult, dev, arch=arch, pretrained=pretrained, drop_rate=drop_rate)
 
 crit = nn.CrossEntropyLoss(label_smoothing=0.1)
 scaler = torch.amp.GradScaler() if dev.type == "cuda" else torch.amp.GradScaler(enabled=False)
