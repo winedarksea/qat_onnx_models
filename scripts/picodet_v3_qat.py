@@ -251,7 +251,9 @@ def train_epoch(model: PicoDet, loader, opt, scaler, assigner: SimOTACache,
         fmap_shapes = []
         for lv in range(len(cls_preds_levels)):
             H, W = cls_preds_levels[lv].shape[2:]
-            s = model.head.strides[lv]
+            # s = model.head.strides[lv]
+            # or just use the tensor s = model.head.strides_buffer[lv]
+            s = model.head.strides_buffer[lv].item() # NEW (use .item() if you need scalar Python float)
             fmap_shapes.append((H, W, s))
 
         for b_idx in range(bs):
@@ -323,7 +325,7 @@ def train_epoch(model: PicoDet, loader, opt, scaler, assigner: SimOTACache,
             # The new strides_all_anchors also has length A.
             # So, strides_all_anchors[fg_mask] should now work.
             if strides_all_anchors.shape[0] != fg_mask.shape[0]:
-                print(f"[CRITICAL ERROR in train_epoch] Mismatch after strides_all_anchors correction!")
+                print("[CRITICAL ERROR in train_epoch] Mismatch after strides_all_anchors correction!")
                 print(f"  strides_all_anchors.shape: {strides_all_anchors.shape}")
                 print(f"  fg_mask.shape: {fg_mask.shape}")
                 print(f"  fmap_shapes used for both: {fmap_shapes}")
@@ -343,9 +345,13 @@ def train_epoch(model: PicoDet, loader, opt, scaler, assigner: SimOTACache,
             if current_num_fg_for_iou == 0:
                 loss_iou = torch.tensor(0.0, device=device)
             else:
-                reshaped_reg_p_fg_for_dfl = reg_p_fg.view(current_num_fg_for_iou, -1, 1, 1)
-                pred_ltrb_offsets_raw = model.head._dfl_to_ltrb(reshaped_reg_p_fg_for_dfl)
-                pred_ltrb_offsets_fg = pred_ltrb_offsets_raw.view(current_num_fg_for_iou, 4)
+                # reshaped_reg_p_fg_for_dfl = reg_p_fg.view(current_num_fg_for_iou, -1, 1, 1)
+                # pred_ltrb_offsets_raw = model.head._dfl_to_ltrb(reshaped_reg_p_fg_for_dfl)
+                # pred_ltrb_offsets_fg = pred_ltrb_offsets_raw.view(current_num_fg_for_iou, 4)
+
+                # This matches the 2D case in _dfl_to_ltrb_original_for_training_etc
+                pred_ltrb_offsets_fg = model.head._dfl_to_ltrb_original_for_training_etc(reg_p_fg)
+                # pred_ltrb_offsets_fg will be (current_num_fg_for_iou, 4)
             
                 centres_all_anchors = torch.cat(
                     [assigner.cache[(H_lvl, W_lvl, s_lvl, str(device))] 
@@ -522,7 +528,18 @@ def main(argv: List[str] | None = None):
     print(f'[INFO] device = {dev}')
 
     backbone, feat_chs = get_backbone(cfg.arch, ckpt=None)
-    model = PicoDet(backbone, feat_chs).to(dev)
+    model = PicoDet(
+        backbone, 
+        feat_chs,
+        num_classes=80, # Or from config/dataset
+        neck_out_ch=96, # Or from config
+        img_size=IMG_SIZE,
+        # Optionally pass head params if they are configurable:
+        # head_reg_max=...,
+        # head_max_det=...,
+        # head_score_thresh=...,
+        # head_nms_iou=...
+    ).to(dev)
 
     tr_loader = get_loader(cfg.coco_root, 'train', cfg.batch, cfg.workers, subset_size=1200)
     vl_loader = get_loader(cfg.coco_root, 'val', cfg.batch, cfg.workers, subset_size=200)
@@ -586,5 +603,3 @@ def main(argv: List[str] | None = None):
 
 if __name__ == '__main__':
     main()
-
-# Epoch 5/5  loss 19.858  IoU 0.197

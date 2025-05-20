@@ -130,7 +130,7 @@ def dfl_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     return loss
 
 # ───────────────────────── detection head ──────────────────────────
-class PicoDetHead(nn.Module):
+class PicoDetHeadOLD(nn.Module):
     def __init__(self, num_classes: int = 80, reg_max: int = 7, num_feats: int = 96,
                  num_levels: int = 3, max_det: int = 100,
                  score_thresh: float = 0.3, nms_iou: float = 0.5):
@@ -193,7 +193,7 @@ class PicoDetHead(nn.Module):
     # ------------------------- inference -------------------------
     def _inference_single(self, feats_out: Tuple[torch.Tensor, ...]):
         cls_ls, obj_ls, reg_ls = feats_out
-        boxes, scores, labels = [], [], []
+        boxes, scores, _ = [], [], []
         for lv, (cl, ob, rg) in enumerate(zip(cls_ls, obj_ls, reg_ls)):
             s = self.strides[lv]
             B, C, H, W = cl.shape
@@ -244,6 +244,391 @@ class PicoDetHead(nn.Module):
         if self.training:
             return cls_ls, obj_ls, reg_ls
         return self._inference_single((cls_ls, obj_ls, reg_ls))
+
+
+class PicoDetHead(nn.Module):
+    def __init__(self, num_classes: int = 80, reg_max: int = 7, num_feats: int = 96,
+                 num_levels: int = 3, max_det: int = 100,
+                 score_thresh: float = 0.05, nms_iou: float = 0.6,
+                 img_size: int = 224): # Add img_size here to compute H, W
+        super().__init__()
+        self.nc = num_classes
+        self.reg_max = reg_max
+        self.nl = num_levels
+        self.max_det = max_det
+        self.score_th = score_thresh
+        self.iou_th = nms_iou
+        
+        strides_tensor = torch.tensor([8, 16, 32][:num_levels], dtype=torch.float32)
+        self.register_buffer('strides_buffer', strides_tensor, persistent=False)
+        
+        dfl_project_tensor = torch.arange(self.reg_max + 1, dtype=torch.float32)
+        self.register_buffer('dfl_project_buffer', dfl_project_tensor, persistent=False)
+
+        # Head convolutional layers (same as before)
+        self.cls_conv = nn.Sequential(*[GhostConv(num_feats, num_feats) for _ in range(2)])
+        self.reg_conv = nn.Sequential(*[GhostConv(num_feats, num_feats) for _ in range(2)])
+        self.cls_pred = nn.ModuleList([nn.Conv2d(num_feats, self.nc, 1) for _ in range(self.nl)])
+        self.obj_pred = nn.ModuleList([nn.Conv2d(num_feats, 1, 1) for _ in range(self.nl)])
+        self.reg_pred = nn.ModuleList(
+            [nn.Conv2d(num_feats, 4 * (self.reg_max + 1), 1) for _ in range(self.nl)]
+        )
+
+        self._initialize_biases()
+        
+        # --- NEW: Pre-calculate and register anchor points ---
+        self.anchor_points_centers_levels: nn.ModuleList[torch.Tensor] = nn.ModuleList() # Use ModuleList for buffers
+        # Or just a list of buffers if you manage device placement carefully
+        # self.register_buffer cannot be used in a loop directly to create a list of buffers with dynamic names
+        # A common pattern is to store them as a list of tensors and then register them manually if needed,
+        # or let them be part of nn.ModuleList if they need to be torch.nn.Module (not the case here)
+        # For simple tensors, storing them as attributes that are tensors works if they are used.
+        
+        _anchor_points_centers_list = []
+        for i in range(self.nl):
+            s = self.strides_buffer[i].item() # Get scalar stride
+            # Important: Use integer division for H, W if img_size/s might not be exact integer
+            H_level = math.ceil(img_size / s) # Or int(img_size / s) if you are sure it's exact
+            W_level = math.ceil(img_size / s) # Or int(img_size / s)
+            
+            yv, xv = torch.meshgrid(
+                torch.arange(H_level, dtype=torch.float32),
+                torch.arange(W_level, dtype=torch.float32),
+                indexing='ij'
+            )
+            grid = torch.stack((xv, yv), dim=2).reshape(H_level * W_level, 2)
+            anchor_points_center = (grid + 0.5) * s
+            _anchor_points_centers_list.append(anchor_points_center)
+            # Register each as a buffer
+            self.register_buffer(f'anchor_points_level_{i}', anchor_points_center, persistent=False)
+
+    def _initialize_biases(self): # (Same as before)
+        cls_bias_init = -math.log((1 - 0.01) / 0.01)
+        for layer_list in [self.cls_pred, self.obj_pred]:
+            for layer in layer_list:
+                if hasattr(layer, 'bias') and layer.bias is not None:
+                    nn.init.constant_(layer.bias, cls_bias_init)
+
+    def _dfl_to_ltrb_inference(self, x_reg_logits_3d: torch.Tensor) -> torch.Tensor:
+        """
+        Decodes DFL regression logits to LTRB box offsets,
+        SPECIALIZED FOR 3D INPUT (Batch, Num_Anchors, 4*(reg_max+1)) for inference tracing.
+        """
+        # Expects x_reg_logits_3d: (B, N_anchors_per_image, 4*(reg_max+1))
+        b, n_anchors_img, _ = x_reg_logits_3d.shape
+        
+        # This assertion can be helpful during dev, but remove/comment for final tracing if it causes issues
+        # assert x_reg_logits_3d.ndim == 3, f"Expected 3D input for _dfl_to_ltrb_inference, got {x_reg_logits_3d.ndim}D"
+
+        x_reg_logits_reshaped = x_reg_logits_3d.view(b, n_anchors_img, 4, self.reg_max + 1)
+        x_softmax = x_reg_logits_reshaped.softmax(dim=3) # Softmax over reg_max+1 dimension
+        
+        # self.dfl_project_buffer shape (M+1), view for broadcast: (1,1,1,M+1)
+        proj = self.dfl_project_buffer.view(1, 1, 1, -1) 
+        ltrb_offsets = (x_softmax * proj).sum(dim=3) # (B, N_anchors_per_image, 4)
+        return ltrb_offsets
+
+    # Keep the original _dfl_to_ltrb for training if needed by your loss calculation
+    # Or, if your loss calculation also flattens to a consistent shape (e.g., 2D),
+    # you might have another specialized version or adjust your training code.
+    def _dfl_to_ltrb_original_for_training_etc(self, x_reg_logits: torch.Tensor) -> torch.Tensor:
+        input_shape = x_reg_logits.shape
+        if x_reg_logits.ndim == 4: # (B, C, H, W) - Not used in current inference path
+            b, _, h, w = input_shape
+            x_reg_logits = x_reg_logits.view(b, 4, self.reg_max + 1, h, w)
+            x_softmax = x_reg_logits.softmax(dim=2)
+            proj = self.dfl_project_buffer.view(1, 1, -1, 1, 1)
+            ltrb_offsets = (x_softmax * proj).sum(dim=2)
+        elif x_reg_logits.ndim == 2: # (N_total_anchors, 4 * (reg_max + 1)) - Might be used in training
+            n_anchors = input_shape[0]
+            x_reg_logits = x_reg_logits.view(n_anchors, 4, self.reg_max + 1)
+            x_softmax = x_reg_logits.softmax(dim=2)
+            proj = self.dfl_project_buffer.view(1, 1, -1)
+            ltrb_offsets = (x_softmax * proj).sum(dim=2)
+        elif x_reg_logits.ndim == 3: # (B, N_anchors_per_image, 4*(reg_max+1)) - Used in inference
+            b, n_anchors_img, _ = input_shape
+            x_reg_logits = x_reg_logits.view(b, n_anchors_img, 4, self.reg_max + 1)
+            x_softmax = x_reg_logits.softmax(dim=3)
+            proj = self.dfl_project_buffer.view(1, 1, 1, -1)
+            ltrb_offsets = (x_softmax * proj).sum(dim=3)
+        else:
+            raise ValueError(f"_dfl_to_ltrb expects 2D, 3D or 4D input, got {x_reg_logits.ndim}D")
+        return ltrb_offsets
+
+    def _decode_predictions_for_level(self,
+                                      cls_logit: torch.Tensor, obj_logit: torch.Tensor, reg_logit: torch.Tensor,
+                                      level_idx: int
+                                     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        B, _, H_feat, W_feat = cls_logit.shape
+        stride = self.strides_buffer[level_idx]
+        num_anchors_level = H_feat * W_feat
+
+        anchor_points_center = getattr(self, f'anchor_points_level_{level_idx}')
+        anchor_points_center = anchor_points_center.to(cls_logit.device)
+
+        cls_logit_perm = cls_logit.permute(0, 2, 3, 1).reshape(B, num_anchors_level, self.nc)
+        obj_logit_perm = obj_logit.permute(0, 2, 3, 1).reshape(B, num_anchors_level, 1)
+        reg_logit_perm = reg_logit.permute(0, 2, 3, 1).reshape(B, num_anchors_level, 4 * (self.reg_max + 1))
+
+        # --- Use the specialized version for inference tracing ---
+        ltrb_offsets = self._dfl_to_ltrb_inference(reg_logit_perm) 
+        ltrb_offsets_scaled = ltrb_offsets * stride
+
+        ap_expanded = anchor_points_center.unsqueeze(0)
+        x1 = ap_expanded[..., 0] - ltrb_offsets_scaled[..., 0]
+        y1 = ap_expanded[..., 1] - ltrb_offsets_scaled[..., 1]
+        x2 = ap_expanded[..., 0] + ltrb_offsets_scaled[..., 2]
+        y2 = ap_expanded[..., 1] + ltrb_offsets_scaled[..., 3]
+        boxes_xyxy_level = torch.stack([x1, y1, x2, y2], dim=-1)
+
+        scores_level = (cls_logit_perm + obj_logit_perm).sigmoid()
+        
+        return boxes_xyxy_level, scores_level
+
+    def _batch_nms_and_pad_OLD(self,
+                           batched_boxes: torch.Tensor,    # (B, Total_Anchors_All_Levels, 4)
+                           batched_scores: torch.Tensor   # (B, Total_Anchors_All_Levels, NC)
+                          ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Performs NMS per image in the batch and pads results to max_det.
+        Returns:
+            - final_boxes: (B, max_det, 4)
+            - final_scores: (B, max_det)
+            - final_labels: (B, max_det)
+        """
+        B = batched_boxes.size(0)
+        
+        output_boxes_list: List[torch.Tensor] = []
+        output_scores_list: List[torch.Tensor] = []
+        output_labels_list: List[torch.Tensor] = []
+
+        for b_idx in range(B):
+            boxes_img = batched_boxes[b_idx]    # (Total_Anchors, 4)
+            scores_img = batched_scores[b_idx]  # (Total_Anchors, NC)
+
+            # Get top score and class index for each anchor/box
+            # conf_per_anchor: (Total_Anchors,), labels_per_anchor: (Total_Anchors,)
+            conf_per_anchor, labels_per_anchor = torch.max(scores_img, dim=1)
+
+            # Filter by score threshold
+            keep_by_score_mask = conf_per_anchor >= self.score_th
+            
+            boxes_above_thresh = boxes_img[keep_by_score_mask]
+            scores_above_thresh = conf_per_anchor[keep_by_score_mask]
+            labels_above_thresh = labels_per_anchor[keep_by_score_mask]
+
+            # Perform NMS. tvops.nms handles empty inputs.
+            # It returns indices relative to the input tensors (boxes_above_thresh, etc.)
+            nms_keep_indices = tvops.nms(boxes_above_thresh, scores_above_thresh, self.iou_th)
+            
+            # Select top self.max_det detections after NMS
+            # Slicing handles cases where nms_keep_indices has fewer than max_det items.
+            nms_keep_indices_topk = nms_keep_indices[:self.max_det]
+
+            boxes_after_nms = boxes_above_thresh[nms_keep_indices_topk]
+            scores_after_nms = scores_above_thresh[nms_keep_indices_topk]
+            labels_after_nms = labels_above_thresh[nms_keep_indices_topk]
+            
+            # Pad to self.max_det
+            num_current_dets = boxes_after_nms.shape[0]
+            pad_size = self.max_det - num_current_dets
+            
+            # F.pad format for 2D tensor (N, D): (pad_left_dim1, pad_right_dim1, pad_left_dim0, pad_right_dim0)
+            # We pad only dim0 (rows) at the end.
+            # Boxes: (num_dets, 4) -> (max_det, 4)
+            padded_boxes = F.pad(boxes_after_nms, (0, 0, 0, pad_size), mode='constant', value=0.0)
+            # Scores: (num_dets,) -> (max_det,)
+            padded_scores = F.pad(scores_after_nms, (0, pad_size), mode='constant', value=0.0)
+            # Labels: (num_dets,) -> (max_det,). Pad with -1 for "no class" or background.
+            padded_labels = F.pad(labels_after_nms, (0, pad_size), mode='constant', value=-1) 
+
+            output_boxes_list.append(padded_boxes)
+            output_scores_list.append(padded_scores)
+            output_labels_list.append(padded_labels)
+
+        final_boxes = torch.stack(output_boxes_list, dim=0)
+        final_scores = torch.stack(output_scores_list, dim=0)
+        final_labels = torch.stack(output_labels_list, dim=0)
+        
+        return final_boxes, final_scores, final_labels
+
+    def forward_OLD(self, neck_feature_maps: Tuple[torch.Tensor, ...]):
+        raw_cls_logits_levels: List[torch.Tensor] = []
+        raw_obj_logits_levels: List[torch.Tensor] = []
+        raw_reg_logits_levels: List[torch.Tensor] = []
+
+        for i, f_map_level in enumerate(neck_feature_maps):
+            cls_common_feat = self.cls_conv(f_map_level)
+            reg_common_feat = self.reg_conv(f_map_level)
+            raw_cls_logits_levels.append(self.cls_pred[i](cls_common_feat))
+            raw_obj_logits_levels.append(self.obj_pred[i](cls_common_feat))
+            raw_reg_logits_levels.append(self.reg_pred[i](reg_common_feat))
+
+        if self.training:
+            return raw_cls_logits_levels, raw_obj_logits_levels, raw_reg_logits_levels
+        else:
+            decoded_boxes_all_levels: List[torch.Tensor] = []
+            decoded_scores_all_levels: List[torch.Tensor] = []
+            
+            # current_device = neck_feature_maps[0].device # No longer need to pass device
+
+            for i in range(self.nl):
+                cls_l, obj_l, reg_l = raw_cls_logits_levels[i], raw_obj_logits_levels[i], raw_reg_logits_levels[i]
+                boxes_level, scores_level = self._decode_predictions_for_level(
+                    cls_l, obj_l, reg_l, i # Removed current_device
+                )
+                decoded_boxes_all_levels.append(boxes_level)
+                decoded_scores_all_levels.append(scores_level)
+
+            batched_all_boxes = torch.cat(decoded_boxes_all_levels, dim=1)
+            batched_all_scores = torch.cat(decoded_scores_all_levels, dim=1)
+            return self._batch_nms_and_pad(batched_all_boxes, batched_all_scores)
+
+    def _batch_nms_and_pad(self,
+                           batched_boxes: torch.Tensor,    # (B, Total_Anchors_All_Levels, 4)
+                           batched_scores: torch.Tensor   # (B, Total_Anchors_All_Levels, NC)
+                          ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        
+        # B_val = batched_boxes.shape[0] # Get shape element; for Proxy, this is symbolic
+        # We know for tracing with example_inputs, B_val will be 1.
+        # For runtime, it can be > 1.
+
+        # The loop is the problem for tracing if range() gets a Proxy.
+        # However, many models with NMS are exported to ONNX using this loop structure.
+        # The key is that the ops inside are fine and the dynamic batch axis handles it.
+
+        # Let's ensure the inputs to the loop body are sliced correctly.
+        # The main problem is `range(B_proxy)`.
+
+        # If the example batch size is 1, the loop `for b_idx in range(batched_boxes.shape[0])`
+        # should effectively be `for b_idx in range(1)`.
+        # The PyTorch FX tracer might be failing to concretize `batched_boxes.shape[0]` to an
+        # integer for `range()` even when the example input has batch size 1.
+
+        # One way to handle this is to use `torch.unbind` to get a list of tensors,
+        # then iterate through that list. `torch.unbind` is traceable.
+        
+        # Unbind the batch dimension. This creates a list of tensors.
+        # boxes_per_image_list: List of Tensors, each (Total_Anchors, 4)
+        # scores_per_image_list: List of Tensors, each (Total_Anchors, NC)
+        # Length of list will be B.
+        
+        # If B is symbolic, len(list) from unbind might also be symbolic for list comprehensions.
+        # However, a direct Python for loop over a list of Proxies (if unbind returns that)
+        # is usually traceable.
+
+        boxes_per_image_list = torch.unbind(batched_boxes, dim=0)
+        scores_per_image_list = torch.unbind(batched_scores, dim=0)
+
+        output_boxes_list: List[torch.Tensor] = []
+        output_scores_list: List[torch.Tensor] = []
+        output_labels_list: List[torch.Tensor] = []
+
+        # This loop iterates over a list of tensors (or Proxies to tensors).
+        # This pattern is often more traceable than `range(symbolic_B)`.
+        for boxes_img, scores_img in zip(boxes_per_image_list, scores_per_image_list):
+            # boxes_img: (Total_Anchors, 4)
+            # scores_img: (Total_Anchors, NC)
+
+            conf_per_anchor, labels_per_anchor = torch.max(scores_img, dim=1)
+            keep_by_score_mask = conf_per_anchor >= self.score_th
+            
+            boxes_above_thresh = boxes_img[keep_by_score_mask]
+            scores_above_thresh = conf_per_anchor[keep_by_score_mask]
+            labels_above_thresh = labels_per_anchor[keep_by_score_mask]
+
+            # tvops.nms can handle empty inputs for boxes_above_thresh
+            nms_keep_indices = tvops.nms(boxes_above_thresh, scores_above_thresh, self.iou_th)
+            nms_keep_indices_topk = nms_keep_indices[:self.max_det] # Slicing also handles < max_det results
+
+            boxes_after_nms = boxes_above_thresh[nms_keep_indices_topk]
+            scores_after_nms = scores_above_thresh[nms_keep_indices_topk]
+            labels_after_nms = labels_above_thresh[nms_keep_indices_topk]
+            
+            num_current_dets = boxes_after_nms.shape[0]
+            pad_size = self.max_det - num_current_dets
+            
+            # F.pad needs pad_size. If num_current_dets is symbolic, pad_size is symbolic.
+            # This should be fine as F.pad can often handle symbolic padding derived from symbolic shapes.
+            padded_boxes = F.pad(boxes_after_nms, (0, 0, 0, pad_size), mode='constant', value=0.0)
+            padded_scores = F.pad(scores_after_nms, (0, pad_size), mode='constant', value=0.0)
+            padded_labels = F.pad(labels_after_nms, (0, pad_size), mode='constant', value=-1) 
+
+            output_boxes_list.append(padded_boxes)
+            output_scores_list.append(padded_scores)
+            output_labels_list.append(padded_labels)
+
+        # Stack the list of processed tensors back into a single batched tensor.
+        # This is also a traceable operation.
+        final_boxes = torch.stack(output_boxes_list, dim=0)
+        final_scores = torch.stack(output_scores_list, dim=0)
+        final_labels = torch.stack(output_labels_list, dim=0)
+        
+        return final_boxes, final_scores, final_labels
+
+    def forward(self, neck_feature_maps: Tuple[torch.Tensor, ...]):
+        # (This part is likely fine from previous fixes, assuming _decode_predictions_for_level is okay)
+        raw_cls_logits_levels: List[torch.Tensor] = []
+        raw_obj_logits_levels: List[torch.Tensor] = []
+        raw_reg_logits_levels: List[torch.Tensor] = []
+
+        for i, f_map_level in enumerate(neck_feature_maps):
+            cls_common_feat = self.cls_conv(f_map_level)
+            reg_common_feat = self.reg_conv(f_map_level)
+            raw_cls_logits_levels.append(self.cls_pred[i](cls_common_feat))
+            raw_obj_logits_levels.append(self.obj_pred[i](cls_common_feat))
+            raw_reg_logits_levels.append(self.reg_pred[i](reg_common_feat))
+
+        if self.training:
+            return raw_cls_logits_levels, raw_obj_logits_levels, raw_reg_logits_levels
+        else: # Inference path
+            decoded_boxes_all_levels: List[torch.Tensor] = []
+            decoded_scores_all_levels: List[torch.Tensor] = []
+            
+            for i in range(self.nl):
+                cls_l, obj_l, reg_l = raw_cls_logits_levels[i], raw_obj_logits_levels[i], raw_reg_logits_levels[i]
+                boxes_level, scores_level = self._decode_predictions_for_level(
+                    cls_l, obj_l, reg_l, i
+                )
+                decoded_boxes_all_levels.append(boxes_level)
+                decoded_scores_all_levels.append(scores_level)
+
+            batched_all_boxes = torch.cat(decoded_boxes_all_levels, dim=1)
+            batched_all_scores = torch.cat(decoded_scores_all_levels, dim=1)
+            return self._batch_nms_and_pad(batched_all_boxes, batched_all_scores) # Calls the modified version
+
+# In PicoDet class:
+class PicoDet(nn.Module):
+    def __init__(self, backbone: nn.Module, feat_chs: Tuple[int, int, int],
+                 num_classes: int = 80, neck_out_ch: int = 96, 
+                 img_size: int = 224, # This img_size IS CRUCIAL
+                 head_reg_max: int = 7, 
+                 head_max_det: int = 100,
+                 head_score_thresh: float = 0.05,
+                 head_nms_iou: float = 0.6):
+        super().__init__()
+        self.pre = ResizeNorm(size=(img_size, img_size)) 
+        self.backbone = backbone
+        self.neck = CSPPAN(in_chs=feat_chs, out_ch=neck_out_ch)
+        num_fpn_levels = len(feat_chs) 
+        
+        self.head = PicoDetHead(
+            num_classes=num_classes, 
+            reg_max=head_reg_max,
+            num_feats=neck_out_ch,
+            num_levels=num_fpn_levels,
+            max_det=head_max_det,
+            score_thresh=head_score_thresh,
+            nms_iou=head_nms_iou,
+            img_size=img_size # <<< --- PASS IMG_SIZE TO HEAD
+        )
+
+    def forward(self, x: torch.Tensor): # (Same as before)
+        x = self.pre(x)
+        backbone_features = self.backbone(x)
+        c3, c4, c5 = backbone_features[0], backbone_features[1], backbone_features[2]
+        p3, p4, p5 = self.neck(c3, c4, c5)
+        return self.head((p3, p4, p5))
 
 # ──────────────────────── preprocess wrapper ──────────────────────
 class ResizeNormOLD(nn.Module):
@@ -400,8 +785,6 @@ class PicoDetOLD(nn.Module):
 
 ###########
 
-# picodet_lib.py modifications:
-
 
 # Helper to wrap torchvision's create_feature_extractor to output a list
 class TVExtractorWrapper(nn.Module):
@@ -555,7 +938,7 @@ def get_backbone(arch: str, ckpt: str | None, img_size: int = 224): # Added img_
     return net, feat_chs
 
 # In PicoDet class forward method:
-class PicoDet(nn.Module):
+class PicoDetOLD2(nn.Module):
     def __init__(self, backbone: nn.Module, feat_chs: Tuple[int, int, int],
                  num_classes: int = 80, neck_out_ch: int = 96, IMG_SIZE: int = 224): # Added neck_out_ch
         super().__init__()
