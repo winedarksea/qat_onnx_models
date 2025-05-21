@@ -19,12 +19,12 @@ class GhostConv(nn.Module):
         pad = k // 2
         self.primary = nn.Sequential(
             nn.Conv2d(c_in, init_ch, k, s, pad, bias=False),
-            nn.BatchNorm2d(init_ch), nn.ReLU6(inplace=True)
+            nn.BatchNorm2d(init_ch), nn.ReLU6(inplace=False)
         )
         self.cheap = nn.Sequential() if cheap_ch == 0 else nn.Sequential(
             nn.Conv2d(init_ch, cheap_ch, dw_size, 1, dw_size // 2,
                       groups=init_ch, bias=False),
-            nn.BatchNorm2d(cheap_ch), nn.ReLU6(inplace=True)
+            nn.BatchNorm2d(cheap_ch), nn.ReLU6(inplace=False)
         )
 
     def forward(self, x: torch.Tensor):
@@ -43,7 +43,7 @@ class DWConv5x5(nn.Module):
         super().__init__()
         self.dw = nn.Conv2d(c, c, 5, 1, 2, groups=c, bias=False)
         self.bn = nn.BatchNorm2d(c)
-        self.act = nn.ReLU6(inplace=True)
+        self.act = nn.ReLU6(inplace=False)
 
     def forward(self, x):
         return self.act(self.bn(self.dw(x)))
@@ -129,121 +129,6 @@ def dfl_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     loss = F.kl_div(F.log_softmax(pred, dim=1), target, reduction='batchmean')
     return loss
 
-# ───────────────────────── detection head ──────────────────────────
-class PicoDetHeadOLD(nn.Module):
-    def __init__(self, num_classes: int = 80, reg_max: int = 7, num_feats: int = 96,
-                 num_levels: int = 3, max_det: int = 100,
-                 score_thresh: float = 0.3, nms_iou: float = 0.5):
-        super().__init__()
-        self.nc, self.reg_max, self.nl = num_classes, reg_max, num_levels
-        self.max_det, self.score_th, self.iou_th = max_det, score_thresh, nms_iou
-        self.strides = (8, 16, 32)
-
-        self.cls_conv = nn.Sequential(*[GhostConv(num_feats, num_feats) for _ in range(2)])
-        self.reg_conv = nn.Sequential(*[GhostConv(num_feats, num_feats) for _ in range(2)])
-
-        self.cls_pred = nn.ModuleList([nn.Conv2d(num_feats, self.nc, 1) for _ in range(self.nl)])
-        self.obj_pred = nn.ModuleList([nn.Conv2d(num_feats, 1, 1) for _ in range(self.nl)])
-        self.reg_pred = nn.ModuleList([nn.Conv2d(num_feats, 4 * (reg_max + 1), 1) for _ in range(self.nl)])
-
-        # bias init (PicoDet / YOLOX style)
-        cls_bias, obj_bias = -4.6, -6.0
-        for cp in self.cls_pred:
-            nn.init.constant_(cp.bias, cls_bias)
-        for op in self.obj_pred:
-            nn.init.constant_(op.bias, obj_bias)
-
-    # -------------------------- helpers --------------------------
-    def _dfl_to_ltrb(self, x: torch.Tensor):
-        # x input shape: (B, 4*(self.reg_max+1), H, W)
-        # e.g. (251, 32, 1, 1)
-        B, C_in, H, W = x.shape 
-        M = self.reg_max
-        
-        # Expected C_in is 4 * (M+1)
-        # print(f"[_dfl_to_ltrb DEBUG] Input x shape: {x.shape}, B={B}, C_in={C_in}, H={H}, W={W}, M={M}")
-
-        # Reshape to (B, 4, M+1, H, W)
-        x_reshaped = x.view(B, 4, M + 1, H, W)
-        # print(f"[_dfl_to_ltrb DEBUG] x_reshaped shape: {x_reshaped.shape}")
-
-        x_softmax = x_reshaped.softmax(dim=2) # Softmax over M+1 dimension
-        # print(f"[_dfl_to_ltrb DEBUG] x_softmax shape: {x_softmax.shape}")
-
-        proj = torch.arange(M + 1, device=x.device, dtype=x.dtype) # Shape (M+1,)
-        # print(f"[_dfl_to_ltrb DEBUG] proj shape: {proj.shape}, values: {proj}")
-
-        # Explicitly reshape proj for broadcasting
-        # Target shape for proj to broadcast with x_softmax: (1, 1, M+1, 1, 1)
-        proj_reshaped = proj.view(1, 1, M + 1, 1, 1)
-        # print(f"[_dfl_to_ltrb DEBUG] proj_reshaped shape: {proj_reshaped.shape}")
-        
-        # Multiply and sum
-        # (B, 4, M+1, H, W) * (1, 1, M+1, 1, 1) -> (B, 4, M+1, H, W)
-        weighted_sum_components = x_softmax * proj_reshaped
-        # print(f"[_dfl_to_ltrb DEBUG] weighted_sum_components shape: {weighted_sum_components.shape}")
-
-        # Sum over the M+1 dimension (dim=2)
-        # (B, 4, M+1, H, W) -> sum(dim=2) -> (B, 4, H, W)
-        out = weighted_sum_components.sum(dim=2)
-        # print(f"[_dfl_to_ltrb DEBUG] Output out shape: {out.shape}, numel: {out.numel()}")
-        
-        return out
-
-    # ------------------------- inference -------------------------
-    def _inference_single(self, feats_out: Tuple[torch.Tensor, ...]):
-        cls_ls, obj_ls, reg_ls = feats_out
-        boxes, scores, _ = [], [], []
-        for lv, (cl, ob, rg) in enumerate(zip(cls_ls, obj_ls, reg_ls)):
-            s = self.strides[lv]
-            B, C, H, W = cl.shape
-            yv, xv = torch.meshgrid(torch.arange(H, device=cl.device),
-                                    torch.arange(W, device=cl.device), indexing='ij')
-            grid = torch.stack((xv, yv), 2).view(1, 1, H, W, 2).float() * s + s * 0.5
-            ltrb = self._dfl_to_ltrb(rg) * s  # (B,4,H,W)
-            # xyxy
-            xyxy = torch.stack((grid[..., 0] - ltrb[:, 0], grid[..., 1] - ltrb[:, 1],
-                                grid[..., 0] + ltrb[:, 2], grid[..., 1] + ltrb[:, 3]), -1)  # (B,H,W,4)
-            boxes.append(xyxy.view(B, -1, 4))
-            # joint logits
-            joint = cl + ob  # broadcasting (B,C,H,W) + (B,1,H,W)
-            scores.append(joint.sigmoid().permute(0, 2, 3, 1).reshape(B, -1, self.nc))
-        boxes = torch.cat(boxes, 1)
-        scores = torch.cat(scores, 1)
-
-        b_out, s_out, l_out = [], [], []
-        for b in range(boxes.size(0)):
-            bx, sc = boxes[b], scores[b]
-            conf, cls = sc.max(1)
-            keep_mask = conf > self.score_th
-            if keep_mask.sum() == 0:
-                # pad empty
-                b_out.append(torch.zeros((self.max_det, 4), device=bx.device))
-                s_out.append(torch.zeros((self.max_det,), device=bx.device))
-                l_out.append(torch.full((self.max_det,), -1, device=bx.device, dtype=torch.long))
-                continue
-            bx, conf, cls = bx[keep_mask], conf[keep_mask], cls[keep_mask]
-            # NMS – torchvision.ops.nms exports to onnx::NonMaxSuppression.
-            keep = tvops.nms(bx, conf, self.iou_th)[: self.max_det]
-            sel_b, sel_s, sel_l = bx[keep], conf[keep], cls[keep]
-            pad = self.max_det - sel_b.shape[0]
-            b_out.append(F.pad(sel_b, (0, 0, 0, pad)))
-            s_out.append(F.pad(sel_s, (0, pad)))
-            l_out.append(F.pad(sel_l, (0, pad), value=-1))
-        return torch.stack(b_out), torch.stack(s_out), torch.stack(l_out)
-
-    # --------------------------- fwd -----------------------------
-    def forward(self, feats: Tuple[torch.Tensor, ...]):
-        cls_ls, obj_ls, reg_ls = [], [], []
-        for i, f in enumerate(feats):
-            c = self.cls_conv(f)
-            r = self.reg_conv(f)
-            cls_ls.append(self.cls_pred[i](c))
-            obj_ls.append(self.obj_pred[i](c))
-            reg_ls.append(self.reg_pred[i](r))
-        if self.training:
-            return cls_ls, obj_ls, reg_ls
-        return self._inference_single((cls_ls, obj_ls, reg_ls))
 
 
 class PicoDetHead(nn.Module):
@@ -385,186 +270,106 @@ class PicoDetHead(nn.Module):
         
         return boxes_xyxy_level, scores_level
 
-    def _batch_nms_and_pad_OLD(self,
-                           batched_boxes: torch.Tensor,    # (B, Total_Anchors_All_Levels, 4)
-                           batched_scores: torch.Tensor   # (B, Total_Anchors_All_Levels, NC)
-                          ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Performs NMS per image in the batch and pads results to max_det.
-        Returns:
-            - final_boxes: (B, max_det, 4)
-            - final_scores: (B, max_det)
-            - final_labels: (B, max_det)
-        """
-        B = batched_boxes.size(0)
-        
-        output_boxes_list: List[torch.Tensor] = []
-        output_scores_list: List[torch.Tensor] = []
-        output_labels_list: List[torch.Tensor] = []
-
-        for b_idx in range(B):
-            boxes_img = batched_boxes[b_idx]    # (Total_Anchors, 4)
-            scores_img = batched_scores[b_idx]  # (Total_Anchors, NC)
-
-            # Get top score and class index for each anchor/box
-            # conf_per_anchor: (Total_Anchors,), labels_per_anchor: (Total_Anchors,)
-            conf_per_anchor, labels_per_anchor = torch.max(scores_img, dim=1)
-
-            # Filter by score threshold
-            keep_by_score_mask = conf_per_anchor >= self.score_th
-            
-            boxes_above_thresh = boxes_img[keep_by_score_mask]
-            scores_above_thresh = conf_per_anchor[keep_by_score_mask]
-            labels_above_thresh = labels_per_anchor[keep_by_score_mask]
-
-            # Perform NMS. tvops.nms handles empty inputs.
-            # It returns indices relative to the input tensors (boxes_above_thresh, etc.)
-            nms_keep_indices = tvops.nms(boxes_above_thresh, scores_above_thresh, self.iou_th)
-            
-            # Select top self.max_det detections after NMS
-            # Slicing handles cases where nms_keep_indices has fewer than max_det items.
-            nms_keep_indices_topk = nms_keep_indices[:self.max_det]
-
-            boxes_after_nms = boxes_above_thresh[nms_keep_indices_topk]
-            scores_after_nms = scores_above_thresh[nms_keep_indices_topk]
-            labels_after_nms = labels_above_thresh[nms_keep_indices_topk]
-            
-            # Pad to self.max_det
-            num_current_dets = boxes_after_nms.shape[0]
-            pad_size = self.max_det - num_current_dets
-            
-            # F.pad format for 2D tensor (N, D): (pad_left_dim1, pad_right_dim1, pad_left_dim0, pad_right_dim0)
-            # We pad only dim0 (rows) at the end.
-            # Boxes: (num_dets, 4) -> (max_det, 4)
-            padded_boxes = F.pad(boxes_after_nms, (0, 0, 0, pad_size), mode='constant', value=0.0)
-            # Scores: (num_dets,) -> (max_det,)
-            padded_scores = F.pad(scores_after_nms, (0, pad_size), mode='constant', value=0.0)
-            # Labels: (num_dets,) -> (max_det,). Pad with -1 for "no class" or background.
-            padded_labels = F.pad(labels_after_nms, (0, pad_size), mode='constant', value=-1) 
-
-            output_boxes_list.append(padded_boxes)
-            output_scores_list.append(padded_scores)
-            output_labels_list.append(padded_labels)
-
-        final_boxes = torch.stack(output_boxes_list, dim=0)
-        final_scores = torch.stack(output_scores_list, dim=0)
-        final_labels = torch.stack(output_labels_list, dim=0)
-        
-        return final_boxes, final_scores, final_labels
-
-    def forward_OLD(self, neck_feature_maps: Tuple[torch.Tensor, ...]):
-        raw_cls_logits_levels: List[torch.Tensor] = []
-        raw_obj_logits_levels: List[torch.Tensor] = []
-        raw_reg_logits_levels: List[torch.Tensor] = []
-
-        for i, f_map_level in enumerate(neck_feature_maps):
-            cls_common_feat = self.cls_conv(f_map_level)
-            reg_common_feat = self.reg_conv(f_map_level)
-            raw_cls_logits_levels.append(self.cls_pred[i](cls_common_feat))
-            raw_obj_logits_levels.append(self.obj_pred[i](cls_common_feat))
-            raw_reg_logits_levels.append(self.reg_pred[i](reg_common_feat))
-
-        if self.training:
-            return raw_cls_logits_levels, raw_obj_logits_levels, raw_reg_logits_levels
-        else:
-            decoded_boxes_all_levels: List[torch.Tensor] = []
-            decoded_scores_all_levels: List[torch.Tensor] = []
-            
-            # current_device = neck_feature_maps[0].device # No longer need to pass device
-
-            for i in range(self.nl):
-                cls_l, obj_l, reg_l = raw_cls_logits_levels[i], raw_obj_logits_levels[i], raw_reg_logits_levels[i]
-                boxes_level, scores_level = self._decode_predictions_for_level(
-                    cls_l, obj_l, reg_l, i # Removed current_device
-                )
-                decoded_boxes_all_levels.append(boxes_level)
-                decoded_scores_all_levels.append(scores_level)
-
-            batched_all_boxes = torch.cat(decoded_boxes_all_levels, dim=1)
-            batched_all_scores = torch.cat(decoded_scores_all_levels, dim=1)
-            return self._batch_nms_and_pad(batched_all_boxes, batched_all_scores)
-
     def _batch_nms_and_pad(self,
                            batched_boxes: torch.Tensor,    # (B, Total_Anchors_All_Levels, 4)
                            batched_scores: torch.Tensor   # (B, Total_Anchors_All_Levels, NC)
                           ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         
-        # B_val = batched_boxes.shape[0] # Get shape element; for Proxy, this is symbolic
-        # We know for tracing with example_inputs, B_val will be 1.
-        # For runtime, it can be > 1.
+        B, N_anchors, NC = batched_scores.shape
+        device = batched_boxes.device
 
-        # The loop is the problem for tracing if range() gets a Proxy.
-        # However, many models with NMS are exported to ONNX using this loop structure.
-        # The key is that the ops inside are fine and the dynamic batch axis handles it.
+        # 1. Reshape inputs for batched_nms
+        # boxes: (B * N_anchors, 4)
+        # scores_flat: (B * N_anchors, NC)
+        boxes_flat = batched_boxes.reshape(-1, 4)
+        scores_flat = batched_scores.reshape(-1, NC)
 
-        # Let's ensure the inputs to the loop body are sliced correctly.
-        # The main problem is `range(B_proxy)`.
-
-        # If the example batch size is 1, the loop `for b_idx in range(batched_boxes.shape[0])`
-        # should effectively be `for b_idx in range(1)`.
-        # The PyTorch FX tracer might be failing to concretize `batched_boxes.shape[0]` to an
-        # integer for `range()` even when the example input has batch size 1.
-
-        # One way to handle this is to use `torch.unbind` to get a list of tensors,
-        # then iterate through that list. `torch.unbind` is traceable.
+        # 2. Create idxs tensor for batched_nms
+        # This tensor indicates which batch item each box belongs to.
+        # (B * N_anchors,)
+        idxs_batch_membership = torch.arange(B, device=device, dtype=torch.long).view(B, 1).expand(B, N_anchors).reshape(-1)
         
-        # Unbind the batch dimension. This creates a list of tensors.
-        # boxes_per_image_list: List of Tensors, each (Total_Anchors, 4)
-        # scores_per_image_list: List of Tensors, each (Total_Anchors, NC)
-        # Length of list will be B.
+        final_batched_boxes = torch.zeros((B, self.max_det, 4), dtype=batched_boxes.dtype, device=device)
+        final_batched_scores = torch.zeros((B, self.max_det), dtype=batched_scores.dtype, device=device)
+        final_batched_labels = torch.full((B, self.max_det), -1, dtype=torch.long, device=device)
+
+        # Process each class separately for NMS, then combine and pick top overall.
+        # Or, more commonly for object detection, get max score per anchor and do class-agnostic NMS per image.
+        # Let's assume we want to do NMS per image, considering the top score for each anchor.
+
+        # Get the top score and corresponding class for each anchor in each batch item
+        # conf_per_anchor_batched: (B, N_anchors)
+        # labels_per_anchor_batched: (B, N_anchors)
+        conf_per_anchor_batched, labels_per_anchor_batched = torch.max(batched_scores, dim=2)
+
+        # Flatten these for batched_nms (or loop and do per-image NMS if batched_nms struggles with class handling here)
+        # conf_flat: (B * N_anchors,)
+        conf_flat = conf_per_anchor_batched.reshape(-1)
         
-        # If B is symbolic, len(list) from unbind might also be symbolic for list comprehensions.
-        # However, a direct Python for loop over a list of Proxies (if unbind returns that)
-        # is usually traceable.
-
-        boxes_per_image_list = torch.unbind(batched_boxes, dim=0)
-        scores_per_image_list = torch.unbind(batched_scores, dim=0)
-
-        output_boxes_list: List[torch.Tensor] = []
-        output_scores_list: List[torch.Tensor] = []
-        output_labels_list: List[torch.Tensor] = []
-
-        # This loop iterates over a list of tensors (or Proxies to tensors).
-        # This pattern is often more traceable than `range(symbolic_B)`.
-        for boxes_img, scores_img in zip(boxes_per_image_list, scores_per_image_list):
-            # boxes_img: (Total_Anchors, 4)
-            # scores_img: (Total_Anchors, NC)
-
-            conf_per_anchor, labels_per_anchor = torch.max(scores_img, dim=1)
-            keep_by_score_mask = conf_per_anchor >= self.score_th
-            
-            boxes_above_thresh = boxes_img[keep_by_score_mask]
-            scores_above_thresh = conf_per_anchor[keep_by_score_mask]
-            labels_above_thresh = labels_per_anchor[keep_by_score_mask]
-
-            # tvops.nms can handle empty inputs for boxes_above_thresh
-            nms_keep_indices = tvops.nms(boxes_above_thresh, scores_above_thresh, self.iou_th)
-            nms_keep_indices_topk = nms_keep_indices[:self.max_det] # Slicing also handles < max_det results
-
-            boxes_after_nms = boxes_above_thresh[nms_keep_indices_topk]
-            scores_after_nms = scores_above_thresh[nms_keep_indices_topk]
-            labels_after_nms = labels_above_thresh[nms_keep_indices_topk]
-            
-            num_current_dets = boxes_after_nms.shape[0]
-            pad_size = self.max_det - num_current_dets
-            
-            # F.pad needs pad_size. If num_current_dets is symbolic, pad_size is symbolic.
-            # This should be fine as F.pad can often handle symbolic padding derived from symbolic shapes.
-            padded_boxes = F.pad(boxes_after_nms, (0, 0, 0, pad_size), mode='constant', value=0.0)
-            padded_scores = F.pad(scores_after_nms, (0, pad_size), mode='constant', value=0.0)
-            padded_labels = F.pad(labels_after_nms, (0, pad_size), mode='constant', value=-1) 
-
-            output_boxes_list.append(padded_boxes)
-            output_scores_list.append(padded_scores)
-            output_labels_list.append(padded_labels)
-
-        # Stack the list of processed tensors back into a single batched tensor.
-        # This is also a traceable operation.
-        final_boxes = torch.stack(output_boxes_list, dim=0)
-        final_scores = torch.stack(output_scores_list, dim=0)
-        final_labels = torch.stack(output_labels_list, dim=0)
+        # Apply score threshold *before* NMS to reduce candidates
+        keep_by_score_mask = conf_flat >= self.score_th
         
-        return final_boxes, final_scores, final_labels
+        boxes_to_nms = boxes_flat[keep_by_score_mask]
+        scores_to_nms = conf_flat[keep_by_score_mask]
+        idxs_batch_membership_to_nms = idxs_batch_membership[keep_by_score_mask]
+        # We also need to keep track of the original labels for the boxes that pass the score threshold
+        original_labels_flat = labels_per_anchor_batched.reshape(-1)
+        labels_to_nms = original_labels_flat[keep_by_score_mask]
+
+        if boxes_to_nms.numel() == 0: # No boxes passed score threshold
+            return final_batched_boxes, final_batched_scores, final_batched_labels
+
+        # Apply batched NMS
+        # `batched_nms` performs NMS independently for items with different `idxs`.
+        # It means it will do NMS per batch item effectively.
+        keep_indices_after_nms = tvops.batched_nms(
+            boxes_to_nms,          # (K, 4)
+            scores_to_nms,         # (K,)
+            idxs_batch_membership_to_nms, # (K,)
+            self.iou_th
+        )
+        # keep_indices_after_nms are indices into boxes_to_nms, scores_to_nms, etc.
+
+        # Select the detections that were kept by NMS
+        boxes_kept = boxes_to_nms[keep_indices_after_nms]
+        scores_kept = scores_to_nms[keep_indices_after_nms]
+        labels_kept = labels_to_nms[keep_indices_after_nms]
+        batch_indices_kept = idxs_batch_membership_to_nms[keep_indices_after_nms]
+
+        # Now, distribute these kept detections back into the per-batch item slots,
+        # select top self.max_det for each, and pad.
+        # This part is tricky because `batched_nms` output is flat.
+
+        for b_idx in range(B):
+            # Find all detections belonging to the current batch item b_idx
+            detections_for_this_batch_item_mask = (batch_indices_kept == b_idx)
+            
+            current_boxes = boxes_kept[detections_for_this_batch_item_mask]
+            current_scores = scores_kept[detections_for_this_batch_item_mask]
+            current_labels = labels_kept[detections_for_this_batch_item_mask]
+
+            # Sort by score to pick top_k (if NMS doesn't already sort, it usually does)
+            # NMS output is often sorted by score, but to be safe:
+            # Not strictly necessary if NMS output is sorted, but good for explicit top-k.
+            # Or, batched_nms might already respect some max_detections_per_class or similar.
+            # torchvision.ops.batched_nms does not have a top-k per class/group.
+            # So we take all, then filter to self.max_det for each image.
+
+            num_dets_for_batch_item = current_boxes.shape[0]
+            
+            if num_dets_for_batch_item > 0:
+                # If we need to sort by score (NMS usually does, but let's assume we might need to re-sort or just take top)
+                # For simplicity, NMS output is generally good enough to take the first N.
+                # If NMS output isn't sorted by score, you'd sort here.
+                # For now, assume tvops.batched_nms gives high-scoring ones first within each group.
+                
+                num_to_fill = min(num_dets_for_batch_item, self.max_det)
+                
+                final_batched_boxes[b_idx, :num_to_fill] = current_boxes[:num_to_fill]
+                final_batched_scores[b_idx, :num_to_fill] = current_scores[:num_to_fill]
+                final_batched_labels[b_idx, :num_to_fill] = current_labels[:num_to_fill]
+        
+        return final_batched_boxes, final_batched_scores, final_batched_labels
 
     def forward(self, neck_feature_maps: Tuple[torch.Tensor, ...]):
         # (This part is likely fine from previous fixes, assuming _decode_predictions_for_level is okay)
@@ -630,20 +435,6 @@ class PicoDet(nn.Module):
         p3, p4, p5 = self.neck(c3, c4, c5)
         return self.head((p3, p4, p5))
 
-# ──────────────────────── preprocess wrapper ──────────────────────
-class ResizeNormOLD(nn.Module):
-    def __init__(self, size: Tuple[int, int] = (224, 224)):
-        super().__init__()
-        self.size = size
-        mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
-        std  = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
-        self.register_buffer('m', mean, persistent=False)
-        self.register_buffer('s', std, persistent=False)
-
-    def forward(self, x: torch.Tensor):
-        if x.shape[-2:] != self.size:
-            x = F.interpolate(x, self.size, mode='bilinear', align_corners=False)
-        return (x.float() / 255. - self.m) / self.s
 
 class ResizeNorm(nn.Module):
     def __init__(self, size: Tuple[int, int], mean: Tuple[float, ...] = (0.485, 0.456, 0.406),
@@ -659,9 +450,9 @@ class ResizeNorm(nn.Module):
         # FX-friendly: always interpolate to the target self.size.
         # If input x is already self.size, F.interpolate is often a no-op or very fast.
         # Using antialias=True is generally recommended for better image quality during resizing.
-        # It might require a newer PyTorch version. If it causes issues, you can remove it.
         x = F.interpolate(x, self.size, mode='bilinear', align_corners=False, antialias=True) 
-        
+        # x = F.interpolate(x, self.size, mode='nearest', align_corners=False, antialias=False)  # faster
+
         # Normalization
         return (x.float() / 255.0 - self.m) / self.s
 
@@ -675,115 +466,6 @@ def _dummy_out_chs(model: nn.Module, feat_nodes: List[str]):
     x = torch.randn(1, 3, 224, 224)
     out = model(x)
     return tuple(out[n].shape[1] for n in feat_nodes)
-
-def get_backbone_old(arch: str = 'mnv3', ckpt: str | None = None, width: float = 1.0, *, pretrained: bool = True):
-    """Return backbone "features‑only" module + (C3, C4, C5) channel dims."""
-    if arch == 'mnv3':
-        weights = mobilenet_v3_small(weights='IMAGENET1K_V1' if pretrained else None, width_mult=width).state_dict()
-        base = mobilenet_v3_small(weights=None, width_mult=width)
-        if pretrained:
-            base.load_state_dict(weights)
-        return_nodes = {
-            'features.3': 'C3',  # stride 8
-            'features.6': 'C4',  # stride 16
-            'features.12': 'C5'  # stride 32
-        }
-        extractor = create_feature_extractor(base, return_nodes)
-        chs = _dummy_out_chs(extractor, list(return_nodes.values()))
-        backbone = extractor
-    elif arch in {'mnv4s', 'mnv4m'}:
-        name = {'mnv4s': 'mobilenetv4_conv_small', 'mnv4m': 'mobilenetv4_conv_medium'}[arch]
-        backbone = timm.create_model(name, pretrained=pretrained, features_only=True,
-                                     out_indices=(2, 4, 6))  # layers whose reductions are 8/16/32
-        chs = tuple(backbone.feature_info.channels())
-    else:
-        raise ValueError(f'unknown arch {arch}')
-
-    if ckpt is not None:
-        sd = torch.load(ckpt, map_location='cpu')
-        miss, unexp = backbone.load_state_dict(sd, strict=False)
-        if miss:
-            warnings.warn(f'Missing keys in ckpt: {miss}')
-        if unexp:
-            warnings.warn(f'Unexpected keys in ckpt: {unexp}')
-    return backbone, chs
-
-def get_backbone_older(arch: str, ckpt: str | None):
-    pretrained = ckpt is None
-    if arch == "mnv3":
-        from torchvision import models as tvm
-        base = tvm.mobilenet_v3_small(
-            weights=tvm.MobileNet_V3_Small_Weights.IMAGENET1K_V1 if pretrained else None,
-            width_mult=1.0,
-            dropout=0.0,
-        )
-        class V3Backbone(torch.nn.Module):
-            """Return C3, C4, C5 (28×28, 14×14, 7×7) from mobilenet_v3_small."""
-            idxs = {3, 6, 12}                     # ← the correct stride 8/16/32 layers
-             
-            def __init__(self, mdl):
-                super().__init__(); self.features = mdl.features
-             
-            def forward(self, x):
-                outs = []
-                for i, layer in enumerate(self.features):
-                    x = layer(x)
-                    if i in self.idxs:
-                        outs.append(x)
-                return outs                      # [c3, c4, c5]
-         
-        net = V3Backbone(base)
-        feat_chs = (24, 40, 576)
-    
-    else:  # MobileNet-V4 Conv-Small / Medium
-        import timm
-        name = {
-            "mnv4s": "mobilenetv4_conv_small",
-            "mnv4m": "mobilenetv4_conv_medium"
-        }[arch]
-        base = timm.create_model(
-            name,
-            pretrained=pretrained,
-            num_classes=0,
-            drop_rate=0.0,
-            drop_path_rate=0.0,
-            features_only=True,
-            out_indices=(2, 3, 4),              # stride 8/16/32
-        )
-
-        class TimmBackbone(torch.nn.Module):
-            def __init__(self, mdl): super().__init__(); self.mdl = mdl
-            def forward(self, x): return self.mdl(x)        # already returns list
-        net = TimmBackbone(base)
-        feat_chs = tuple(m["num_chs"] for m in base.feature_info)
-    
-    if ckpt is not None:
-        net.load_state_dict(torch.load(ckpt, map_location="cpu"), strict=False)
-    
-    return net, feat_chs
-
-
-# ───────────────────────── full detector ─────────────────────────
-class PicoDetOLD(nn.Module):
-    def __init__(self, backbone: nn.Module, feat_chs: Tuple[int, int, int],
-                 num_classes: int = 80):
-        super().__init__()
-        self.pre = ResizeNorm()
-        self.backbone = backbone
-        self.neck = CSPPAN(feat_chs)
-        self.head = PicoDetHead(num_classes)
-
-    def forward(self, x: torch.Tensor):
-        x = self.pre(x)
-        feats_out = self.backbone(x)  # returns dict (mnv3 extractor) or list(tuple) (timm)
-        if isinstance(feats_out, dict):
-            c3, c4, c5 = feats_out['C3'], feats_out['C4'], feats_out['C5']
-        else:
-            c3, c4, c5 = feats_out  # list[Tensor]
-        p3, p4, p5 = self.neck(c3, c4, c5)
-        return self.head((p3, p4, p5))
-
-###########
 
 
 # Helper to wrap torchvision's create_feature_extractor to output a list
@@ -936,28 +618,6 @@ def get_backbone(arch: str, ckpt: str | None, img_size: int = 224): # Added img_
 
     net.train() # Ensure model is in train mode by default after potential .eval() in helper
     return net, feat_chs
-
-# In PicoDet class forward method:
-class PicoDetOLD2(nn.Module):
-    def __init__(self, backbone: nn.Module, feat_chs: Tuple[int, int, int],
-                 num_classes: int = 80, neck_out_ch: int = 96, IMG_SIZE: int = 224): # Added neck_out_ch
-        super().__init__()
-        self.pre = ResizeNorm((IMG_SIZE, IMG_SIZE)) # Ensure IMG_SIZE is accessible or passed
-        self.backbone = backbone
-        # Pass the dynamic feat_chs and the desired neck output channels
-        self.neck = CSPPAN(in_chs=feat_chs, out_ch=neck_out_ch)
-        self.head = PicoDetHead(num_classes=num_classes, num_feats=neck_out_ch) # Head takes neck's out_ch
-
-    def forward(self, x: torch.Tensor):
-        x = self.pre(x)
-        # Backbone is now expected to return a list/tuple [c3, c4, c5]
-        # The elements are tensors: (B, CH_c3, H/8, W/8), (B, CH_c4, H/16, W/16), (B, CH_c5, H/32, W/32)
-        c3, c4, c5 = self.backbone(x)
-        # Neck processes these features
-        # Input to neck: c3, c4, c5
-        # Output from neck: p3, p4, p5 (these will have `neck_out_ch` channels)
-        p3, p4, p5 = self.neck(c3, c4, c5)
-        return self.head((p3, p4, p5))
     
 # Convenience export
 __all__ = [

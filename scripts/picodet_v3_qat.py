@@ -153,7 +153,7 @@ class SimOTACache:
             
             # Original cls_cost was -torch.eye(self.nc)[tgt['labels']][None,:,:].max(-1).values.T
             # This simplifies to a tensor of -1s of shape (M,1) if labels are one-hot represented.
-            cls_cost_val = -1.0 # Assuming this is the intended constant classification cost component.
+            cls_cost_val = -1.0 # This might need to be changed
             cls_cost = torch.full((M, 1), cls_cost_val, device=device, dtype=torch.float32)
             # print(f"[SimOTACache DEBUG] cls_cost shape: {cls_cost.shape}, value: {cls_cost_val}")
 
