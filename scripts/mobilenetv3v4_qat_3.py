@@ -177,6 +177,11 @@ def get_backbone(arch: str, ncls: int, width: float,
             weights=tvm.MobileNet_V3_Small_Weights.IMAGENET1K_V1 if pretrained else None,
             width_mult=width, dropout=drop_rate)
         model.classifier[3] = nn.Linear(model.classifier[3].in_features, ncls)
+    elif arch == "mnv3l":
+        model = tvm.mobilenet_v3_large(
+            weights=tvm.MobileNet_V3_Large_Weights.IMAGENET1K_V2 if pretrained else None,
+            width_mult=width, dropout=drop_rate)
+        model.classifier[3] = nn.Linear(model.classifier[3].in_features, ncls)
     elif arch == "mnv2":
         model = tvm.mobilenet_v2(
             weights=tvm.MobileNet_V2_Weights.IMAGENET1K_V2 if pretrained else None,
@@ -346,8 +351,8 @@ def evaluate(model, loader, dev):
 
 # --- Main script execution ---
 data_dir: str = "filtered_imagenet2_native" # Example, replace with your actual path
-epochs: int = 2 # Reduced for quick testing, set to your desired value (e.g., 55)
-qat_epochs: int = 2 # Reduced for quick testing, set to your desired value (e.g., 5)
+epochs: int = 500 # Reduced for quick testing, set to your desired value (e.g., 55)
+qat_epochs: int = 8 # Reduced for quick testing, set to your desired value (e.g., 5)
 batch: int = 64
 lr: float = 0.025
 qat_lr_factor: float = 0.05
@@ -416,7 +421,7 @@ model = build_model(ncls, width_mult, dev, arch=arch, pretrained=pretrained, dro
 crit = nn.CrossEntropyLoss(label_smoothing=0.1)
 scaler = torch.amp.GradScaler(enabled=(dev.type == "cuda" and not compile_model)) # torch.compile may not like scaler with fullgraph
 
-stock_trainer = True
+stock_trainer = False
 if stock_trainer:
     # used for faster, simpler testing
     opt = optim.SGD(model.parameters(), lr=lr, momentum=0.9, weight_decay=1e-4)
@@ -731,7 +736,7 @@ except Exception as e_load:
 
 print(f"[INFO] Performing ONNX Runtime static quantization on {onnx_fp32_path}...")
 
-onnx_model_optimized_path = final_model_for_export.replace(".onnx", "_optimized.onnx")
+onnx_model_optimized_path = onnx_path.replace(".onnx", "_optimized.onnx")
 sess_options = ort.SessionOptions()
 # Set graph optimization level
 # ORT_ENABLE_BASIC, ORT_ENABLE_EXTENDED, ORT_ENABLE_ALL
@@ -743,7 +748,7 @@ sess_options.optimized_model_filepath = onnx_model_optimized_path
 
 # Create a session with the model and options to trigger optimization and save.
 # We don't actually need to run inference here.
-_ = ort.InferenceSession(final_model_for_export, sess_options, providers=['CPUExecutionProvider'])
+_ = ort.InferenceSession(onnx_path, sess_options, providers=['CPUExecutionProvider'])
 
 if os.path.exists(onnx_model_optimized_path):
     print(f"[INFO] Optimized ONNX model saved to: {onnx_model_optimized_path}")
