@@ -3,15 +3,19 @@
 """
 MobileNetV3-Small/V2/V4s → QAT → INT8 ONNX (opset-17, full pipeline).
 Corrected QAT workflow for PyTorch FX.
+Torch 2.7, cuda 12.8, onnx 1.17.0
+
+main thing to try that is not here is diffusion
 """
 
 from __future__ import annotations
-import json, os, random, warnings, copy # Added copy
+import json, os, random, warnings, copy, sys # Added copy
 from pathlib import Path
 
 import torch, torch.nn as nn, torch.optim as optim
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 import torchvision.transforms.v2 as T_v2
+from torchvision.transforms.v2 import MixUp, CutMix
 import torchvision.models as tvm
 import torchvision.datasets as dsets
 from torchvision.io import read_image, ImageReadMode
@@ -28,6 +32,10 @@ from torch.ao.quantization.backend_config import get_native_backend_config # Cor
 warnings.filterwarnings(
     "ignore", message="'.*has_(cuda|cudnn|mps|mkldnn).*is deprecated", module="torch.overrides"
 )
+
+
+folder_to_add = r"C:\Users\Colin\qat_onnx_models\scripts" # Use 'r' for raw string to handle backslashes
+sys.path.append(folder_to_add)
 
 SEED, IMG_SIZE, NUM_WORKERS = 42, 224, 0
 DUMMY_H, DUMMY_W = IMG_SIZE + 32, IMG_SIZE + 64 # Used for QAT example input
@@ -160,18 +168,47 @@ def replace_timm_bn_act_with_torch_bn_and_act(module: nn.Module, module_name_pre
         else:
             replace_timm_bn_act_with_torch_bn_and_act(child_module, full_child_name)
 
-# --- In your `get_backbone` function (or after it's called) ---
 def get_backbone(arch: str, ncls: int, width: float,
                  pretrained: bool, drop_rate: float = 0.0,
                  drop_path_rate: float = 0.0,
-                 replace_bn_for_qat: bool = False) -> nn.Module: # Added flag
-    # ... (original model creation for mnv3, mnv2) ...
+                 replace_bn_for_qat: bool = False) -> nn.Module:
     if arch == "mnv3":
-        # ...
-        pass
+        model = tvm.mobilenet_v3_small(
+            weights=tvm.MobileNet_V3_Small_Weights.IMAGENET1K_V1 if pretrained else None,
+            width_mult=width, dropout=drop_rate)
+        model.classifier[3] = nn.Linear(model.classifier[3].in_features, ncls)
     elif arch == "mnv2":
-        # ...
-        pass
+        model = tvm.mobilenet_v2(
+            weights=tvm.MobileNet_V2_Weights.IMAGENET1K_V2 if pretrained else None,
+            width_mult=width,
+        )
+        # 1. Get the input features for the final linear layer
+        # The default classifier is Sequential(Dropout, Linear)
+        # The in_features for the Linear layer is at classifier[1].in_features
+        in_features = model.classifier[1].in_features
+        # 2. Reconstruct the classification head with inplace=False for Dropout
+        # This is the most robust way when replacing the head for fine-tuning
+        new_classifier_layers = []
+        if drop_rate is not None and drop_rate > 0.0:
+            # Use inplace=False explicitly for better tracing compatibility
+            new_classifier_layers.append(nn.Dropout(p=drop_rate, inplace=False))
+        
+        new_classifier_layers.append(nn.Linear(in_features, ncls))
+        
+        model.classifier = nn.Sequential(*new_classifier_layers)
+    elif arch == "mnv4c":
+        from customMobilenetNetv4 import MobileNetV4ConvSmallPico
+        # For PicoDet, you might want to set num_classes=0 and specify out_indices
+        # For classification as in this script, num_classes=ncls
+        model = MobileNetV4ConvSmallPico(
+            width_multiplier=width,
+            num_classes=ncls,
+            drop_rate=drop_rate, # For classifier
+            drop_path_rate=drop_path_rate # For stochastic depth in blocks
+            # out_features_indices can be set if used for detection later
+        )
+        # The model already has its own classifier if ncls > 0
+        # No need to replace model.classifier like for mnv3/mnv2
     elif arch in {"mnv4s", "mnv4m"}:
         try:
             import timm
@@ -265,7 +302,7 @@ def build_model(
                         drop_rate=drop_rate,
                         drop_path_rate=drop_path_rate)
     model = nn.Sequential(
-        T_v2.Resize((IMG_SIZE, IMG_SIZE), antialias=True), # 0: Resize
+        T_v2.Resize((IMG_SIZE, IMG_SIZE), antialias=True), # 0: Resize, antialias=False would be faster, antialias requires opset 18
         PreprocNorm(),                                   # 1: Preprocessing
         backbone                                         # 2: Backbone
     ).to(
@@ -274,13 +311,16 @@ def build_model(
     return model
 
 # ───────────────────── training helpers ─────────────────────────
-def train_epoch(model, loader, crit, opt, scaler, dev, ep, qat_mode_active:bool = False):
+def train_epoch(model, loader, crit, opt, scaler, dev, ep, qat_mode_active:bool = False, mixup_fn=None):
     model.train(); tot = loss_sum = 0
-    pbar_desc = f"QAT Epoch {ep+1}" if qat_mode_active else f"FP32 Epoch {ep+1}"
     for i, (img, lab) in enumerate(loader): # Consider adding tqdm here for progress
         img = img.to(dev, non_blocking=True,
                      memory_format=torch.channels_last if _CNL(dev) else torch.contiguous_format)
         lab = lab.to(dev, non_blocking=True)
+        # Apply MixUp/CutMix if provided
+        if mixup_fn and not qat_mode_active: # Usually not applied during QAT fine-tuning
+            # T_v2 MixUp/CutMix expect labels to be one-hotted if not already
+            img, lab = mixup_fn(img, lab) # lab will now be soft labels
         opt.zero_grad(set_to_none=True)
 
         if not qat_mode_active and dev.type == "cuda":
@@ -304,20 +344,19 @@ def evaluate(model, loader, dev):
         lab = lab.to(dev); corr += (model(img).argmax(1) == lab).sum().item(); tot += lab.size(0)
     return corr / tot
 
-# Removed the old get_qat_model_fx function as its logic will be inlined and corrected.
-
 # --- Main script execution ---
 data_dir: str = "filtered_imagenet2_native" # Example, replace with your actual path
-epochs: int = 1 # Reduced for quick testing, set to your desired value (e.g., 55)
-qat_epochs: int = 1 # Reduced for quick testing, set to your desired value (e.g., 5)
+epochs: int = 2 # Reduced for quick testing, set to your desired value (e.g., 55)
+qat_epochs: int = 2 # Reduced for quick testing, set to your desired value (e.g., 5)
 batch: int = 64
 lr: float = 0.025
 qat_lr_factor: float = 0.05
 width_mult: float = 1.0
 device_arg = None
 compile_model: bool = False
-arch: str = "mnv4s" # Change to "mnv2", "mnv3" as needed
+arch: str = "mnv3" # Change to "mnv2", "mnv3", "mnv4s" as needed
 pretrained: bool = True # Using pretrained weights for FP32 start
+drop_rate: float = 0.2
 
 if device_arg is None:
     device_name = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
@@ -338,8 +377,9 @@ if not Path(data_dir).exists() or not (Path(data_dir) / "train").exists() or not
 
 pretrain_str = "_pretrained" if pretrained else ""
 # Using a more descriptive name that includes QAT status
-output_base_name = f"mobilenet_w{str(width_mult).replace('.', '_')}_{arch}{pretrain_str}"
+output_base_name = f"mobilenet_w{str(width_mult).replace('.', '_')}_{arch}{pretrain_str}_drp{str(drop_rate).replace('.', '_')}"
 pt_path = f"{output_base_name}_qat_int8.pt" # For PyTorch INT8 state_dict
+onnx_fp32_path = f"{output_base_name}_fp32_from_qat.onnx"
 onnx_path = f"{output_base_name}_qat_int8.onnx" # For ONNX INT8 model
 
 # Create class_mapping.json if it doesn't exist for dummy runs
@@ -371,23 +411,116 @@ print(f"[INFO] #classes = {ncls}")
 tr = get_loader(data_dir, batch, True, dev)
 vl = get_loader(data_dir, batch, False, dev)
 
-model = build_model(ncls, width_mult, dev, arch=arch, pretrained=pretrained, drop_rate=0.2)
+model = build_model(ncls, width_mult, dev, arch=arch, pretrained=pretrained, drop_rate=drop_rate)
 
 crit = nn.CrossEntropyLoss(label_smoothing=0.1)
 scaler = torch.amp.GradScaler(enabled=(dev.type == "cuda" and not compile_model)) # torch.compile may not like scaler with fullgraph
 
-opt = optim.SGD(model.parameters(), lr=lr, momentum=0.9, weight_decay=1e-4)
-sched = CosineAnnealingLR(opt, T_max=epochs, eta_min=lr * 0.01)
+stock_trainer = True
+if stock_trainer:
+    # used for faster, simpler testing
+    opt = optim.SGD(model.parameters(), lr=lr, momentum=0.9, weight_decay=1e-4)
+    sched = CosineAnnealingLR(opt, T_max=epochs, eta_min=lr * 0.01)
+else:
+    # Define the new hyperparameters
+    peak_lr = 0.002
+    adamw_weight_decay = 0.01
+    adamw_beta1 = 0.6
+    adamw_beta2 = 0.999
+    adamw_epsilon = 1e-6
+    total_training_epochs = epochs if epochs > 10 else 10
+    warmup_epochs = 5
+    cosine_decay_alpha = 0.0 # This usually maps to eta_min_ratio or eta_min directly
+    
+    # 1. New Optimizer: AdamW
+    opt = optim.AdamW(
+        model.parameters(),
+        lr=peak_lr,
+        betas=(adamw_beta1, adamw_beta2),
+        eps=adamw_epsilon,
+        weight_decay=adamw_weight_decay
+    )
+    
+    # Cosine Annealing with Warm-up
+    # Warm-up scheduler: Linear increase from a very small LR to peak_lr
+    # The start_factor can be chosen to be very small, e.g., 1e-6, so LR effectively starts from 0
+    warmup_scheduler = LinearLR(
+        opt,
+        start_factor=1e-6, # Start from near zero
+        end_factor=1.0,    # End at the peak_lr
+        total_iters=warmup_epochs
+    )
+    
+    # Cosine Annealing scheduler: Decays from peak_lr to peak_lr * cosine_decay_alpha
+    # T_max is the total number of epochs for the cosine decay phase.
+    # eta_min is the minimum learning rate. Since cosine_decay_alpha is 0.0, eta_min will be 0.
+    cosine_scheduler = CosineAnnealingLR(
+        opt,
+        T_max=total_training_epochs - warmup_epochs, # Remaining epochs after warm-up
+        eta_min=peak_lr * cosine_decay_alpha # This will be 0 if cosine_decay_alpha is 0.0
+    )
+    
+    # Combine them using SequentialLR
+    # The schedulers will be applied sequentially.
+    # The `milestones` define when the next scheduler in the list takes over.
+    sched = SequentialLR(
+        opt,
+        schedulers=[warmup_scheduler, cosine_scheduler],
+        milestones=[warmup_epochs]
+    )
 
 print("[INFO] Starting FP32 training...")
+# if used, operate on batches, pass to mixup_fn
+mixup_or_cutmix = T_v2.RandomChoice([
+    MixUp(alpha=0.2, num_classes=ncls),
+    CutMix(alpha=1.0, num_classes=ncls)
+])
 for ep in range(epochs):
-    l = train_epoch(model, tr, crit, opt, scaler, dev, ep, qat_mode_active=False)
+    l = train_epoch(model, tr, crit, opt, scaler, dev, ep, qat_mode_active=False, mixup_fn=None)
     a = evaluate(model, vl, dev)
     sched.step()
     print(f"FP32 Epoch {ep+1}/{epochs}  loss {l:.4f}  val@1 {a*100:.2f}%  lr {opt.param_groups[0]['lr']:.5f}")
 
-# (Optional) Save FP32 backbone if needed for other purposes
-# ... your existing code for saving fp32_backbone_state_dict ...
+# save raw training for loading into object detector on same backbone
+print("[INFO] Extracting FP32 backbone state_dict...")
+try:
+    fp32_backbone_state_dict = {}
+    model.cpu()
+    full_sd = model.state_dict()
+
+    key_prefix = "2.classifier." if arch in ["mnv3", "mnv2"] else "2.head." if arch in ["mnv4s", "mnv4m"] else None
+    backbone_prefix = "2."
+
+    if key_prefix:
+        for k, v in full_sd.items():
+            if k.startswith(backbone_prefix) and not k.startswith(key_prefix):
+                fp32_backbone_state_dict[k[len(backbone_prefix):]] = v
+        if fp32_backbone_state_dict:
+            bpath = f"{pt_path}_fp32_backbone.pt"
+            Path(bpath).parent.mkdir(parents=True, exist_ok=True)
+            torch.save(fp32_backbone_state_dict, bpath)
+            print(f"[SAVE] FP32 PyTorch backbone state_dict → {bpath}")
+except Exception as e:
+    print("failed to export fp32 backbone: " + repr(e))
+
+try:
+    path = output_base_name + "fp32_onnx.onnx"
+    dummy_input_onnx_cpu = torch.randint(0, 256, (1, 3, IMG_SIZE, IMG_SIZE), dtype=torch.uint8)
+    torch.onnx.export(
+        model.cpu().eval(),
+        (dummy_input_onnx_cpu,),
+        path,
+        input_names=["input_u8"],
+        output_names=["logits"],
+        dynamic_axes={"input_u8": {0: "batch", 2: "height", 3: "width"}, "logits": {0: "batch"}},
+        opset_version=17,
+        do_constant_folding=True
+    )
+    print(f"[SAVE] ONNX model → {path}")
+except Exception as e:
+    print(f"[ERROR] ONNX export failed: {repr(e)}")
+    import traceback
+    traceback.print_exc()
 
 # ───────────────────────── QAT Process Start ─────────────────────────
 print("\n[INFO] Preparing model for QAT...")
@@ -517,7 +650,7 @@ try:
         input_names=["input_u8"],
         output_names=["logits"],
         dynamic_axes={"input_u8": {0: "batch", 2: "height", 3: "width"}, "logits": {0: "batch"}},
-        opset_version=17, # Using a recent opset
+        opset_version=17, # Using a recent opset, 18 has antialias resize
         do_constant_folding=True
     )
     print(f"[SAVE] INT8 ONNX model → {onnx_path}")
@@ -528,3 +661,118 @@ except Exception as e:
     traceback.print_exc()
 
 print("\n[DONE]")
+
+
+
+# onnx imports
+import onnx
+from onnxruntime.quantization import quantize_static, QuantFormat, QuantType
+import onnxruntime as ort
+
+
+# STATIC QUANTIZATION FROM ONNX to ONNX
+
+# --- Configuration ---
+num_calibration_batches = 100 # Number of batches to use for calibration
+onnx_int8_path = "mobilenet_v2_int8_ort_quantized.onnx"
+provider = "CPUExecutionProvider" # Or "CUDAExecutionProvider"
+
+# --- Configuration for ONNX Runtime PTQ ---
+# data_dir, batch_size, num_calibration_batches, onnx_int8_path, provider are already defined
+
+print("[INFO] Preparing calibration data for ONNX Runtime quantization...")
+# Calibration loader can run on CPU, ensure it yields uint8 tensors
+calibration_loader = get_loader(data_dir, batch, is_train=False, device=torch.device("cpu"))
+
+# Define a data reader for ONNX Runtime quantizer
+class DataReader:
+    def __init__(self, dataloader, num_batches, input_name: str): # input_name is still good for flexibility if this assumption is wrong
+        self.dataloader = dataloader
+        self.num_batches = num_batches
+        self.iterator = iter(dataloader)
+        self.count = 0
+        self.input_name = input_name
+        print(f"[DataReader INFO] Initialized to provide data for input key: '{self.input_name}'")
+
+
+    def get_next(self):
+        if self.count < self.num_batches:
+            try:
+                batch, _ = next(self.iterator) # batch should be uint8 from get_loader
+                self.count += 1
+                # ONNX Runtime expects input as a dictionary of numpy arrays
+                return {self.input_name: batch.numpy()}
+            except StopIteration:
+                print(f"[WARN] Calibration data exhausted after {self.count} batches. Using available batches.")
+                return None
+        else:
+            return None
+
+# FORCED INPUT NAME FOR CALIBRATOR:
+# The error message strongly suggests that the ORT Calibrator, when quantizing
+# for INT8/UINT8 activations, expects the calibration data feed to use the key "input_u8".
+calibrator_expected_input_key = "input_u8"
+print(f"[INFO] Using input key '{calibrator_expected_input_key}' for ONNX Runtime calibration data reader.")
+
+calibration_data_reader = DataReader(calibration_loader, num_calibration_batches, input_name=calibrator_expected_input_key)
+print(f"[INFO] Using {num_calibration_batches} batches for calibration (batch size {batch}).")
+
+# Also, add a debug print to confirm the input name of the onnx_fp32_path model itself
+try:
+    loaded_onnx_fp32_model = onnx.load(path)
+    if loaded_onnx_fp32_model.graph.input:
+        actual_model_input_name = loaded_onnx_fp32_model.graph.input[0].name
+        print(f"[DEBUG] The FP32 ONNX model at '{onnx_fp32_path}' has input node named: '{actual_model_input_name}'.")
+    else:
+        print(f"[DEBUG] The FP32 ONNX model at '{onnx_fp32_path}' has no graph.input defined.")
+except Exception as e_load:
+    print(f"[DEBUG] Could not load or inspect '{onnx_fp32_path}': {e_load}")
+
+
+print(f"[INFO] Performing ONNX Runtime static quantization on {onnx_fp32_path}...")
+
+onnx_model_optimized_path = final_model_for_export.replace(".onnx", "_optimized.onnx")
+sess_options = ort.SessionOptions()
+# Set graph optimization level
+# ORT_ENABLE_BASIC, ORT_ENABLE_EXTENDED, ORT_ENABLE_ALL
+sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+# sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL # Try ALL for more aggressive opts
+
+# Set up the output path for the optimized model
+sess_options.optimized_model_filepath = onnx_model_optimized_path
+
+# Create a session with the model and options to trigger optimization and save.
+# We don't actually need to run inference here.
+_ = ort.InferenceSession(final_model_for_export, sess_options, providers=['CPUExecutionProvider'])
+
+if os.path.exists(onnx_model_optimized_path):
+    print(f"[INFO] Optimized ONNX model saved to: {onnx_model_optimized_path}")
+    # Update the path to be used for quantization
+    onnx_model_path_for_quantization = onnx_model_optimized_path
+else:
+    print(f"[WARN] Optimized model was not saved to {onnx_model_optimized_path}. Using previous model path.")
+
+try:
+    if True:
+        quantize_static(
+            path,
+            onnx_int8_path,
+            calibration_data_reader,
+            quant_format=QuantFormat.QDQ,
+            per_channel=True,
+            weight_type=QuantType.QInt8,
+            activation_type=QuantType.QInt8 # This likely triggers the "input_u8" expectation
+        )
+        print(f"[INFO] ONNX Runtime INT8 quantized model saved to {onnx_int8_path}")
+    
+        onnx_quant_model = onnx.load(onnx_int8_path)
+        onnx.checker.check_model(onnx_quant_model)
+        print("[INFO] INT8 ONNX model check passed.")
+
+except Exception as e:
+    print(f"[ERROR] Failed to quantize ONNX model with ONNX Runtime: {e}")
+    import traceback
+    traceback.print_exc()
+    # exit()
+
+print("[DONE]")

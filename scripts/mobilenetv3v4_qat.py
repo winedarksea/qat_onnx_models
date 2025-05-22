@@ -7,9 +7,8 @@ Generally tested on pytorch 2.7.0 (pip installed), CUDA 12.8 (mamba installed fi
 """
 
 from __future__ import annotations
-import argparse, json, os, random, warnings
+import json, os, random, warnings
 from pathlib import Path
-from typing import List
 
 import torch, torch.nn as nn, torch.optim as optim
 from torch.optim.lr_scheduler import CosineAnnealingLR
@@ -26,6 +25,10 @@ from torch.ao.quantization import get_default_qat_qconfig_mapping, QConfig
 from torch.ao.quantization.observer import MovingAveragePerChannelMinMaxObserver
 from torch.ao.quantization.quantize_fx import prepare_qat_fx as prepare_qat_fx_torch, convert_fx as convert_fx_torch
 
+# onnx imports
+import onnx
+from onnxruntime.quantization import quantize_static, QuantFormat, QuantType
+import onnxruntime as ort
 
 warnings.filterwarnings(
     "ignore", message="'.*has_(cuda|cudnn|mps|mkldnn).*is deprecated", module="torch.overrides"
@@ -210,8 +213,8 @@ def get_qat_model_fx(model_fp32_cpu: nn.Module, example_inputs_cpu: tuple):
     return prepared_model
 
 data_dir: str = "filtered_imagenet2_native"
-epochs: int = 25
-qat_epochs: int = 5
+epochs: int = 2
+qat_epochs: int = 2
 batch: int = 64
 lr: float = 0.025
 qat_lr_factor: float = 0.05
@@ -230,7 +233,10 @@ dev = torch.device(device)
 print(f"[INFO] device: {dev}")
 
 pretrain_str = "_pretrained" if pretrained else ""
-pt_path = f"mobilenet_w{str(width_mult).replace('.', '_')}_{arch}{pretrain_str}_drp{drop_rate}_int8_fullpipe.pt"
+base_path = f"mobilenet_w{str(width_mult).replace('.', '_')}_{arch}{pretrain_str}_drp{str(drop_rate).replace('.', '_')}_int8_fullpipe"
+pt_path = base_path+ ".pt"
+onnx_fp32_path = f"{base_path}_fp32.onnx"
+
 
 with open(Path(data_dir) / "class_mapping.json") as f:
     ncls = len(json.load(f)); print(f"[INFO] #classes = {ncls}")
@@ -295,8 +301,16 @@ for qep in range(qat_epochs):
     val_acc_q = evaluate(qat_model, vl, qat_train_device)
     print(f"[QAT] Epoch {qep+1}/{qat_epochs} loss {l_q:.4f} val@1 {val_acc_q*100:.2f}%")
 
-print("[INFO] Converting QAT model to INT8")
 qat_model.cpu().eval()
+qat_model_for_export = qat_model.cpu().eval()
+qat_model_for_export.apply(torch.ao.quantization.disable_fake_quant)
+qat_model_for_export.apply(torch.ao.quantization.disable_observer)
+torch.save(qat_model_for_export.state_dict(), "qat_model.pth") # Save the state_dict
+print("[INFO] QAT model state_dict saved to qat_model.pth")
+fp32_model_for_onnx_export = build_model(ncls, width_mult, torch.device("cpu"), arch=arch, pretrained=False, drop_rate=drop_rate).cpu().eval()
+fp32_model_for_onnx_export.load_state_dict(torch.load("qat_model.pth")) # Load the state_dict
+print("[INFO] QAT model state_dict loaded.")
+
 int8_model_final = convert_fx_torch(qat_model)
 
 if compile_model:
@@ -332,5 +346,129 @@ except Exception as e:
     print(f"[ERROR] ONNX export failed: {repr(e)}")
     import traceback
     traceback.print_exc()
+
+try:
+    path = "fp32_onnx.onnx"
+    torch.onnx.export(
+        model,
+        (dummy_input_onnx_cpu,),
+        path,
+        input_names=["input_u8"],
+        output_names=["logits"],
+        dynamic_axes={"input_u8": {0: "batch", 2: "height", 3: "width"}, "logits": {0: "batch"}},
+        opset_version=17,
+        do_constant_folding=True
+    )
+    print(f"[SAVE] ONNX model → {path}")
+except Exception as e:
+    print(f"[ERROR] ONNX export failed: {repr(e)}")
+    import traceback
+    traceback.print_exc()
+
+# STATIC QUANTIZATION FROM ONNX to ONNX
+
+# --- Configuration ---
+data_dir = "filtered_imagenet2_native" # Make sure this path is correct
+batch_size = 32 # Use a larger batch size for calibration for efficiency
+num_calibration_batches = 100 # Number of batches to use for calibration
+onnx_int8_path = "mobilenet_v2_int8_ort_quantized.onnx"
+provider = "CPUExecutionProvider" # Or "CUDAExecutionProvider"
+# ... (after INT8 ONNX export from PyTorch QAT model)
+
+# --- Configuration for ONNX Runtime PTQ ---
+# data_dir, batch_size, num_calibration_batches, onnx_int8_path, provider are already defined
+
+print("[INFO] Preparing calibration data for ONNX Runtime quantization...")
+# Calibration loader can run on CPU, ensure it yields uint8 tensors
+calibration_loader = get_loader(data_dir, batch_size, is_train=False, device=torch.device("cpu"))
+
+# Define a data reader for ONNX Runtime quantizer
+class DataReader:
+    def __init__(self, dataloader, num_batches, input_name: str): # input_name is still good for flexibility if this assumption is wrong
+        self.dataloader = dataloader
+        self.num_batches = num_batches
+        self.iterator = iter(dataloader)
+        self.count = 0
+        self.input_name = input_name
+        print(f"[DataReader INFO] Initialized to provide data for input key: '{self.input_name}'")
+
+
+    def get_next(self):
+        if self.count < self.num_batches:
+            try:
+                batch, _ = next(self.iterator) # batch should be uint8 from get_loader
+                self.count += 1
+                # ONNX Runtime expects input as a dictionary of numpy arrays
+                return {self.input_name: batch.numpy()}
+            except StopIteration:
+                print(f"[WARN] Calibration data exhausted after {self.count} batches. Using available batches.")
+                return None
+        else:
+            return None
+
+# FORCED INPUT NAME FOR CALIBRATOR:
+# The error message strongly suggests that the ORT Calibrator, when quantizing
+# for INT8/UINT8 activations, expects the calibration data feed to use the key "input_u8".
+calibrator_expected_input_key = "input_u8"
+print(f"[INFO] Using input key '{calibrator_expected_input_key}' for ONNX Runtime calibration data reader.")
+
+calibration_data_reader = DataReader(calibration_loader, num_calibration_batches, input_name=calibrator_expected_input_key)
+print(f"[INFO] Using {num_calibration_batches} batches for calibration (batch size {batch_size}).")
+
+# Also, add a debug print to confirm the input name of the onnx_fp32_path model itself
+try:
+    loaded_onnx_fp32_model = onnx.load(path)
+    if loaded_onnx_fp32_model.graph.input:
+        actual_model_input_name = loaded_onnx_fp32_model.graph.input[0].name
+        print(f"[DEBUG] The FP32 ONNX model at '{onnx_fp32_path}' has input node named: '{actual_model_input_name}'.")
+    else:
+        print(f"[DEBUG] The FP32 ONNX model at '{onnx_fp32_path}' has no graph.input defined.")
+except Exception as e_load:
+    print(f"[DEBUG] Could not load or inspect '{onnx_fp32_path}': {e_load}")
+
+
+print(f"[INFO] Performing ONNX Runtime static quantization on {onnx_fp32_path}...")
+try:
+    onnx_model_optimized_path = path.replace(".onnx", "_optimized.onnx")
+    sess_options = ort.SessionOptions()
+    # Set graph optimization level
+    # ORT_ENABLE_BASIC, ORT_ENABLE_EXTENDED, ORT_ENABLE_ALL
+    sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_EXTENDED
+    # sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL # Try ALL for more aggressive opts
+    
+    # Set up the output path for the optimized model
+    sess_options.optimized_model_filepath = onnx_model_optimized_path
+    
+    # Create a session with the model and options to trigger optimization and save.
+    # We don't actually need to run inference here.
+    _ = ort.InferenceSession(path, sess_options, providers=['CPUExecutionProvider'])
+    
+    if os.path.exists(onnx_model_optimized_path):
+        print(f"[INFO] Optimized ONNX model saved to: {onnx_model_optimized_path}")
+        # Update the path to be used for quantization
+        onnx_model_path_for_quantization = onnx_model_optimized_path
+    else:
+        print(f"[WARN] Optimized model was not saved to {onnx_model_optimized_path}. Using previous model path.")
+
+    quantize_static(
+        onnx_model_optimized_path,
+        onnx_int8_path,
+        calibration_data_reader,
+        quant_format=QuantFormat.QDQ,
+        per_channel=True,
+        weight_type=QuantType.QInt8,
+        activation_type=QuantType.QInt8 # This likely triggers the "input_u8" expectation
+    )
+    print(f"[INFO] ONNX Runtime INT8 quantized model saved to {onnx_int8_path}")
+
+    onnx_quant_model = onnx.load(onnx_int8_path)
+    onnx.checker.check_model(onnx_quant_model)
+    print("[INFO] INT8 ONNX model check passed.")
+
+except Exception as e:
+    print(f"[ERROR] Failed to quantize ONNX model with ONNX Runtime: {e}")
+    import traceback
+    traceback.print_exc()
+    # exit()
 
 print("[DONE]")

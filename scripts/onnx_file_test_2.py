@@ -99,7 +99,7 @@ def inspect_onnx_graph(onnx_model_path):
                                             "Add", "Mul", "Div", "Sub", # If operating on FP32 feature maps
                                             "AveragePool", "GlobalAveragePool", "MaxPool"} # If not QLinear* versions
         # Ops that should ideally be fused or are problematic if present
-        SHOULD_BE_FUSED_OR_ABSENT = {"BatchNormalization"}
+        SHOULD_BE_FUSED_OR_ABSENT = {"BatchNormalization", "InstanceNormalization", "Where"}
         # Common ops that are often part of the graph structure, activations, etc.
         # Not typically the main compute bottlenecks if the heavy ops are quantized.
         SUPPORT_OPS = {
@@ -212,7 +212,7 @@ def inspect_onnx_graph(onnx_model_path):
 
 # ───────────────────────────── main ─────────────────────────────
 # onnx_path = "mobilenet_w1_0_mnv3_pretrained_int8_fullpipe.onnx"
-onnx_path = "mobilenet_w1_0_mnv4s_pretrained_qat_int8.onnx"
+onnx_path = "mobilenet_w1_0_mnv2_pretrained_drp0_0_int8_fullpipe_optimized.onnx"
 data_dir = "filtered_imagenet2_native" # Make sure this path is correct
 batch = 1 # Keep batch=1 for per-image timing, but can increase for throughput tests
 provider = "CPUExecutionProvider"  # CPUExecutionProvider, CUDAExecutionProvider
