@@ -99,9 +99,7 @@ class SimOTACache:
                                             torch.arange(W, device=device), indexing='ij')
                     c = torch.stack((xv, yv), dim=2).reshape(-1, 2).to(torch.float32) * float(s_val) + float(s_val) * 0.5
                     self.cache[key] = c
-                    # print(f"[SimOTACache DEBUG] Cached centres for key {key} with shape {c.shape}")
-                # else:
-                    # print(f"[SimOTACache DEBUG] Cache hit for key: {key}.")
+
                 centres.append(self.cache[key])
                 strides_list.append(torch.full((H * W,), float(s_val), dtype=torch.float32, device=device))
             
@@ -113,9 +111,6 @@ class SimOTACache:
             
             centres = torch.cat(centres, dim=0)
             strides = torch.cat(strides_list, dim=0)
-            # print(f"[SimOTACache DEBUG] centres concatenated. Shape: {centres.shape}")
-            # print(f"[SimOTACache DEBUG] strides concatenated. Shape: {strides.shape}")
-
             A = centres.size(0)
             M = tgt['boxes'].size(0)
             # print(f"[SimOTACache DEBUG] Num anchors (A): {A}, Num GT objects (M): {M}")
@@ -219,13 +214,11 @@ def create_coco_contiguous_label_map(coco_api):
     cat_ids = coco_api.getCatIds()  # Get all category IDs present in the annotation file
     # It's good practice to sort them to ensure a consistent mapping,
     # especially if self.nc is based on a specific ordered subset (like the 80 standard COCO classes).
-    # If your model uses a specific predefined 80-class list, you'd map against that.
-    # For a general case, sorting all present IDs works.
     sorted_cat_ids = sorted(cat_ids)
     
     contiguous_map = {coco_id: i for i, coco_id in enumerate(sorted_cat_ids)}
     
-    # If your model is strictly for the 80 common COCO categories, you might want a fixed map:
+    # If the model is strictly for the 80 common COCO categories, you might want a fixed map:
     # For example:
     # coco_80_categories = [ # List of the 80 COCO category IDs in the desired order for your model
     #    1, 2, 3, ..., 90 # (actual IDs for the 80 classes)
@@ -234,8 +227,6 @@ def create_coco_contiguous_label_map(coco_api):
     # This ensures that, e.g., COCO ID 1 always maps to 0, ID 2 to 1, etc., *if* they are in your list.
 
     print(f"[INFO] Created COCO contiguous label map. {len(contiguous_map)} categories mapped.")
-    # print(f"   First 5 mappings: {list(contiguous_map.items())[:5]}")
-    # print(f"   Last 5 mappings: {list(contiguous_map.items())[-5:]}")
     return contiguous_map
 
 # ───────────────────── train / val loops ────────────────────────
@@ -264,13 +255,6 @@ def train_epoch(
                 f"Expected 4 outputs from model in training mode (preds_cls, preds_obj, preds_reg, strides), got {len(model_outputs)}"
             )
         cls_preds_levels, obj_preds_levels, reg_preds_levels, strides_per_level_tensors = model_outputs
-        
-        # head_nc and head_reg_max are now passed as arguments
-        # No need for:
-        # original_head_module = model.head
-        # ...
-        # head_nc = original_head_module.nc 
-        # head_reg_max = original_head_module.reg_max
 
         bs = imgs.size(0)
         # ... (fmap_shapes calculation using strides_per_level_tensors) ...
@@ -395,18 +379,9 @@ from torch.ao.quantization import (
 from torch.ao.quantization.quantize_fx import prepare_qat_fx, convert_fx
 
 
-def qat_prepare_OLD(model: nn.Module, example: torch.Tensor):
-    qmap = get_default_qat_qconfig_mapping('x86')
-    wobs = MovingAveragePerChannelMinMaxObserver.with_args(dtype=torch.qint8, qscheme=torch.per_channel_symmetric)
-    aobs = MovingAveragePerChannelMinMaxObserver.with_args(dtype=torch.quint8, qscheme=torch.per_channel_affine)
-    qmap = qmap.set_global(QConfig(aobs, wobs))
-    # skip preprocess from quant
-    qmap = qmap.set_module_name('pre', None)
-    return prepare_qat_fx(model.cpu(), qmap, (example,))
-
 def qat_prepare(model: nn.Module, example: torch.Tensor):
-    # backend = 'x86' # or 'fbgemm' which is often the default for x86
-    backend = 'qnnpack' # More explicit, often used for server-side QAT
+    # backend = 'x86' # or 'fbgemm' which is often the default for x86, 'qnnpack' for arm
+    backend = 'x86' # More explicit, often used for server-side QAT
     qmap = get_default_qat_qconfig_mapping(backend) # Use fbgemm or qnnpack
 
     # For weights: Per-channel quantization is good.
@@ -429,19 +404,12 @@ def qat_prepare(model: nn.Module, example: torch.Tensor):
     # Apply this qconfig globally
     qmap = qmap.set_global(custom_qconfig) # This might be too broad if some ops need special handling
 
-    # A more targeted approach if set_global is problematic:
-    # Iterate through module types and set specific qconfigs.
-    # For now, let's try correcting the global observers first.
-    # If `get_default_qat_qconfig_mapping` for 'fbgemm' already uses per-tensor for activations,
-    # you might not even need to manually set `aobs` and `wobs` globally like this
-    # unless you specifically want `MovingAveragePerChannelMinMaxObserver` for weights.
-
     # Let's refine the global qconfig:
     # Use per-channel for weights, per-tensor for activations.
     qconfig_global_refined = QConfig(
         activation=MovingAverageMinMaxObserver.with_args(
             dtype=torch.quint8, qscheme=torch.per_tensor_affine
-            # reduce_range=True # SOmetimes recommended for QNNPACK
+            # reduce_range=True # Sometimes recommended for QNNPACK
         ),
         weight=MovingAveragePerChannelMinMaxObserver.with_args(
             dtype=torch.qint8, qscheme=torch.per_channel_symmetric # Symmetric for weights is common
@@ -450,19 +418,8 @@ def qat_prepare(model: nn.Module, example: torch.Tensor):
     qmap_new = get_default_qat_qconfig_mapping(backend) # Start fresh
     qmap_new = qmap_new.set_global(qconfig_global_refined)
 
-
     # Skip quantization for the 'pre' module (ResizeNorm)
     qmap_new = qmap_new.set_module_name('pre', None)
-
-    # It's also common to skip quantization for specific operations if they cause issues
-    # or are not well-suited for quantization, e.g., some types of F.interpolate if they are problematic.
-    # For example, to skip a specific function:
-    # qmap = qmap.set_object_type(F.interpolate, None) # If interpolate was an issue
-
-    # Check if any other parts of PicoDetHead (like DFL projection buffers) are being observed
-    # when they shouldn't be. Buffers are usually not quantized unless part of a quantizable op.
-    # The error points to `_tensor_constant1` which is a *lifted attribute* in the QAT graph,
-    # not directly a buffer from your original model.
 
     return prepare_qat_fx(model.cpu(), qmap_new, (example,))
 
@@ -471,30 +428,7 @@ def unwrap_dataset(ds):
         ds = ds.dataset
     return ds
 
-def warn_missing_categories(coco_api, subset_indices, base_dataset):
-    """
-    Warn if some COCO categories are not present in the subset.
-    
-    Parameters:
-    - coco_api: COCO object (from dataset.coco)
-    - subset_indices: indices into the base COCO dataset (not subset)
-    - base_dataset: unwrapped base dataset (CocoDetection)
-    """
-    full_cat_ids = set(coco_api.getCatIds())
 
-    # Collect category IDs actually used in the subset annotations
-    used_cat_ids = set()
-    for ds_idx in subset_indices:
-        _, anns = base_dataset[ds_idx]  # ← base_dataset is the full CocoDetection dataset
-        used_cat_ids.update(ann['category_id'] for ann in anns)
-
-    missing = full_cat_ids - used_cat_ids
-    if missing:
-        print(f"[WARNING] {len(missing)} COCO categories are not present in the selected subset:")
-        print(f"   Missing category IDs: {sorted(missing)}")
-
-# NMS and padding utility function (adapted from old _batch_nms_and_pad)
-# This will be used by quick_val_iou
 def apply_nms_and_padding_to_raw_outputs(
     raw_boxes_batch: torch.Tensor, # (B, Total_Anchors, 4)
     raw_scores_batch: torch.Tensor, # (B, Total_Anchors, NC)
@@ -549,9 +483,10 @@ def apply_nms_and_padding_to_raw_outputs(
 
 
 @torch.no_grad()
-def quick_val_iou(model: PicoDet, loader, device, 
-                  # Pass NMS params needed if model head no longer holds them directly for this
-                  score_thresh: float, iou_thresh: float, max_detections: int):
+def quick_val_iou(
+    model: PicoDet, loader, device,
+    score_thresh: float, iou_thresh: float, max_detections: int
+):
     model.eval()
     total_iou_sum = 0.
     num_images_with_gt = 0
@@ -606,15 +541,6 @@ def quick_val_iou(model: PicoDet, loader, device,
     return total_iou_sum / num_images_with_gt if num_images_with_gt > 0 else 0.
 
 def main(argv: List[str] | None = None):
-    # ... (argparsing, device setup, get_backbone remain same) ...
-    # Make sure to pass inplace_act_for_head_neck=False to PicoDet constructor
-    # if you want to disable inplace operations in head and neck globally.
-    # Example:
-    # model = PicoDet(
-    #     backbone, feat_chs, num_classes=80, img_size=IMG_SIZE,
-    #     inplace_act_for_head_neck=False # <--- Add this
-    # ).to(dev)
-    
     pa = argparse.ArgumentParser()
     pa.add_argument('--coco_root', default='coco')
     pa.add_argument('--arch', choices=['mnv3', 'mnv4s', 'mnv4m'], default='mnv3')
@@ -623,7 +549,6 @@ def main(argv: List[str] | None = None):
     pa.add_argument('--workers', type=int, default=0)
     pa.add_argument('--device', default=None)
     pa.add_argument('--out', default='picodet_int8.onnx')
-    # Add argument to control inplace for head/neck for easier experimentation
     pa.add_argument('--no_inplace_head_neck', action='store_true', help="Disable inplace activations in head/neck")
     cfg = pa.parse_args(argv)
 
@@ -646,12 +571,8 @@ def main(argv: List[str] | None = None):
     vl_loader = get_loader(cfg.coco_root, 'val', cfg.batch, cfg.workers, subset_size=200)
 
     train_base_ds = unwrap_dataset(tr_loader.dataset)
-    # val_base_ds = unwrap_dataset(vl_loader.dataset)
     if hasattr(train_base_ds, 'coco') and train_base_ds.coco is not None:
         coco_label_map = create_coco_contiguous_label_map(train_base_ds.coco)
-    
-        if isinstance(tr_loader.dataset, torch.utils.data.Subset):
-            warn_missing_categories(train_base_ds.coco, tr_loader.dataset.indices, train_base_ds)
 
         if len(coco_label_map) != model.head.nc:
             print(f"[main WARNING] Number of categories in generated map ({len(coco_label_map)}) "
@@ -690,215 +611,279 @@ def main(argv: List[str] | None = None):
         sch.step()
         print(f'Epoch {ep + 1}/{cfg.epochs}  loss {l:.3f}  IoU {m:.3f}')
 
-    # ... (QAT preparation: model.train(), model.cpu(), qat_prepare(model, ...)) ...
+    # --- QAT Preparation ---
     print("[INFO] Preparing model for QAT...")
-    dummy_uint8_input = torch.randint(0, 256, (1, 3, IMG_SIZE, IMG_SIZE), dtype=torch.uint8, device='cpu')
-    preprocessor = ResizeNorm(size=(IMG_SIZE, IMG_SIZE))
-    example_float_input_for_qat = preprocessor(dummy_uint8_input.float()).cpu()
+    dummy_uint8_input_cpu = torch.randint(0, 256, (1, 3, IMG_SIZE, IMG_SIZE), dtype=torch.uint8, device='cpu')
 
-    model.train() 
-    model.cpu()    
-    
+    # The 'model' contains 'model.pre' (ResizeNorm).
+    # The 'example' for qat_prepare should be the input to 'model' itself.
+    # ResizeNorm is configured to take uint8 input and convert/normalize.
+    example_input_for_qat_entire_model = dummy_uint8_input_cpu.cpu()
+
+    model.train()
+    model.cpu()
+
     print("[INFO] Running qat_prepare...")
-    qat_model = qat_prepare(model, example_float_input_for_qat) 
+    # qat_prepare will trace the 'model', including 'model.pre'.
+    # 'model.pre' will be skipped for quantization inserts due to set_module_name('pre', None)
+    # but it will be part of the traced graph.
+    qat_model = qat_prepare(model, example_input_for_qat_entire_model)
     qat_model = qat_model.to(dev)
     print("[INFO] QAT model prepared and moved to device.")
 
-    # Debug inspection for _tensor_constant1 (if it reappears)
-    # The constant might be specific to the inference path trace if PicoDetHead.forward has different ops
-    if hasattr(qat_model, '_tensor_constant1'): # Check on qat_model directly
-        print(f"qat_model._tensor_constant1 exists. Value: {getattr(qat_model, '_tensor_constant1')}")
-    else:
-        # Try to find it deeper if it's a submodule attribute
-        found_constant = False
-        for name, sub_module in qat_model.named_modules():
-            if hasattr(sub_module, '_tensor_constant1'):
-                print(f"Found _tensor_constant1 in submodule {name}: {getattr(sub_module, '_tensor_constant1')}")
-                found_constant = True
-                break
-        if not found_constant:
-            print("Inspecting qat_model for _tensor_constant1... NOT FOUND anywhere.")
-
-
-    # --- QAT Finetuning ---
+    # ... (QAT Finetuning) ...
     qat_model.train()
     opt_q_params = filter(lambda p: p.requires_grad, qat_model.parameters())
-    opt_q = SGD(opt_q_params, lr=0.002, momentum=0.9)
+    opt_q = SGD(opt_q_params, lr=0.002, momentum=0.9) # Potentially adjust LR for QAT
     scaler_q = torch.amp.GradScaler(enabled=(dev.type == 'cuda'))
-    
-    print("[INFO] Starting QAT finetuning epochs...")
-    for qep in range(5):
-        lq = train_epoch(qat_model, tr_loader, opt_q, scaler_q, assigner, dev, qep, coco_label_map,
-                        head_nc_for_loss=original_model_head_nc, # Use values from original model
-                        head_reg_max_for_loss=original_model_head_reg_max, # Use values from original model
-                        dfl_project_buffer_for_decode=original_dfl_project_buffer) # Pass it
-        print(f'[QAT] Epoch {qep + 1}/5  loss {lq:.3f}')
-    qat_model.cpu().eval()
-    int8_model_no_nms = convert_fx(qat_model)
 
-    # ---------------- ONNX export (model without NMS) ------------------------------
-    int8_model_no_nms.eval()
+    print("[INFO] Starting QAT finetuning epochs...")
+    for qep in range(cfg.epochs // 2 or 1): # Example: finetune for half the FP32 epochs or at least 1
+        lq = train_epoch(qat_model, tr_loader, opt_q, scaler_q, assigner, dev, qep, coco_label_map,
+                        head_nc_for_loss=original_model_head_nc,
+                        head_reg_max_for_loss=original_model_head_reg_max,
+                        dfl_project_buffer_for_decode=original_dfl_project_buffer)
+        if lq is not None : # Check if loss was computed
+            print(f'[QAT] Epoch {qep + 1}/{(cfg.epochs // 2 or 1)}  loss {lq:.3f}')
+        else:
+            print(f'[QAT] Epoch {qep + 1}/{(cfg.epochs // 2 or 1)}  loss N/A (no samples contributed)')
+
+    # --- Convert QAT model to INT8 ---
+    qat_model.cpu().eval()
+    int8_model_with_preprocessor = convert_fx(qat_model) # This model still contains 'pre'
+    print("[INFO] QAT model converted to INT8.")
+
+    # ---------------- ONNX export (model WITH preprocessor, without NMS) ----------------
+    int8_model_with_preprocessor.eval()
     temp_onnx_path = cfg.out.replace(".onnx", "_temp_no_nms.onnx")
 
-    torch.onnx.export(int8_model_no_nms, example_float_input_for_qat.cpu(), temp_onnx_path,
-                      input_names=['images_normalized_float'],
-                      output_names=['raw_boxes', 'raw_scores'], # From PicoDetHead's inference
-                      dynamic_axes={'images_normalized_float': {0: 'batch_size', 2: 'height', 3: 'width'},
-                                    'raw_boxes': {0: 'batch_size'},
-                                    'raw_scores': {0: 'batch_size'}},
-                      opset_version=17, # 11 min opset for NonMaxSuppression attributes as inputs
-                      do_constant_folding=True)
-    print(f'[SAVE] Intermediate ONNX (no NMS) → {temp_onnx_path}')
+    # The input for ONNX export should match what the 'int8_model_with_preprocessor' expects,
+    # which is a uint8 image tensor because its first module 'pre' (ResizeNorm) handles it.
+    actual_onnx_input_example = dummy_uint8_input_cpu.cpu() # uint8 tensor
+
+
+    torch.onnx.export(
+        int8_model_with_preprocessor,
+        actual_onnx_input_example,
+        temp_onnx_path,
+        input_names=['images_uint8'], # Input is now uint8
+        output_names=['raw_boxes', 'raw_scores'],
+        dynamic_axes={
+            'images_uint8': {0: 'batch_size', 2: 'height', 3: 'width'},
+            'raw_boxes': {0: 'batch_size', 1: 'num_anchors'},
+            'raw_scores': {0: 'batch_size', 1: 'num_anchors'}
+        },
+        opset_version=18,
+        do_constant_folding=True
+    )
+    print(f'[SAVE] Intermediate ONNX (no NMS, with preprocessor) → {temp_onnx_path}')
+
+    # DEBUG: Inspect intermediate ONNX model outputs
+    intermediate_model_check = onnx.load(temp_onnx_path)
+    print("[DEBUG] Intermediate ONNX model input ValueInfo:")
+    for input_vi in intermediate_model_check.graph.input:
+        # ... (same detailed print logic as for outputs) ...
+        if hasattr(input_vi.type, 'tensor_type'):
+            tensor_type = input_vi.type.tensor_type
+            elem_type = tensor_type.elem_type
+            shape_dims = [str(d.dim_value) if d.dim_value else d.dim_param for d in tensor_type.shape.dim]
+            print(f"  Name: {input_vi.name}, Type: tensor({onnx.TensorProto.DataType.Name(elem_type)}), Shape: {shape_dims}")
+        else:
+            print(f"  Name: {input_vi.name}, Type (raw): {input_vi.type.WhichOneof('value')}")
+
+
+    print("[DEBUG] Intermediate ONNX model output ValueInfo:")
+    for output_vi in intermediate_model_check.graph.output:
+        if hasattr(output_vi.type, 'tensor_type'):
+            tensor_type = output_vi.type.tensor_type
+            elem_type = tensor_type.elem_type
+            shape_dims = [str(d.dim_value) if d.dim_value else d.dim_param for d in tensor_type.shape.dim]
+            print(f"  Name: {output_vi.name}, Type: tensor({onnx.TensorProto.DataType.Name(elem_type)}), Shape: {shape_dims}")
+        elif hasattr(output_vi.type, 'sequence_type'):
+            seq_type = output_vi.type.sequence_type
+            if hasattr(seq_type.elem_type, 'tensor_type'):
+                tensor_type = seq_type.elem_type.tensor_type
+                elem_type = tensor_type.elem_type
+                shape_dims = [str(d.dim_value) if d.dim_value else d.dim_param for d in tensor_type.shape.dim]
+                print(f"  Name: {output_vi.name}, Type: seq(tensor({onnx.TensorProto.DataType.Name(elem_type)})), Shape_of_elem: {shape_dims}")
+            else:
+                print(f"  Name: {output_vi.name}, Type: seq(<unknown_elem_type>)")
+        else:
+            print(f"  Name: {output_vi.name}, Type (raw int): {output_vi.type.WhichOneof('value')}")
+
+    print("[DEBUG] Running PyTorch forward pass on int8_model_with_preprocessor...")
+    try:
+        # Ensure model is on CPU for this test if actual_onnx_input_example is on CPU
+        int8_model_with_preprocessor.cpu().eval() # Ensure CPU and eval
+        actual_onnx_input_example_cpu = actual_onnx_input_example.cpu()
+
+        py_outputs = int8_model_with_preprocessor(actual_onnx_input_example_cpu) # Call it
+
+        print(f"  [PyTorch Output] Type of py_outputs: {type(py_outputs)}")
+        if isinstance(py_outputs, (tuple, list)):
+            print(f"  [PyTorch Output] Number of elements: {len(py_outputs)}")
+            for i, item in enumerate(py_outputs):
+                print(f"    Element {i}: Type={type(item)}")
+                if isinstance(item, torch.Tensor):
+                    print(f"      Shape={item.shape}, Dtype={item.dtype}")
+                elif isinstance(item, (list, tuple)):
+                     print(f"      (Nested list/tuple) Length={len(item)}")
+
+        elif isinstance(py_outputs, torch.Tensor):
+             print(f"  [PyTorch Output] (Single Tensor) Shape={py_outputs.shape}, Dtype={py_outputs.dtype}")
+        else:
+            print(f"  [PyTorch Output] Unexpected output type: {type(py_outputs)}")
+
+    except Exception as e:
+        print(f"  [PyTorch Output] Error during PyTorch forward: {e}")
+        traceback.print_exc()
+
 
     # ---------------- Append NMS to the ONNX model ------------------------------
     onnx_model = onnx.load(temp_onnx_path)
     graph = onnx_model.graph
 
-    # NMS parameters from the model's head (ensure these are what you want)
+    # NMS parameters from the original FP32 model's head
     score_thresh_val = float(model.head.score_th)
     iou_thresh_val = float(model.head.iou_th)
-    # For ONNX NonMaxSuppression, max_output_boxes_per_class can be set.
-    # If we want a total of model.head.max_det detections,
-    # we can set max_output_boxes_per_class to model.head.max_det.
-    # This means NMS might keep up to model.head.max_det *per class*.
-    # A subsequent TopK operation across all classes would be needed for a strict global top-K.
-    # For simplicity, we'll use this, and the output might have more than max_det boxes if from different classes.
-    # Or, set it to a smaller number like ceil(max_det / num_classes) if that's desired.
-    # Let's set it to model.head.max_det for now.
-    max_output_boxes_per_class_val = int(model.head.max_det) 
+    max_output_boxes_per_class_val = int(model.head.max_det)
 
-    # Original outputs from the PyTorch model
-    # Their names were 'raw_boxes', 'raw_scores' from the export step.
-    # Find them in the graph to ensure correct naming if changed.
-    onnx_raw_boxes_name = ""
-    onnx_raw_scores_name = ""
-    for output_node in graph.output:
-        if output_node.name == 'raw_boxes':
-            onnx_raw_boxes_name = output_node.name
-        elif output_node.name == 'raw_scores':
-            onnx_raw_scores_name = output_node.name
-    
-    if not onnx_raw_boxes_name or not onnx_raw_scores_name:
-        raise RuntimeError("Could not find raw_boxes or raw_scores in the ONNX graph outputs.")
+    # Original model outputs (inputs to NMS logic)
+    onnx_raw_boxes_name = "raw_boxes"    # Shape: [batch_size, num_total_anchors, 4]
+    onnx_raw_scores_name = "raw_scores"  # Shape: [batch_size, num_total_anchors, num_classes]
 
-    # 1. Transpose scores: from (B, NumAnchors, NC) to (B, NC, NumAnchors)
-    # Output of PyTorch model raw_scores: (batch_size, num_total_anchors, num_classes)
-    # ONNX NMS expects scores: (batch_size, num_classes, num_boxes)
+    # 1. Transpose scores for NonMaxSuppression
+    # From: [batch_size, num_total_anchors, num_classes]
+    # To:   [batch_size, num_classes, num_total_anchors]
     scores_transposed_name = "scores_transposed_for_nms"
     transpose_node = onnx_helper.make_node(
         "Transpose",
         inputs=[onnx_raw_scores_name],
         outputs=[scores_transposed_name],
-        perm=[0, 2, 1] # Batch, Class, Box
+        perm=[0, 2, 1],
+        name="TransposeScores_NMS"
     )
     graph.node.append(transpose_node)
 
-    # 2. Create constant tensors for NMS parameters
-    # These need to be float32 for thresholds, int64 for max_output_boxes_per_class
-    iou_threshold_const_name = "nms_iou_threshold"
-    score_threshold_const_name = "nms_score_threshold"
-    max_boxes_per_class_const_name = "nms_max_boxes_per_class"
+    # 2. Create constant tensors (initializers) for NMS parameters
+    iou_threshold_const_name = "nms_iou_threshold_const"
+    score_threshold_const_name = "nms_score_threshold_const"
+    max_boxes_per_class_const_name = "nms_max_boxes_per_class_const"
 
     graph.initializer.append(onnx_helper.make_tensor(iou_threshold_const_name, onnx_TensorProto.FLOAT, [], [iou_thresh_val]))
     graph.initializer.append(onnx_helper.make_tensor(score_threshold_const_name, onnx_TensorProto.FLOAT, [], [score_thresh_val]))
     graph.initializer.append(onnx_helper.make_tensor(max_boxes_per_class_const_name, onnx_TensorProto.INT64, [], [max_output_boxes_per_class_val]))
 
     # 3. Add NonMaxSuppression node
-    # Output selected_indices: [num_selected_indices, 3] where columns are [batch_index, class_index, box_index]
+    # Output: selected_indices [num_selected_indices, 3] -> [batch_index, class_index, box_index]
     selected_indices_output_name = "selected_nms_indices"
     nms_node = onnx_helper.make_node(
         "NonMaxSuppression",
-        inputs=[onnx_raw_boxes_name, scores_transposed_name, max_boxes_per_class_const_name, iou_threshold_const_name, score_threshold_const_name],
+        inputs=[
+            onnx_raw_boxes_name,
+            scores_transposed_name,
+            max_boxes_per_class_const_name,
+            iou_threshold_const_name,
+            score_threshold_const_name
+        ],
         outputs=[selected_indices_output_name],
-        center_point_box=0 # 0 for (x1,y1,x2,y2) or (y1,x1,y2,x2)
+        center_point_box=0,  # Assuming boxes are (x1,y1,x2,y2) or (y1,x1,y2,x2)
+        name="NMS_Operator"
     )
     graph.node.append(nms_node)
 
-    # 4. Gather the actual boxes, scores, and labels using selected_indices
-    # selected_indices: [num_selected_total, 3]
-    # Column 0: batch_index
-    # Column 1: class_index
-    # Column 2: box_index (original index within the num_anchors for that batch item)
+    # 4. Extract columns from selected_indices to get flat lists of batch_idx, class_idx, box_idx
+    # These will be 1D tensors of shape [num_selected_indices]
 
-    # Extract components from selected_indices
-    # These will be 1D tensors of length num_selected_total
-    # Need an 'axes' constant for Gather
-    axes_col_const = onnx_helper.make_tensor("gather_axes_col", onnx_TensorProto.INT64, [], [1])
-    graph.initializer.append(axes_col_const)
-    
-    batch_idx_flat_name = "nms_batch_indices_flat"
-    class_idx_flat_name = "nms_class_indices_flat"
-    box_idx_flat_name = "nms_box_indices_flat"
+    # Constants for Gather column indices and Squeeze/Unsqueeze axes
+    # For Gather 'axis' attribute:
+    gather_axis1_attr = 1 # Gather along columns of the [N,3] tensor
+    # For Squeeze/Unsqueeze 'axes' input (opset 13+ requires this as a tensor)
+    # This tensor will contain a single element: [1], to squeeze/unsqueeze the dim at index 1
+    axes_for_squeeze_unsqueeze_name = "axes_for_squeeze_unsqueeze_const"
+    graph.initializer.append(onnx_helper.make_tensor(axes_for_squeeze_unsqueeze_name, onnx_TensorProto.INT64, [1], [1]))
 
-    # indices_0 = onnx_helper.make_tensor("indices_0", onnx_TensorProto.INT64, [], [0]) # For 0th col
-    # indices_1 = onnx_helper.make_tensor("indices_1", onnx_TensorProto.INT64, [], [1]) # For 1st col
-    # indices_2 = onnx_helper.make_tensor("indices_2", onnx_TensorProto.INT64, [], [2]) # For 2nd col
-    # graph.initializer.extend([indices_0, indices_1, indices_2])
-    
-    # Slicing columns using Gather is verbose. Alternative: Split or multiple Gathers.
-    # For simplicity, let's assume we can use Split if available and easy, or just Gather cols.
-    # Let's use Gather to pick columns:
-    idx_0_tensor = onnx_helper.make_tensor("idx_0_tensor", onnx_TensorProto.INT64, [], [0])
-    idx_1_tensor = onnx_helper.make_tensor("idx_1_tensor", onnx_TensorProto.INT64, [], [1])
-    idx_2_tensor = onnx_helper.make_tensor("idx_2_tensor", onnx_TensorProto.INT64, [], [2])
-    graph.initializer.extend([idx_0_tensor, idx_1_tensor, idx_2_tensor])
+    # Column index constants (as initializers)
+    idx_0_const_name = "const_col_idx_0"
+    idx_1_const_name = "const_col_idx_1"
+    idx_2_const_name = "const_col_idx_2"
+    graph.initializer.append(onnx_helper.make_tensor(idx_0_const_name, onnx_TensorProto.INT64, [], [0]))
+    graph.initializer.append(onnx_helper.make_tensor(idx_1_const_name, onnx_TensorProto.INT64, [], [1]))
+    graph.initializer.append(onnx_helper.make_tensor(idx_2_const_name, onnx_TensorProto.INT64, [], [2]))
 
-    graph.node.append(onnx_helper.make_node("Gather", [selected_indices_output_name, idx_0_tensor], [batch_idx_flat_name], axis=1))
-    graph.node.append(onnx_helper.make_node("Squeeze", [batch_idx_flat_name, axes_col_const], [batch_idx_flat_name])) # Remove dim 1
+    # Gather each column: output shape [num_selected_indices, 1]
+    batch_indices_col_name = "nms_batch_indices_col"
+    class_indices_col_name = "nms_class_indices_col"
+    box_indices_col_name = "nms_box_indices_col"
 
-    graph.node.append(onnx_helper.make_node("Gather", [selected_indices_output_name, idx_1_tensor], [class_idx_flat_name], axis=1))
-    graph.node.append(onnx_helper.make_node("Squeeze", [class_idx_flat_name, axes_col_const], [class_idx_flat_name]))
+    graph.node.append(onnx_helper.make_node("Gather", [selected_indices_output_name, idx_0_const_name], [batch_indices_col_name], axis=gather_axis1_attr, name="Gather_BatchIdx_Col"))
+    graph.node.append(onnx_helper.make_node("Gather", [selected_indices_output_name, idx_1_const_name], [class_indices_col_name], axis=gather_axis1_attr, name="Gather_ClassIdx_Col"))
+    graph.node.append(onnx_helper.make_node("Gather", [selected_indices_output_name, idx_2_const_name], [box_indices_col_name], axis=gather_axis1_attr, name="Gather_BoxIdx_Col"))
 
-    graph.node.append(onnx_helper.make_node("Gather", [selected_indices_output_name, idx_2_tensor], [box_idx_flat_name], axis=1))
-    graph.node.append(onnx_helper.make_node("Squeeze", [box_idx_flat_name, axes_col_const], [box_idx_flat_name]))
-    
-    # We need to gather boxes from onnx_raw_boxes_name [B, NumAnchors, 4]
-    # using batch_idx_flat_name and box_idx_flat_name. This needs GatherND.
-    # GatherND indices: [num_selected_total, 2] where cols are [batch_idx, box_idx]
+    # Squeeze to remove the trailing dimension of 1: output shape [num_selected_indices]
+    # For Squeeze, 'axes' is an input tensor since opset 17.
+    batch_indices_flat_name = "final_nms_batch_indices" # Final output name
+    class_indices_flat_name = "final_nms_labels"      # Final output name
+    box_indices_flat_name   = "nms_box_indices_flat"    # Intermediate
+
+    graph.node.append(onnx_helper.make_node("Squeeze", [batch_indices_col_name, axes_for_squeeze_unsqueeze_name], [batch_indices_flat_name], name="Squeeze_BatchIdx"))
+    graph.node.append(onnx_helper.make_node("Squeeze", [class_indices_col_name, axes_for_squeeze_unsqueeze_name], [class_indices_flat_name], name="Squeeze_ClassIdx"))
+    graph.node.append(onnx_helper.make_node("Squeeze", [box_indices_col_name, axes_for_squeeze_unsqueeze_name], [box_indices_flat_name], name="Squeeze_BoxIdx"))
+
+    # 5. Gather final boxes using GatherND
+    # Indices for GatherND must be [num_selected_indices, rank_of_data_indices]
+    # For boxes (rank 3: batch, anchor_idx, 4), we need [N_selected, 2] from (batch_idx, box_idx)
+    batch_idx_unsqueeze_name = "batch_idx_flat_unsqueezed_for_concat"
+    box_idx_unsqueeze_name   = "box_idx_flat_unsqueezed_for_concat"
+
+    graph.node.append(onnx_helper.make_node("Unsqueeze", [batch_indices_flat_name, axes_for_squeeze_unsqueeze_name], [batch_idx_unsqueeze_name], name="Unsqueeze_BatchIdx_GatherND"))
+    graph.node.append(onnx_helper.make_node("Unsqueeze", [box_indices_flat_name, axes_for_squeeze_unsqueeze_name], [box_idx_unsqueeze_name], name="Unsqueeze_BoxIdx_GatherND"))
+
     gathernd_indices_for_boxes_name = "gathernd_indices_for_boxes"
-    batch_idx_unsqueeze_name = "batch_idx_unsqueeze_for_stack"
-    box_idx_unsqueeze_name = "box_idx_unsqueeze_for_stack"
-    graph.node.append(onnx_helper.make_node("Unsqueeze", [batch_idx_flat_name, axes_col_const], [batch_idx_unsqueeze_name]))
-    graph.node.append(onnx_helper.make_node("Unsqueeze", [box_idx_flat_name, axes_col_const], [box_idx_unsqueeze_name]))
-    graph.node.append(onnx_helper.make_node("Concat", [batch_idx_unsqueeze_name, box_idx_unsqueeze_name], [gathernd_indices_for_boxes_name], axis=1))
-    
-    gathered_boxes_name = "final_nms_boxes" # Shape: [num_selected_total, 4]
-    graph.node.append(onnx_helper.make_node("GatherND", [onnx_raw_boxes_name, gathernd_indices_for_boxes_name], [gathered_boxes_name]))
+    graph.node.append(onnx_helper.make_node("Concat", [batch_idx_unsqueeze_name, box_idx_unsqueeze_name], [gathernd_indices_for_boxes_name], axis=1, name="Concat_Box_Gather_Indices"))
 
-    # Gather scores from onnx_raw_scores_name [B, NumAnchors, NC]
-    # using batch_idx_flat_name, box_idx_flat_name, and class_idx_flat_name.
-    # GatherND indices: [num_selected_total, 3] where cols are [batch_idx, box_idx, class_idx]
-    class_idx_unsqueeze_name = "class_idx_unsqueeze_for_stack"
-    graph.node.append(onnx_helper.make_node("Unsqueeze", [class_idx_flat_name, axes_col_const], [class_idx_unsqueeze_name]))
+    final_boxes_name = "final_nms_boxes" # Final output name
+    graph.node.append(onnx_helper.make_node("GatherND", [onnx_raw_boxes_name, gathernd_indices_for_boxes_name], [final_boxes_name], name="GatherND_FinalBoxes"))
+
+    # 6. Gather final scores using GatherND
+    # For scores (rank 3: batch, anchor_idx, class_idx), we need [N_selected, 3] from (batch_idx, box_idx, class_idx)
+    class_idx_unsqueeze_name = "class_idx_flat_unsqueezed_for_concat"
+    graph.node.append(onnx_helper.make_node("Unsqueeze", [class_indices_flat_name, axes_for_squeeze_unsqueeze_name], [class_idx_unsqueeze_name], name="Unsqueeze_ClassIdx_GatherND"))
+
     gathernd_indices_for_scores_name = "gathernd_indices_for_scores"
-    graph.node.append(onnx_helper.make_node("Concat", [batch_idx_unsqueeze_name, box_idx_unsqueeze_name, class_idx_unsqueeze_name], [gathernd_indices_for_scores_name], axis=1))
+    # Order for onnx_raw_scores_name [B, NumAnchors, NC] is: batch_idx, box_idx (anchor), class_idx
+    graph.node.append(onnx_helper.make_node(
+        "Concat",
+        [batch_idx_unsqueeze_name, box_idx_unsqueeze_name, class_idx_unsqueeze_name],
+        [gathernd_indices_for_scores_name],
+        axis=1,
+        name="Concat_Score_Gather_Indices"
+    ))
 
-    gathered_scores_name = "final_nms_scores" # Shape: [num_selected_total]
-    graph.node.append(onnx_helper.make_node("GatherND", [onnx_raw_scores_name, gathernd_indices_for_scores_name], [gathered_scores_name]))
-    
-    # Labels are simply class_idx_flat_name
-    gathered_labels_name = "final_nms_labels"
-    graph.node.append(onnx_helper.make_node("Identity", [class_idx_flat_name], [gathered_labels_name]))
+    final_scores_name = "final_nms_scores" # Final output name
+    graph.node.append(onnx_helper.make_node("GatherND", [onnx_raw_scores_name, gathernd_indices_for_scores_name], [final_scores_name], name="GatherND_FinalScores"))
 
-    # 5. Update graph outputs
-    graph.ClearField("output") # Remove raw_boxes and raw_scores
+    # 7. Update graph outputs
+    graph.ClearField("output") # Remove raw_boxes and raw_scores from final graph outputs
     graph.output.extend([
-        onnx_helper.make_tensor_value_info(gathered_boxes_name, onnx_TensorProto.FLOAT, ["num_total_selected_detections", 4]),
-        onnx_helper.make_tensor_value_info(gathered_scores_name, onnx_TensorProto.FLOAT, ["num_total_selected_detections"]),
-        onnx_helper.make_tensor_value_info(gathered_labels_name, onnx_TensorProto.INT64, ["num_total_selected_detections"]),
-        # Optionally also output batch_idx_flat_name if user needs to know which batch item each flat detection belongs to
-        onnx_helper.make_tensor_value_info(batch_idx_flat_name, onnx_TensorProto.INT64, ["num_total_selected_detections"], name="final_nms_batch_indices") 
+        onnx_helper.make_tensor_value_info(final_boxes_name, onnx_TensorProto.FLOAT, ['num_total_selected_detections', 4]),
+        onnx_helper.make_tensor_value_info(final_scores_name, onnx_TensorProto.FLOAT, ['num_total_selected_detections']),
+        onnx_helper.make_tensor_value_info(class_indices_flat_name, onnx_TensorProto.INT64, ['num_total_selected_detections']), # final_nms_labels
+        onnx_helper.make_tensor_value_info(batch_indices_flat_name, onnx_TensorProto.INT64, ['num_total_selected_detections'])  # final_nms_batch_indices
     ])
-    
-    # Clean up graph from old outputs if they are no longer needed by any node
-    # This is usually handled automatically if they are not graph outputs.
 
-    # Save the final ONNX model with NMS
+    # 8. Validate and save the final model
+    try:
+        onnx.checker.check_model(onnx_model)
+        print("[INFO] Final ONNX model with NMS checked successfully.")
+    except onnx.checker.ValidationError as e:
+        error_model_path = cfg.out.replace(".onnx", "_nms_failed_validation.onnx")
+        onnx.save(onnx_model, error_model_path)
+        print(f"[ERROR] ONNX model validation failed after NMS append: {e}. Problematic model saved to {error_model_path}")
+        raise # Re-raise the exception to halt execution
+
     onnx.save(onnx_model, cfg.out)
     print(f'[SAVE] Final ONNX with NMS graph → {cfg.out}')
-    
-    # (Optional) Validate the final model
-    onnx.checker.check_model(cfg.out)
 
 
 if __name__ == '__main__':

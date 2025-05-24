@@ -5,9 +5,10 @@ import math, warnings
 from typing import List, Tuple
 
 import torch, torch.nn as nn, torch.nn.functional as F
-import torchvision.ops as tvops
 from torchvision.models import mobilenet_v3_small, MobileNet_V3_Small_Weights
 
+from torchvision.models.feature_extraction import create_feature_extractor
+import timm
 
 # ───────────────────────────── layers ──────────────────────────────
 class GhostConv(nn.Module):
@@ -165,7 +166,6 @@ class PicoDetHead(nn.Module):
         )
         self._initialize_biases()
         
-        _anchor_points_centers_list = [] # Corrected from self.anchor_points_centers_levels
         for i in range(self.nl):
             s = self.strides_buffer[i].item()
             H_level = math.ceil(img_size / s)
@@ -201,10 +201,6 @@ class PicoDetHead(nn.Module):
         dfl_project_buffer: torch.Tensor, # Pass this explicitly
         reg_max_val: int                  # Pass this explicitly
     ) -> torch.Tensor:
-        # Replaces _dfl_to_ltrb_original_for_training_etc
-        # x_reg_logits: (N_total_anchors, 4 * (reg_max + 1))
-        # dfl_project_buffer: (M+1)
-        # reg_max_val: scalar int for reg_max
         
         input_shape = x_reg_logits.shape
         if x_reg_logits.ndim == 2: # (N_total_anchors, 4 * (reg_max + 1))
@@ -224,7 +220,6 @@ class PicoDetHead(nn.Module):
         return ltrb_offsets
 
     def _dfl_to_ltrb_original_for_training_etc(self, x_reg_logits: torch.Tensor) -> torch.Tensor:
-        # ... (implementation remains same) ...
         input_shape = x_reg_logits.shape
         if x_reg_logits.ndim == 4: # (B, C, H, W) - Not used in current inference path
             b, _, h, w = input_shape
@@ -280,15 +275,10 @@ class PicoDetHead(nn.Module):
         
         return boxes_xyxy_level, scores_level
 
-    # NMS related methods (_batch_nms_and_pad, _process_single_image_detections_for_vmap)
-    # are removed from PicoDetHead if NMS is fully externalized for QAT/ONNX.
-    # They can be kept as staticmethods or standalone utility functions if needed by quick_val_iou.
-
     def forward(self, neck_feature_maps: Tuple[torch.Tensor, ...]):
-        # ... (logic to compute raw_cls_logits_levels, etc.) ...
-        raw_cls_logits_levels: List[torch.Tensor] = []
-        raw_obj_logits_levels: List[torch.Tensor] = []
-        raw_reg_logits_levels: List[torch.Tensor] = []
+        raw_cls_logits_levels: List[torch.Tensor] = [] # len nl
+        raw_obj_logits_levels: List[torch.Tensor] = [] # len nl
+        raw_reg_logits_levels: List[torch.Tensor] = [] # len nl
 
         for i, f_map_level in enumerate(neck_feature_maps):
             cls_common_feat = self.cls_conv(f_map_level)
@@ -297,27 +287,25 @@ class PicoDetHead(nn.Module):
             raw_obj_logits_levels.append(self.obj_pred[i](cls_common_feat))
             raw_reg_logits_levels.append(self.reg_pred[i](reg_common_feat))
 
+
         if self.training:
-            strides_outputs = [self.strides_buffer[i] for i in range(self.nl)]
-            return ( # Return a tuple of 4 items
-                raw_cls_logits_levels, 
-                raw_obj_logits_levels, 
-                raw_reg_logits_levels, 
-                strides_outputs
+            strides_outputs_list = [self.strides_buffer[i] for i in range(self.nl)] # List[Tensor]
+
+            return (
+                tuple(raw_cls_logits_levels), # Now a tuple of tensors
+                tuple(raw_obj_logits_levels), # Now a tuple of tensors
+                tuple(raw_reg_logits_levels), # Now a tuple of tensors
+                tuple(strides_outputs_list)   # Now a tuple of tensors
             )
         else: # Inference path
-            # ... (inference logic, returns 2 items: batched_all_boxes, batched_all_scores) ...
+            # This path returns two Tensors
             decoded_boxes_all_levels: List[torch.Tensor] = []
             decoded_scores_all_levels: List[torch.Tensor] = []
-            
             for i in range(self.nl):
                 cls_l, obj_l, reg_l = raw_cls_logits_levels[i], raw_obj_logits_levels[i], raw_reg_logits_levels[i]
-                boxes_level, scores_level = self._decode_predictions_for_level(
-                    cls_l, obj_l, reg_l, i
-                )
+                boxes_level, scores_level = self._decode_predictions_for_level(cls_l, obj_l, reg_l, i)
                 decoded_boxes_all_levels.append(boxes_level)
                 decoded_scores_all_levels.append(scores_level)
-
             batched_all_boxes = torch.cat(decoded_boxes_all_levels, dim=1)
             batched_all_scores = torch.cat(decoded_scores_all_levels, dim=1)
             return batched_all_boxes, batched_all_scores
@@ -362,27 +350,22 @@ class ResizeNorm(nn.Module):
     def __init__(self, size: Tuple[int, int], mean: Tuple[float, ...] = (0.485, 0.456, 0.406),
                  std: Tuple[float, ...] = (0.229, 0.224, 0.225)):
         super().__init__()
-        self.size = tuple(size) # e.g., (IMG_SIZE, IMG_SIZE)
-        # Register m and s as buffers so they are moved to device with the model
-        # and included in state_dict.
+        self.size = tuple(size)
         self.register_buffer('m', torch.tensor(mean).view(1, 3, 1, 1))
         self.register_buffer('s', torch.tensor(std).view(1, 3, 1, 1))
 
     def forward(self, x: torch.Tensor):
-        # FX-friendly: always interpolate to the target self.size.
-        # If input x is already self.size, F.interpolate is often a no-op or very fast.
-        # Using antialias=True is generally recommended for better image quality during resizing.
-        x = F.interpolate(x, self.size, mode='bilinear', align_corners=False, antialias=False) 
-        # x = F.interpolate(x, self.size, mode='nearest', align_corners=False, antialias=False)  # faster
 
-        # Normalization
-        return (x.float() / 255.0 - self.m) / self.s
+        x_float_scaled = x.float() / 255.0
+
+        # Interpolation, faster if antialias=False
+        x_resized = F.interpolate(x_float_scaled, self.size, mode='bilinear', align_corners=False, antialias=False) # antialias=False for speed/simplicity
+
+        # Normalization (mean/std)
+        return (x_resized - self.m) / self.s
 
 
 # ───────────────────────── backbone util ──────────────────────────
-from torchvision.models.feature_extraction import create_feature_extractor
-import timm
-
 @torch.no_grad()
 def _dummy_out_chs(model: nn.Module, feat_nodes: List[str]):
     model.eval()
@@ -396,14 +379,12 @@ class TVExtractorWrapper(nn.Module):
     def __init__(self, base_model: nn.Module, return_nodes_dict: dict):
         super().__init__()
         self.extractor = create_feature_extractor(base_model, return_nodes_dict)
-        # Ensure order of features C3, C4, C5
-        # Assumes return_nodes_dict is ordered or keys are named to reflect C3, C4, C5
-        # For the specific keys used, this will be ['C3', 'C4', 'C5']
         self.output_keys = list(return_nodes_dict.values())
 
-    def forward(self, x: torch.Tensor) -> List[torch.Tensor]:
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]: # Changed to Tuple
         feature_dict = self.extractor(x)
-        return [feature_dict[key] for key in self.output_keys]
+        # Assuming 3 features are always returned, otherwise adjust Tuple annotation
+        return tuple(feature_dict[key] for key in self.output_keys) # Return as tuple
 
 @torch.no_grad()
 def _get_dynamic_feat_chs(model: nn.Module, img_size: int, device: torch.device) -> Tuple[int, int, int]:
@@ -434,15 +415,7 @@ def get_backbone(arch: str, ckpt: str | None, img_size: int = 224): # Added img_
         # Ensure dropout is 0.0 as per your original get_backbone intent
         # MobileNetV3 constructor doesn't take dropout, but we can set it if default is non-zero for eval
         base = mobilenet_v3_small(weights=weights, width_mult=1.0)
-        # Default dropout in mobilenet_v3_small is 0.2. Set to 0 for detection.
-        # The dropout layer is typically the last layer before classifier in `base.classifier[-1]`
-        # or within the feature blocks if `stochastic_depth_prob` is used (not for mnv3 dropout).
-        # For MobileNetV3, dropout is usually in the classifier head, which we are bypassing.
-        # If 'width_mult' affects internal dropout rates, this is handled by torchvision.
-        # The main concern is `base.dropout` if it existed at top level, or in classifier.
-        # Since we use `create_feature_extractor` on `base.features`, classifier dropout is not an issue.
 
-        # Node names from your `get_backbone_old`
         return_nodes = {
             'features.3': 'C3',  # Stride 8
             'features.6': 'C4',  # Stride 16
@@ -469,16 +442,7 @@ def get_backbone(arch: str, ckpt: str | None, img_size: int = 224): # Added img_
             'mnv4m': 'mobilenetv4_conv_medium.pyt_in1k'
         }
         model_name = name_map[arch]
-        
-        # Using out_indices from your `get_backbone_old` as they might be more tested
-        # These indices should correspond to features with strides 8, 16, 32
-        # For many timm models, stages producing these strides are 2,3,4 or similar.
-        # (2,4,6) suggests MobileNetV4 might have more feature levels reported by feature_info.
-        # It's CRITICAL to verify these indices for the specific timm model version.
-        # A common pattern is `out_indices = [i for i, r in enumerate(model.feature_info.reduction()) if r in {8,16,32}]`
-        # For now, let's use (2,3,4) as it's more standard for FPNs tapping S8,S16,S32 from 5-stage backbones.
-        # If errors persist with mnv4, (2,4,6) or dynamic index finding would be the next step.
-        
+
         # Create a temporary model to get correct indices for strides 8, 16, 32
         temp_model = timm.create_model(model_name, pretrained=False, features_only=True) # Get all stages
         desired_strides = {8, 16, 32}
@@ -548,8 +512,3 @@ __all__ = [
     'VarifocalLoss', 'dfl_loss', 'build_dfl_targets',
     'PicoDetHead', 'ResizeNorm', 'get_backbone', 'PicoDet'
 ]
-
-# ... (ResizeNorm, backbone utils like TVExtractorWrapper, _get_dynamic_feat_chs, get_backbone remain same)
-# Ensure get_backbone passes inplace_act=False or similar to its child modules if they take it.
-# For MobileNetV3/V4 from torchvision/timm, their internal activations are pre-set.
-# The custom modules (GhostConv, DWConv5x5, CSPBlock, CSPPAN) are the main concern for inplace.
