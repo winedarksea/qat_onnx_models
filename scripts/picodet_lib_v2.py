@@ -372,7 +372,7 @@ class ResizeNorm(nn.Module):
         # FX-friendly: always interpolate to the target self.size.
         # If input x is already self.size, F.interpolate is often a no-op or very fast.
         # Using antialias=True is generally recommended for better image quality during resizing.
-        x = F.interpolate(x, self.size, mode='bilinear', align_corners=False, antialias=True) 
+        x = F.interpolate(x, self.size, mode='bilinear', align_corners=False, antialias=False) 
         # x = F.interpolate(x, self.size, mode='nearest', align_corners=False, antialias=False)  # faster
 
         # Normalization
