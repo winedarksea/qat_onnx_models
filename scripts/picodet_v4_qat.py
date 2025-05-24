@@ -746,7 +746,7 @@ def main(argv: List[str] | None = None):
                       dynamic_axes={'images_normalized_float': {0: 'batch_size', 2: 'height', 3: 'width'},
                                     'raw_boxes': {0: 'batch_size'},
                                     'raw_scores': {0: 'batch_size'}},
-                      opset_version=18, # Min opset for NonMaxSuppression attributes as inputs
+                      opset_version=17, # 11 min opset for NonMaxSuppression attributes as inputs
                       do_constant_folding=True)
     print(f'[SAVE] Intermediate ONNX (no NMS) → {temp_onnx_path}')
 
