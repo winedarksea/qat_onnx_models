@@ -540,6 +540,106 @@ def quick_val_iou(
 
     return total_iou_sum / num_images_with_gt if num_images_with_gt > 0 else 0.
 
+def append_nms_to_onnx(
+        in_path: str,
+        out_path: str,
+        score_thresh: float,
+        iou_thresh: float,
+        max_det: int,
+        raw_boxes: str = "raw_boxes",
+        raw_scores: str = "raw_scores",
+):
+    import onnx
+    from onnx import helper as oh, TensorProto as TP
+
+    m = onnx.load(in_path)
+    g = m.graph
+
+    # 1. transpose scores  [B, A, C] → [B, C, A]
+    scores_t = "scores_t"
+    g.node.append(oh.make_node("Transpose", [raw_scores], [scores_t],
+                               perm=[0, 2, 1], name="TransposeScores"))
+
+    # 2. constants
+    g.initializer.extend([
+        oh.make_tensor("iou_th",   TP.FLOAT, [], [iou_thresh]),
+        oh.make_tensor("score_th", TP.FLOAT, [], [score_thresh]),
+        oh.make_tensor("max_det",  TP.INT64, [], [max_det]),
+    ])
+
+    # 3. NMS
+    sel = "selected_idx"
+    g.node.append(oh.make_node(
+        "NonMaxSuppression",
+        [raw_boxes, scores_t, "max_det", "iou_th", "score_th"],
+        [sel], name="NMS"))
+
+    # 4. split columns  [N,3] → three [N,1] tensors
+    b_col, c_col, a_col = "b_col", "c_col", "a_col"
+    
+    # constant that tells Split how to slice
+    g.initializer.append(
+        oh.make_tensor("split_const_1_1_1", TP.INT64, [3], [1, 1, 1]))
+    
+    g.node.append(
+        oh.make_node("Split",
+                     [sel, "split_const_1_1_1"],          # data, split
+                     [b_col, c_col, a_col],
+                     axis=1,
+                     name="SplitSelectedIdx"))
+
+
+    # squeeze-axis constant
+    g.initializer.append(oh.make_tensor("axis1", TP.INT64, [1], [1]))
+
+    # 5. squeeze to 1-D
+    b_idx, cls_idx, anc_idx = "batch_idx", "class_idx", "anchor_idx"
+    for src, dst in [(b_col, b_idx), (c_col, cls_idx), (a_col, anc_idx)]:
+        g.node.append(oh.make_node("Squeeze", [src, "axis1"], [dst],
+                                   name=f"Squeeze_{dst}"))
+
+    # 6. GatherND for boxes
+    b_u, a_u = b_idx + "_u", anc_idx + "_u"
+    g.node.extend([
+        oh.make_node("Unsqueeze", [b_idx, "axis1"], [b_u],
+                     name="UnsqBatchGather"),
+        oh.make_node("Unsqueeze", [anc_idx, "axis1"], [a_u],
+                     name="UnsqAnchorGather"),
+    ])
+    idx_boxes = "gather_idx_boxes"
+    g.node.append(oh.make_node("Concat", [b_u, a_u], [idx_boxes],
+                               axis=1, name="CatBoxIdx"))
+    final_boxes = "det_boxes"
+    g.node.append(oh.make_node("GatherND",
+                               [raw_boxes, idx_boxes], [final_boxes],
+                               name="GatherNDBOXES"))
+
+    # 7. GatherND for scores
+    cls_u = cls_idx + "_u"
+    g.node.append(oh.make_node("Unsqueeze", [cls_idx, "axis1"], [cls_u],
+                               name="UnsqClassGather"))
+    idx_scores = "gather_idx_scores"
+    g.node.append(oh.make_node("Concat",
+                               [b_u, a_u, cls_u], [idx_scores],
+                               axis=1, name="CatScoreIdx"))
+    final_scores = "det_scores"
+    g.node.append(oh.make_node("GatherND",
+                               [raw_scores, idx_scores], [final_scores],
+                               name="GatherNDSCORES"))
+
+    # 8. set final outputs
+    del g.output[:]
+    g.output.extend([
+        oh.make_tensor_value_info(final_boxes,  TP.FLOAT, ['N', 4]),
+        oh.make_tensor_value_info(final_scores, TP.FLOAT, ['N']),
+        oh.make_tensor_value_info(cls_idx,      TP.INT64, ['N']),
+        oh.make_tensor_value_info(b_idx,        TP.INT64, ['N']),
+    ])
+
+    onnx.checker.check_model(m)
+    onnx.save(m, out_path)
+    print(f"[SAVE] Final ONNX with NMS → {out_path}")
+
 def main(argv: List[str] | None = None):
     pa = argparse.ArgumentParser()
     pa.add_argument('--coco_root', default='coco')
@@ -740,150 +840,13 @@ def main(argv: List[str] | None = None):
 
 
     # ---------------- Append NMS to the ONNX model ------------------------------
-    onnx_model = onnx.load(temp_onnx_path)
-    graph = onnx_model.graph
-
-    # NMS parameters from the original FP32 model's head
-    score_thresh_val = float(model.head.score_th)
-    iou_thresh_val = float(model.head.iou_th)
-    max_output_boxes_per_class_val = int(model.head.max_det)
-
-    # Original model outputs (inputs to NMS logic)
-    onnx_raw_boxes_name = "raw_boxes"    # Shape: [batch_size, num_total_anchors, 4]
-    onnx_raw_scores_name = "raw_scores"  # Shape: [batch_size, num_total_anchors, num_classes]
-
-    # 1. Transpose scores for NonMaxSuppression
-    # From: [batch_size, num_total_anchors, num_classes]
-    # To:   [batch_size, num_classes, num_total_anchors]
-    scores_transposed_name = "scores_transposed_for_nms"
-    transpose_node = onnx_helper.make_node(
-        "Transpose",
-        inputs=[onnx_raw_scores_name],
-        outputs=[scores_transposed_name],
-        perm=[0, 2, 1],
-        name="TransposeScores_NMS"
+    append_nms_to_onnx(
+        in_path=temp_onnx_path,
+        out_path=cfg.out,
+        score_thresh=float(model.head.score_th),
+        iou_thresh=float(model.head.iou_th),
+        max_det=int(model.head.max_det),
     )
-    graph.node.append(transpose_node)
-
-    # 2. Create constant tensors (initializers) for NMS parameters
-    iou_threshold_const_name = "nms_iou_threshold_const"
-    score_threshold_const_name = "nms_score_threshold_const"
-    max_boxes_per_class_const_name = "nms_max_boxes_per_class_const"
-
-    graph.initializer.append(onnx_helper.make_tensor(iou_threshold_const_name, onnx_TensorProto.FLOAT, [], [iou_thresh_val]))
-    graph.initializer.append(onnx_helper.make_tensor(score_threshold_const_name, onnx_TensorProto.FLOAT, [], [score_thresh_val]))
-    graph.initializer.append(onnx_helper.make_tensor(max_boxes_per_class_const_name, onnx_TensorProto.INT64, [], [max_output_boxes_per_class_val]))
-
-    # 3. Add NonMaxSuppression node
-    # Output: selected_indices [num_selected_indices, 3] -> [batch_index, class_index, box_index]
-    selected_indices_output_name = "selected_nms_indices"
-    nms_node = onnx_helper.make_node(
-        "NonMaxSuppression",
-        inputs=[
-            onnx_raw_boxes_name,
-            scores_transposed_name,
-            max_boxes_per_class_const_name,
-            iou_threshold_const_name,
-            score_threshold_const_name
-        ],
-        outputs=[selected_indices_output_name],
-        center_point_box=0,  # Assuming boxes are (x1,y1,x2,y2) or (y1,x1,y2,x2)
-        name="NMS_Operator"
-    )
-    graph.node.append(nms_node)
-
-    # 4. Extract columns from selected_indices to get flat lists of batch_idx, class_idx, box_idx
-    # These will be 1D tensors of shape [num_selected_indices]
-
-    # Constants for Gather column indices and Squeeze/Unsqueeze axes
-    # For Gather 'axis' attribute:
-    gather_axis1_attr = 1 # Gather along columns of the [N,3] tensor
-    # For Squeeze/Unsqueeze 'axes' input (opset 13+ requires this as a tensor)
-    # This tensor will contain a single element: [1], to squeeze/unsqueeze the dim at index 1
-    axes_for_squeeze_unsqueeze_name = "axes_for_squeeze_unsqueeze_const"
-    graph.initializer.append(onnx_helper.make_tensor(axes_for_squeeze_unsqueeze_name, onnx_TensorProto.INT64, [1], [1]))
-
-    # Column index constants (as initializers)
-    idx_0_const_name = "const_col_idx_0"
-    idx_1_const_name = "const_col_idx_1"
-    idx_2_const_name = "const_col_idx_2"
-    graph.initializer.append(onnx_helper.make_tensor(idx_0_const_name, onnx_TensorProto.INT64, [], [0]))
-    graph.initializer.append(onnx_helper.make_tensor(idx_1_const_name, onnx_TensorProto.INT64, [], [1]))
-    graph.initializer.append(onnx_helper.make_tensor(idx_2_const_name, onnx_TensorProto.INT64, [], [2]))
-
-    # Gather each column: output shape [num_selected_indices, 1]
-    batch_indices_col_name = "nms_batch_indices_col"
-    class_indices_col_name = "nms_class_indices_col"
-    box_indices_col_name = "nms_box_indices_col"
-
-    graph.node.append(onnx_helper.make_node("Gather", [selected_indices_output_name, idx_0_const_name], [batch_indices_col_name], axis=gather_axis1_attr, name="Gather_BatchIdx_Col"))
-    graph.node.append(onnx_helper.make_node("Gather", [selected_indices_output_name, idx_1_const_name], [class_indices_col_name], axis=gather_axis1_attr, name="Gather_ClassIdx_Col"))
-    graph.node.append(onnx_helper.make_node("Gather", [selected_indices_output_name, idx_2_const_name], [box_indices_col_name], axis=gather_axis1_attr, name="Gather_BoxIdx_Col"))
-
-    # Squeeze to remove the trailing dimension of 1: output shape [num_selected_indices]
-    # For Squeeze, 'axes' is an input tensor since opset 17.
-    batch_indices_flat_name = "final_nms_batch_indices" # Final output name
-    class_indices_flat_name = "final_nms_labels"      # Final output name
-    box_indices_flat_name   = "nms_box_indices_flat"    # Intermediate
-
-    graph.node.append(onnx_helper.make_node("Squeeze", [batch_indices_col_name, axes_for_squeeze_unsqueeze_name], [batch_indices_flat_name], name="Squeeze_BatchIdx"))
-    graph.node.append(onnx_helper.make_node("Squeeze", [class_indices_col_name, axes_for_squeeze_unsqueeze_name], [class_indices_flat_name], name="Squeeze_ClassIdx"))
-    graph.node.append(onnx_helper.make_node("Squeeze", [box_indices_col_name, axes_for_squeeze_unsqueeze_name], [box_indices_flat_name], name="Squeeze_BoxIdx"))
-
-    # 5. Gather final boxes using GatherND
-    # Indices for GatherND must be [num_selected_indices, rank_of_data_indices]
-    # For boxes (rank 3: batch, anchor_idx, 4), we need [N_selected, 2] from (batch_idx, box_idx)
-    batch_idx_unsqueeze_name = "batch_idx_flat_unsqueezed_for_concat"
-    box_idx_unsqueeze_name   = "box_idx_flat_unsqueezed_for_concat"
-
-    graph.node.append(onnx_helper.make_node("Unsqueeze", [batch_indices_flat_name, axes_for_squeeze_unsqueeze_name], [batch_idx_unsqueeze_name], name="Unsqueeze_BatchIdx_GatherND"))
-    graph.node.append(onnx_helper.make_node("Unsqueeze", [box_indices_flat_name, axes_for_squeeze_unsqueeze_name], [box_idx_unsqueeze_name], name="Unsqueeze_BoxIdx_GatherND"))
-
-    gathernd_indices_for_boxes_name = "gathernd_indices_for_boxes"
-    graph.node.append(onnx_helper.make_node("Concat", [batch_idx_unsqueeze_name, box_idx_unsqueeze_name], [gathernd_indices_for_boxes_name], axis=1, name="Concat_Box_Gather_Indices"))
-
-    final_boxes_name = "final_nms_boxes" # Final output name
-    graph.node.append(onnx_helper.make_node("GatherND", [onnx_raw_boxes_name, gathernd_indices_for_boxes_name], [final_boxes_name], name="GatherND_FinalBoxes"))
-
-    # 6. Gather final scores using GatherND
-    # For scores (rank 3: batch, anchor_idx, class_idx), we need [N_selected, 3] from (batch_idx, box_idx, class_idx)
-    class_idx_unsqueeze_name = "class_idx_flat_unsqueezed_for_concat"
-    graph.node.append(onnx_helper.make_node("Unsqueeze", [class_indices_flat_name, axes_for_squeeze_unsqueeze_name], [class_idx_unsqueeze_name], name="Unsqueeze_ClassIdx_GatherND"))
-
-    gathernd_indices_for_scores_name = "gathernd_indices_for_scores"
-    # Order for onnx_raw_scores_name [B, NumAnchors, NC] is: batch_idx, box_idx (anchor), class_idx
-    graph.node.append(onnx_helper.make_node(
-        "Concat",
-        [batch_idx_unsqueeze_name, box_idx_unsqueeze_name, class_idx_unsqueeze_name],
-        [gathernd_indices_for_scores_name],
-        axis=1,
-        name="Concat_Score_Gather_Indices"
-    ))
-
-    final_scores_name = "final_nms_scores" # Final output name
-    graph.node.append(onnx_helper.make_node("GatherND", [onnx_raw_scores_name, gathernd_indices_for_scores_name], [final_scores_name], name="GatherND_FinalScores"))
-
-    # 7. Update graph outputs
-    graph.ClearField("output") # Remove raw_boxes and raw_scores from final graph outputs
-    graph.output.extend([
-        onnx_helper.make_tensor_value_info(final_boxes_name, onnx_TensorProto.FLOAT, ['num_total_selected_detections', 4]),
-        onnx_helper.make_tensor_value_info(final_scores_name, onnx_TensorProto.FLOAT, ['num_total_selected_detections']),
-        onnx_helper.make_tensor_value_info(class_indices_flat_name, onnx_TensorProto.INT64, ['num_total_selected_detections']), # final_nms_labels
-        onnx_helper.make_tensor_value_info(batch_indices_flat_name, onnx_TensorProto.INT64, ['num_total_selected_detections'])  # final_nms_batch_indices
-    ])
-
-    # 8. Validate and save the final model
-    try:
-        onnx.checker.check_model(onnx_model)
-        print("[INFO] Final ONNX model with NMS checked successfully.")
-    except onnx.checker.ValidationError as e:
-        error_model_path = cfg.out.replace(".onnx", "_nms_failed_validation.onnx")
-        onnx.save(onnx_model, error_model_path)
-        print(f"[ERROR] ONNX model validation failed after NMS append: {e}. Problematic model saved to {error_model_path}")
-        raise # Re-raise the exception to halt execution
-
-    onnx.save(onnx_model, cfg.out)
-    print(f'[SAVE] Final ONNX with NMS graph → {cfg.out}')
 
 
 if __name__ == '__main__':
