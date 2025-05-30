@@ -351,7 +351,7 @@ def evaluate(model, loader, dev):
 
 # --- Main script execution ---
 data_dir: str = "filtered_imagenet2_native" # Example, replace with your actual path
-epochs: int = 500 # Reduced for quick testing, set to your desired value (e.g., 55)
+epochs: int = 550 # Reduced for quick testing, set to your desired value (e.g., 55)
 qat_epochs: int = 8 # Reduced for quick testing, set to your desired value (e.g., 5)
 batch: int = 64
 lr: float = 0.025
@@ -359,8 +359,8 @@ qat_lr_factor: float = 0.05
 width_mult: float = 1.0
 device_arg = None
 compile_model: bool = False
-arch: str = "mnv3" # Change to "mnv2", "mnv3", "mnv4s" as needed
-pretrained: bool = True # Using pretrained weights for FP32 start
+arch: str = "mnv4c" # Change to "mnv2", "mnv3", "mnv4s" as needed
+pretrained: bool = False # Using pretrained weights for FP32 start
 drop_rate: float = 0.2
 
 if device_arg is None:
@@ -518,8 +518,9 @@ try:
         input_names=["input_u8"],
         output_names=["logits"],
         dynamic_axes={"input_u8": {0: "batch", 2: "height", 3: "width"}, "logits": {0: "batch"}},
-        opset_version=17,
-        do_constant_folding=True
+        opset_version=18,
+        do_constant_folding=True,
+        # dynamo=False,
     )
     print(f"[SAVE] ONNX model → {path}")
 except Exception as e:
@@ -655,10 +656,30 @@ try:
         input_names=["input_u8"],
         output_names=["logits"],
         dynamic_axes={"input_u8": {0: "batch", 2: "height", 3: "width"}, "logits": {0: "batch"}},
-        opset_version=17, # Using a recent opset, 18 has antialias resize
+        opset_version=18, # Using a recent opset, 18 has antialias resize
         do_constant_folding=True
     )
     print(f"[SAVE] INT8 ONNX model → {onnx_path}")
+    print(f"[INFO] Use the ONNX inspection and inference script to test '{Path(onnx_path).name}'")
+except Exception as e:
+    print(f"[ERROR] ONNX export failed: {repr(e)}")
+    import traceback
+    traceback.print_exc()
+
+try:
+    dummy_input_onnx_cpu = (torch.randint(0, 256, (1, 3, IMG_SIZE, IMG_SIZE), dtype=torch.uint8),)
+    torch.onnx.export(
+        final_model_for_export,
+        dummy_input_onnx_cpu, # Must be a tuple of inputs
+        str(onnx_path).replace(".onnx", "_dynamo.onnx"),
+        input_names=["input_u8"],
+        output_names=["logits"],
+        dynamic_axes={"input_u8": {0: "batch", 2: "height", 3: "width"}, "logits": {0: "batch"}},
+        opset_version=18, # Using a recent opset, 18 has antialias resize
+        dynamo=True,
+        keep_initializers_as_inputs=False,
+    )
+    print(f"[SAVE] INT8 ONNX model → {onnx_path} dynamo")
     print(f"[INFO] Use the ONNX inspection and inference script to test '{Path(onnx_path).name}'")
 except Exception as e:
     print(f"[ERROR] ONNX export failed: {repr(e)}")
@@ -679,7 +700,7 @@ import onnxruntime as ort
 
 # --- Configuration ---
 num_calibration_batches = 100 # Number of batches to use for calibration
-onnx_int8_path = "mobilenet_v2_int8_ort_quantized.onnx"
+onnx_int8_path = output_base_name + "_ort_quantized.onnx"
 provider = "CPUExecutionProvider" # Or "CUDAExecutionProvider"
 
 # --- Configuration for ONNX Runtime PTQ ---
