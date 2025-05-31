@@ -27,7 +27,7 @@ except Exception:
 
 warnings.filterwarnings('ignore', category=UserWarning)
 SEED = 42; random.seed(SEED); torch.manual_seed(SEED)
-IMG_SIZE = 128  # also subset for speed, 224, PicoDet’s anchors assume stride-divisible sizes
+IMG_SIZE = 160  # also subset for speed, 224, PicoDet’s anchors assume stride-divisible sizes. Divisible by 32
 
 # ───────────────────── data & transforms ───────────────────────
 import torchvision.transforms.functional as F_tv
@@ -539,6 +539,166 @@ def quick_val_iou(
 
     return total_iou_sum / num_images_with_gt if num_images_with_gt > 0 else 0.
 
+
+class PostprocessorForONNX(nn.Module):
+    def __init__(self, head_ref: PicoDetHead): # Pass original PicoDetHead instance
+        super().__init__()
+        self.nc = head_ref.nc
+        self.reg_max = head_ref.reg_max
+        self.nl = head_ref.nl # Number of FPN levels (e.g., 3)
+
+        # Register buffers needed for decoding, cloned from the original head.
+        # These will be part of the ONNX graph as constants if not inputs.
+        self.register_buffer('strides_buffer', head_ref.strides_buffer.clone().detach(), persistent=False)
+        self.register_buffer('dfl_project_buffer', head_ref.dfl_project_buffer.clone().detach(), persistent=False)
+        for i in range(self.nl):
+            anchor_points = getattr(head_ref, f'anchor_points_level_{i}')
+            self.register_buffer(f'anchor_points_level_{i}', anchor_points.clone().detach(), persistent=False)
+
+    def _dfl_to_ltrb_inference_onnx(self, x_reg_logits_3d: torch.Tensor) -> torch.Tensor:
+        # x_reg_logits_3d shape: (B, N_anchors_img_level, 4 * (reg_max + 1))
+        # Using .size() for ONNX compatibility with dynamic shapes
+        b = x_reg_logits_3d.size(0)
+        n_anchors_img_level = x_reg_logits_3d.size(1)
+
+        # Reshape for softmax and projection. self.reg_max + 1 is constant.
+        # Target shape: (B, N_anchors_img_level, 4, self.reg_max + 1)
+        x_reg_logits_reshaped = x_reg_logits_3d.view(b, n_anchors_img_level, 4, self.reg_max + 1)
+        x_softmax = F.softmax(x_reg_logits_reshaped, dim=3) # Apply softmax over reg_max+1 dimension
+
+        # self.dfl_project_buffer has shape (reg_max+1)
+        # Unsqueeze for broadcasting: (1, 1, 1, reg_max+1)
+        proj = self.dfl_project_buffer.view(1, 1, 1, self.reg_max + 1) # Use self.reg_max + 1 for shape
+        ltrb_offsets = (x_softmax * proj).sum(dim=3) # Sum over reg_max+1 dim
+        return ltrb_offsets
+
+    def _decode_predictions_for_level_onnx(
+            self,
+            cls_logit: torch.Tensor,  # (B, NC, H_feat, W_feat)
+            obj_logit: torch.Tensor,  # (B, 1,  H_feat, W_feat)
+            reg_logit: torch.Tensor,  # (B, 4*(reg_max+1), H_feat, W_feat)
+            level_idx: int
+        ) -> Tuple[torch.Tensor, torch.Tensor]:
+
+        # B can be dynamic, H_feat, W_feat might be if input image size is dynamic
+        B = cls_logit.size(0)
+        H_feat = cls_logit.size(2)
+        W_feat = cls_logit.size(3)
+
+        stride_val = self.strides_buffer[level_idx] # Scalar tensor for this level
+        num_anchors_level = H_feat * W_feat
+
+        # anchor_points_center shape: (Max_H_feat_for_level * Max_W_feat_for_level, 2)
+        # If H_feat, W_feat are dynamic and smaller than max, slicing/selection might be needed.
+        # For fixed IMG_SIZE during QAT, H_feat, W_feat will be fixed for each level.
+        anchor_points_center = getattr(self, f'anchor_points_level_{level_idx}')
+        
+        # If anchor_points were generated for a max H_feat, W_feat and current H_feat, W_feat are smaller
+        # (e.g. due to dynamic input image size leading to smaller feature maps),
+        # a more robust way to get the *correct subset* of anchor_points is needed.
+        # However, PicoDetHead pre-calculates anchors based on a fixed img_size for training,
+        # and QAT example uses this fixed img_size. So, H_feat, W_feat should match the
+        # dimensions for which anchor_points_level_{level_idx} were created.
+
+        # Permute and reshape logits
+        # (B, C, H, W) -> (B, H, W, C) -> (B, H*W, C)
+        # For ONNX, ensure reshape uses -1 carefully if B or H*W is dynamic.
+        cls_logit_perm = cls_logit.permute(0, 2, 3, 1).contiguous().view(B, num_anchors_level, self.nc)
+        obj_logit_perm = obj_logit.permute(0, 2, 3, 1).contiguous().view(B, num_anchors_level, 1)
+        reg_logit_perm = reg_logit.permute(0, 2, 3, 1).contiguous().view(B, num_anchors_level, 4 * (self.reg_max + 1))
+
+        ltrb_offsets = self._dfl_to_ltrb_inference_onnx(reg_logit_perm)
+        ltrb_offsets_scaled = ltrb_offsets * stride_val # Element-wise with broadcasting (stride_val is scalar)
+
+        # ap_expanded shape: (1, num_anchors_level, 2) for broadcasting with B
+        ap_expanded = anchor_points_center.unsqueeze(0)
+
+        # Calculate box coordinates
+        x1 = ap_expanded[..., 0] - ltrb_offsets_scaled[..., 0]
+        y1 = ap_expanded[..., 1] - ltrb_offsets_scaled[..., 1]
+        x2 = ap_expanded[..., 0] + ltrb_offsets_scaled[..., 2]
+        y2 = ap_expanded[..., 1] + ltrb_offsets_scaled[..., 3]
+        boxes_xyxy_level = torch.stack([x1, y1, x2, y2], dim=-1) # Shape (B, num_anchors_level, 4)
+
+        # For ONNX, sigmoid should be torch.sigmoid
+        scores_level = torch.sigmoid(cls_logit_perm + obj_logit_perm) # Shape (B, num_anchors_level, NC)
+
+        return boxes_xyxy_level, scores_level
+
+    def forward(self, raw_model_outputs_nested_tuple: Tuple[Tuple[torch.Tensor, ...], ...]):
+        # raw_model_outputs_nested_tuple is now expected to be the 4-element tuple,
+        # where the first 3 elements are themselves tuples of 3 tensors each.
+        # ( (cls_l0, cls_l1, cls_l2),
+        #   (obj_l0, obj_l1, obj_l2),
+        #   (reg_l0, reg_l1, reg_l2),
+        #   (str_l0, str_l1, str_l2)  <- strides, might not be needed if using self.strides_buffer
+        # )
+
+        if not isinstance(raw_model_outputs_nested_tuple, tuple) or len(raw_model_outputs_nested_tuple) < 3:
+            raise ValueError(
+                f"PostprocessorForONNX expected a nested tuple with at least 3 inner tuples, "
+                f"got type {type(raw_model_outputs_nested_tuple)} with length {len(raw_model_outputs_nested_tuple) if isinstance(raw_model_outputs_nested_tuple, tuple) else 'N/A'}"
+            )
+
+        raw_cls_logits_levels_tuple = raw_model_outputs_nested_tuple[0]
+        raw_obj_logits_levels_tuple = raw_model_outputs_nested_tuple[1]
+        raw_reg_logits_levels_tuple = raw_model_outputs_nested_tuple[2]
+        # optional_strides_tuple = raw_model_outputs_nested_tuple[3] # If needed
+
+        if not (isinstance(raw_cls_logits_levels_tuple, tuple) and
+                  isinstance(raw_obj_logits_levels_tuple, tuple) and
+                  isinstance(raw_reg_logits_levels_tuple, tuple)):
+            raise ValueError("Inner elements of the input to PostprocessorForONNX are not tuples as expected.")
+
+        if not (len(raw_cls_logits_levels_tuple) == self.nl and
+                len(raw_obj_logits_levels_tuple) == self.nl and
+                len(raw_reg_logits_levels_tuple) == self.nl):
+            raise ValueError(
+                f"PostprocessorForONNX: Inner tuples do not have the expected length ({self.nl}). "
+                f"Got lengths: cls={len(raw_cls_logits_levels_tuple)}, "
+                f"obj={len(raw_obj_logits_levels_tuple)}, "
+                f"reg={len(raw_reg_logits_levels_tuple)}"
+            )
+
+        decoded_boxes_all_levels_list: List[torch.Tensor] = []
+        decoded_scores_all_levels_list: List[torch.Tensor] = []
+
+        for i in range(self.nl):
+            cls_l = raw_cls_logits_levels_tuple[i]
+            obj_l = raw_obj_logits_levels_tuple[i]
+            reg_l = raw_reg_logits_levels_tuple[i]
+
+            # Debugging shapes received by postprocessor
+            # print(f"[PostprocessorForONNX Level {i}] cls_l shape: {cls_l.shape}, obj_l shape: {obj_l.shape}, reg_l shape: {reg_l.shape}")
+
+            boxes_level, scores_level = self._decode_predictions_for_level_onnx(
+                cls_l, obj_l, reg_l, i
+            )
+            decoded_boxes_all_levels_list.append(boxes_level)
+            decoded_scores_all_levels_list.append(scores_level)
+
+        batched_all_boxes = torch.cat(decoded_boxes_all_levels_list, dim=1)
+        batched_all_scores = torch.cat(decoded_scores_all_levels_list, dim=1)
+
+        return batched_all_boxes, batched_all_scores
+
+
+class ONNXExportablePicoDet(nn.Module):
+    def __init__(self,
+                 quantized_core_model: nn.Module, # This is int8_model_with_preprocessor
+                 head_postprocessor: PostprocessorForONNX):
+        super().__init__()
+        self.core_model = quantized_core_model
+        self.postprocessor = head_postprocessor
+
+    def forward(self, x: torch.Tensor): # x is images_uint8
+        # core_model is expected to return the tuple of (typically 12) flattened tensors
+        # from the baked-in training output path of PicoDetHead.
+        raw_feature_outputs_tuple = self.core_model(x)
+
+        # The postprocessor takes this tuple and decodes it to the inference outputs
+        return self.postprocessor(raw_feature_outputs_tuple)
+
 # ────────────────── append_nms_to_onnx ────────────────────
 def append_nms_to_onnx(
         in_path: str,
@@ -653,7 +813,7 @@ def main(argv: List[str] | None = None):
     pa = argparse.ArgumentParser()
     pa.add_argument('--coco_root', default='coco')
     pa.add_argument('--arch', choices=['mnv3', 'mnv4s', 'mnv4m'], default='mnv3')
-    pa.add_argument('--epochs', type=int, default=5) 
+    pa.add_argument('--epochs', type=int, default=25) 
     pa.add_argument('--batch', type=int, default=16)
     pa.add_argument('--workers', type=int, default=0)
     pa.add_argument('--device', default=None)
@@ -676,8 +836,8 @@ def main(argv: List[str] | None = None):
         inplace_act_for_head_neck=not cfg.no_inplace_head_neck # Control from arg
     ).to(dev)
     
-    tr_loader = get_loader(cfg.coco_root, 'train', cfg.batch, cfg.workers, subset_size=1200)
-    vl_loader = get_loader(cfg.coco_root, 'val', cfg.batch, cfg.workers, subset_size=200)
+    tr_loader = get_loader(cfg.coco_root, 'train', cfg.batch, cfg.workers, subset_size=12000)
+    vl_loader = get_loader(cfg.coco_root, 'val', cfg.batch, cfg.workers, subset_size=2000)
 
     train_base_ds = unwrap_dataset(tr_loader.dataset)
     if hasattr(train_base_ds, 'coco') and train_base_ds.coco is not None:
@@ -762,32 +922,48 @@ def main(argv: List[str] | None = None):
     int8_model_with_preprocessor = convert_fx(qat_model) # This model still contains 'pre'
     print("[INFO] QAT model converted to INT8.")
 
-    # ---------------- ONNX export (model WITH preprocessor, without NMS) ----------------
-    int8_model_with_preprocessor.eval()
+    # ---------------- Create the wrapper for ONNX export ----------------
+    # `model` here is your original FP32 PicoDet model, used to get head parameters
+    # Ensure `model` is accessible here. If it was modified, load weights if necessary,
+    # or ensure `model.head` has the correct buffers.
+    if not hasattr(model, 'head') or not isinstance(model.head, PicoDetHead):
+        raise RuntimeError("Original FP32 model or its head is not available for PostprocessorForONNX initialization.")
+
+    # It's crucial that model.head's buffers (strides, dfl_project, anchors) are correctly initialized
+    # for the IMG_SIZE used during training. This should already be the case.
+    onnx_postprocessor = PostprocessorForONNX(model.head) # Pass the head of the original FP32 model
+    
+    # Create the final model that combines the quantized core and the new postprocessor
+    final_exportable_int8_model = ONNXExportablePicoDet(
+        int8_model_with_preprocessor, # The FX GraphModule from convert_fx
+        onnx_postprocessor
+    )
+    final_exportable_int8_model.cpu().eval() # Ensure CPU and eval mode for export
+
+    # ---------------- ONNX export (model WITH preprocessor AND wrapped postprocessor, without NMS) ----------------
     temp_onnx_path = cfg.out.replace(".onnx", "_temp_no_nms.onnx")
 
-    # The input for ONNX export should match what the 'int8_model_with_preprocessor' expects,
-    # which is a uint8 image tensor because its first module 'pre' (ResizeNorm) handles it.
     actual_onnx_input_example = dummy_uint8_input_cpu.cpu() # uint8 tensor
 
-
+    print("[INFO] Exporting final INT8 model with wrapped postprocessing to ONNX...")
     torch.onnx.export(
-        int8_model_with_preprocessor,
+        final_exportable_int8_model, # <--- Use this new composite model
         actual_onnx_input_example,
         temp_onnx_path,
         input_names=['images_uint8'],
+        # These output names now correspond to the (B, TotalAnchors, 4/NC) tensors
         output_names=['raw_boxes', 'raw_scores'],
         dynamic_axes={
             'images_uint8': {0: 'batch', 2: 'h', 3: 'w'},
-            'raw_boxes':    {0: 'batch', 1: 'anchors'},          #  [B, A, 4]
-            'raw_scores':   {0: 'batch', 1: 'anchors', 2: 'cls'} #  [B, A, C]
+            'raw_boxes':    {0: 'batch', 1: 'anchors'}, # Shape [batch, total_anchors, 4]
+            'raw_scores':   {0: 'batch', 1: 'anchors'}  # Shape [batch, total_anchors, num_classes]
+                                                        # The 3rd dim (num_classes) is static
         },
-        opset_version=18,
-        keep_initializers_as_inputs=False,
+        opset_version=18, # Your script uses 18
+        keep_initializers_as_inputs=False, # Important for some runtimes
         do_constant_folding=True,
-        dynamo=False,  # true might be faster
     )
-    print(f'[SAVE] Intermediate ONNX (no NMS, with preprocessor) → {temp_onnx_path}')
+    print(f'[SAVE] Intermediate ONNX (no NMS, with wrapped postprocessor) → {temp_onnx_path}')
 
     # DEBUG: Inspect intermediate ONNX model outputs
     intermediate_model_check = onnx.load(temp_onnx_path)
@@ -848,13 +1024,51 @@ def main(argv: List[str] | None = None):
     except Exception as e:
         print(f"  [PyTorch Output] Error during PyTorch forward: {e}")
         traceback.print_exc()
+    
+    print("[DEBUG] Inspecting output of int8_model_with_preprocessor directly...")
+    int8_model_with_preprocessor.cpu().eval() # Ensure it's on CPU and eval
+    dummy_input_for_inspection = actual_onnx_input_example.cpu() # Or generate a new one
+    
+    try:
+        core_model_outputs = int8_model_with_preprocessor(dummy_input_for_inspection)
+        print(f"  [Core Model Output] Type: {type(core_model_outputs)}")
+        if isinstance(core_model_outputs, tuple):
+            print(f"  [Core Model Output] Number of elements: {len(core_model_outputs)}")
+            for i, item in enumerate(core_model_outputs):
+                if isinstance(item, torch.Tensor):
+                    print(f"    Element {i}: Shape={item.shape}, Dtype={item.dtype}")
+                else:
+                    print(f"    Element {i}: Type={type(item)}")
+        elif isinstance(core_model_outputs, torch.Tensor):
+            print(f"  [Core Model Output] (Single Tensor) Shape={core_model_outputs.shape}, Dtype={core_model_outputs.dtype}")
+        else:
+            print(f"  [Core Model Output] Unexpected output type: {type(core_model_outputs)}")
+    except Exception as e:
+        print(f"  [Core Model Output] Error during direct call: {e}")
+        import traceback
+        traceback.print_exc()
 
+
+    print("[DEBUG] Running PyTorch forward pass on final_exportable_int8_model...")
+    try:
+        py_outputs_final_exportable = final_exportable_int8_model(actual_onnx_input_example.cpu())
+        print(f"  [PyTorch Final Exportable Output] Type: {type(py_outputs_final_exportable)}")
+        if isinstance(py_outputs_final_exportable, tuple) and len(py_outputs_final_exportable) == 2:
+            print(f"    raw_boxes shape: {py_outputs_final_exportable[0].shape}, dtype: {py_outputs_final_exportable[0].dtype}")
+            print(f"    raw_scores shape: {py_outputs_final_exportable[1].shape}, dtype: {py_outputs_final_exportable[1].dtype}")
+        else:
+            print("    Unexpected output structure from final_exportable_int8_model.")
+    except Exception as e:
+        print(f"  [PyTorch Final Exportable Output] Error during PyTorch forward: {e}")
+        import traceback
+        traceback.print_exc()
 
     # ---------------- Append NMS to the ONNX model ------------------------------
+    # This should now work correctly as raw_boxes and raw_scores will have the expected shapes.
     append_nms_to_onnx(
         in_path=temp_onnx_path,
         out_path=cfg.out,
-        score_thresh=float(model.head.score_th),
+        score_thresh=float(model.head.score_th), # NMS params from original head
         iou_thresh=float(model.head.iou_th),
         max_det=int(model.head.max_det),
     )
