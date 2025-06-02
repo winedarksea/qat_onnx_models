@@ -1,5 +1,5 @@
 # picodet_lib.py
-# PyTorch ≥ 2.7 / opset‑18 ready
+# PyTorch 2.7 / opset‑18
 from __future__ import annotations
 import math, warnings
 from typing import List, Tuple
@@ -13,26 +13,33 @@ import timm
 # ───────────────────────────── layers ──────────────────────────────
 class GhostConv(nn.Module):
     def __init__(self, c_in: int, c_out: int, k: int = 1, s: int = 1,
-                 dw_size: int = 3, ratio: int = 2, inplace_act: bool = False): # Added inplace_act
+                 dw_size: int = 3, ratio: int = 2, inplace_act: bool = False):  # dw_size 3, 5
         super().__init__()
-        init_ch = min(c_out, math.ceil(c_out / ratio))
-        cheap_ch = c_out - init_ch
-        pad = k // 2
-        self.primary = nn.Sequential(
-            nn.Conv2d(c_in, init_ch, k, s, pad, bias=False),
-            nn.BatchNorm2d(init_ch), nn.ReLU6(inplace=inplace_act) # Use param
-        )
-        self.cheap = nn.Sequential() if cheap_ch == 0 else nn.Sequential(
-            nn.Conv2d(init_ch, cheap_ch, dw_size, 1, dw_size // 2,
-                      groups=init_ch, bias=False),
-            nn.BatchNorm2d(cheap_ch), nn.ReLU6(inplace=inplace_act) # Use param
-        )
+        self.c_out = c_out # Store c_out
+        init_ch = math.ceil(c_out / ratio)
+        # Ensure init_ch is not greater than c_out, especially if c_out is small.
+        init_ch = min(init_ch, c_out)
+        self.cheap_ch = c_out - init_ch
 
-    def forward(self, x: torch.Tensor):
-        y = self.primary(x)
+        self.primary = nn.Sequential(
+            nn.Conv2d(c_in, init_ch, k, s, k // 2, bias=False),
+            nn.BatchNorm2d(init_ch), nn.ReLU6(inplace=inplace_act)
+        )
+        if self.cheap_ch > 0:
+            self.cheap = nn.Sequential(
+                nn.Conv2d(init_ch, self.cheap_ch, dw_size, 1, dw_size // 2,
+                          groups=init_ch, bias=False),
+                nn.BatchNorm2d(self.cheap_ch), nn.ReLU6(inplace=inplace_act)
+            )
+        else:
+            self.cheap = None # Use None for clarity
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y_primary = self.primary(x)
         if self.cheap:
-            y = torch.cat([y, self.cheap(y)], 1)
-        return y[:, : self.out_channels]
+            y_cheap = self.cheap(y_primary)
+            return torch.cat([y_primary, y_cheap], 1)
+        return y_primary # Already has c_out (init_ch) channels if cheap_ch is 0
 
     @property
     def out_channels(self):
@@ -135,7 +142,7 @@ def dfl_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
 
 
 class PicoDetHead(nn.Module):
-    def __init__(self, num_classes: int = 80, reg_max: int = 7, num_feats: int = 96,
+    def __init__(self, num_classes: int = 80, reg_max: int = 16, num_feats: int = 96,
                  num_levels: int = 3, 
                  # NMS parameters are stored for use by external NMS/ONNX appending
                  max_det: int = 100, 
@@ -180,12 +187,26 @@ class PicoDetHead(nn.Module):
             # _anchor_points_centers_list.append(anchor_points_center) # Not strictly needed if directly registering
             self.register_buffer(f'anchor_points_level_{i}', anchor_points_center, persistent=False)
 
-    def _initialize_biases(self):
-        cls_bias_init = -math.log((1 - 0.01) / 0.01)
-        for layer_list in [self.cls_pred, self.obj_pred]:
-            for layer in layer_list:
-                if hasattr(layer, 'bias') and layer.bias is not None:
-                    nn.init.constant_(layer.bias, cls_bias_init)
+    def _initialize_biases(self) -> None:
+        """
+        Initialise conv-biases so that:
+          • class-scores start with the common “p = 0.01” prior  (≈ –4.595)
+          • objectness scores start at 0.0  (p = 0.5) so that
+            the *joint* score  sigmoid(cls + obj)  also starts at 0.01
+        This prevents the network from being over-confidently negative and
+        makes it possible for early positive boxes to cross a 0.05 threshold.
+        """
+        # classification branches
+        cls_prior = 0.01
+        cls_bias  = -math.log((1. - cls_prior) / cls_prior)      # –4.595
+        for conv in self.cls_pred:
+            if conv.bias is not None:
+                nn.init.constant_(conv.bias, cls_bias)
+
+        # objectness branches   (neutral ⇒ bias = 0.0)
+        for conv in self.obj_pred:
+            if conv.bias is not None:
+                nn.init.constant_(conv.bias, 0.0)
 
     def _dfl_to_ltrb_inference(self, x_reg_logits_3d: torch.Tensor) -> torch.Tensor:
         b, n_anchors_img, _ = x_reg_logits_3d.shape
@@ -218,31 +239,6 @@ class PicoDetHead(nn.Module):
                 f"PicoDetHead.dfl_decode_for_training expects 2D input (N, 4*(M+1)), got {x_reg_logits.ndim}D"
             )
         return ltrb_offsets
-
-    def _dfl_to_ltrb_original_for_training_etc(self, x_reg_logits: torch.Tensor) -> torch.Tensor:
-        input_shape = x_reg_logits.shape
-        if x_reg_logits.ndim == 4: # (B, C, H, W) - Not used in current inference path
-            b, _, h, w = input_shape
-            x_reg_logits = x_reg_logits.view(b, 4, self.reg_max + 1, h, w)
-            x_softmax = x_reg_logits.softmax(dim=2)
-            proj = self.dfl_project_buffer.view(1, 1, -1, 1, 1)
-            ltrb_offsets = (x_softmax * proj).sum(dim=2)
-        elif x_reg_logits.ndim == 2: # (N_total_anchors, 4 * (reg_max + 1)) - Might be used in training
-            n_anchors = input_shape[0]
-            x_reg_logits = x_reg_logits.view(n_anchors, 4, self.reg_max + 1)
-            x_softmax = x_reg_logits.softmax(dim=2)
-            proj = self.dfl_project_buffer.view(1, 1, -1)
-            ltrb_offsets = (x_softmax * proj).sum(dim=2)
-        elif x_reg_logits.ndim == 3: # (B, N_anchors_per_image, 4*(reg_max+1)) - Used in inference
-            b, n_anchors_img, _ = input_shape
-            x_reg_logits = x_reg_logits.view(b, n_anchors_img, 4, self.reg_max + 1)
-            x_softmax = x_reg_logits.softmax(dim=3)
-            proj = self.dfl_project_buffer.view(1, 1, 1, -1)
-            ltrb_offsets = (x_softmax * proj).sum(dim=3)
-        else:
-            raise ValueError(f"_dfl_to_ltrb expects 2D, 3D or 4D input, got {x_reg_logits.ndim}D")
-        return ltrb_offsets
-
 
     def _decode_predictions_for_level(
             self,
@@ -313,9 +309,10 @@ class PicoDetHead(nn.Module):
 
 class PicoDet(nn.Module):
     def __init__(self, backbone: nn.Module, feat_chs: Tuple[int, int, int],
-                 num_classes: int = 80, neck_out_ch: int = 96, 
+                 num_classes: int = 80,
+                 neck_out_ch: int = 96,  # 96, 128
                  img_size: int = 224,
-                 head_reg_max: int = 7, 
+                 head_reg_max: int = 16, 
                  head_max_det: int = 100, # Will be used by ONNX NMS logic
                  head_score_thresh: float = 0.05, # Will be used by ONNX NMS logic
                  head_nms_iou: float = 0.6, # Will be used by ONNX NMS logic
