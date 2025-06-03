@@ -10,7 +10,7 @@ import torchvision.datasets as tvsets
 import torchvision.ops as tvops
 from torch.utils.data import DataLoader, Subset
 from torch.optim import SGD, AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 import torch.nn.functional as F
 
 import onnx
@@ -75,249 +75,136 @@ def get_loader(root: str, split: str, bsz: int, workers: int = 0, subset_size: i
                       collate_fn=collate, num_workers=workers, pin_memory=True,
                       persistent_workers=bool(workers))
 
+
 # ───────────────────── assigner (SimOTA, cached) ────────────────
-# picodet_lib.py (SimOTACache class - UPDATED)
-
 class SimOTACache:
-    def __init__(self, nc: int, ctr: float = 2.5, topk: int = 10, cls_cost_weight: float = 0.5):
-        """
-        SimOTA Assigner with caching for anchor centers.
-
-        Args:
-            nc (int): Number of classes.
-            ctr (float): Center radius factor. Anchors must be within ctr * stride of a GT center.
-            topk (int): Max number of anchors to consider per GT for dynamic-k selection (candidate_k).
-            cls_cost_weight (float): Weight for the classification cost term in the matching cost matrix.
-                                     Should be > 0 for multi-class to prevent high-IoU wrong-class matches.
-                                     Set to 0 if you want to revert to only localization cost.
-        """
+    def __init__(self,
+                 nc: int,
+                 ctr: float = 2.5,
+                 topk: int = 10,
+                 cls_cost_weight: float = 0.5,
+                 debug_epochs: int = 0):         # 0 = silent
         self.nc = nc
         self.r = ctr
         self.k = topk
-        self.cls_cost_weight = cls_cost_weight # New parameter for classification cost
-        self.cache = {} # Caches anchor center coordinates and strides per feature level
+        self.cls_cost_weight = cls_cost_weight
+        self.cache = {}               # anchor centres per (H,W,stride,device)
+        # debug
+        self._dbg_mod  = debug_epochs
+        self._dbg_iter = 0
 
+    # ------------------------------------------------------------
+    #  main call
+    # ------------------------------------------------------------
     @torch.no_grad()
-    def __call__(self, f_shapes: Tuple[Tuple[int, int, int], ...], device: torch.device,
-                 tgt: dict) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        # Returns:
-        #   fg_mask (A,): Boolean mask, True for foreground anchors.
-        #   assigned_gt_labels_full (A,): Long tensor, GT label index (0..nc-1) for fg_mask positions, -1 elsewhere.
-        #   assigned_gt_boxes_full (A, 4): Float tensor, GT box [x1,y1,x2,y2] for fg_mask positions, zeros elsewhere.
-        #   assigned_iou_full (A,): Float tensor, IoU with assigned GT for fg_mask positions, zeros elsewhere.
-        try:
-            centres_list, strides_list = [], []
-            for H, W, s_val_level in f_shapes:
-                key = (H, W, s_val_level, str(device))
-                if key not in self.cache:
-                    yv, xv = torch.meshgrid(torch.arange(H, device=device),
-                                            torch.arange(W, device=device), indexing='ij')
-                    s_float = float(s_val_level)
-                    level_centers = (torch.stack((xv, yv), dim=2).reshape(-1, 2).to(torch.float32) + 0.5) * s_float
-                    self.cache[key] = level_centers
-                
-                centres_list.append(self.cache[key])
-                strides_list.append(torch.full((H * W,), float(s_val_level), dtype=torch.float32, device=device))
-            
-            if not centres_list:
-                return (torch.zeros(0, dtype=torch.bool, device=device),
-                        torch.full((0,), -1, dtype=torch.long, device=device),
-                        torch.zeros((0, 4), device=device),
-                        torch.zeros(0, device=device))
+    def __call__(self,
+                 f_shapes,               # List[(H,W,stride)]
+                 device: torch.device,
+                 tgt: dict              # {"boxes":(M,4), "labels":(M,)}
+                 ):
 
-            anchor_centers = torch.cat(centres_list, dim=0) # (A, 2)
-            anchor_strides = torch.cat(strides_list, dim=0) # (A,)
-            A = anchor_centers.size(0) # Total number of anchors
-            
-            gt_boxes = tgt['boxes']    # (M, 4)
-            gt_labels = tgt['labels']  # (M,)
-            M = gt_boxes.size(0)       # Number of GT objects
+        # 0. early-exit if no GT
+        gt_boxes = tgt['boxes']
+        gt_labels = tgt['labels']
+        M = gt_boxes.size(0)
+        if M == 0:
+            A = sum(H * W for H, W, _ in f_shapes)
+            empty_bool = torch.zeros(A, dtype=torch.bool,  device=device)
+            return empty_bool,            \
+                   torch.full((A,), -1,   dtype=torch.long,  device=device), \
+                   torch.zeros((A, 4),    dtype=torch.float32, device=device), \
+                   torch.zeros((A,),      dtype=torch.float32, device=device)
 
-            if M == 0:
-                return (torch.zeros(A, dtype=torch.bool, device=device),
-                        torch.full((A,), -1, dtype=torch.long, device=device),
-                        torch.zeros((A, 4), device=device),
-                        torch.zeros(A, device=device))
+        # 1. collect anchor centres & strides (with cache)
+        centres_l, strides_l = [], []
+        for H, W, s_val in f_shapes:
+            key = (H, W, s_val, str(device))
+            if key not in self.cache:
+                yv, xv = torch.meshgrid(torch.arange(H, device=device),
+                                        torch.arange(W, device=device),
+                                        indexing='ij')
+                centres = (torch.stack((xv, yv), 2).view(-1, 2).float() + 0.5) * float(s_val)
+                self.cache[key] = centres
+            centres_l.append(self.cache[key])
+            strides_l.append(torch.full((H * W,),
+                                        float(s_val),
+                                        dtype=torch.float32,
+                                        device=device))
 
-            # --- Label Validation ---
-            if gt_labels.numel() > 0:
-                if gt_labels.max().item() >= self.nc or gt_labels.min().item() < 0:
-                    raise IndexError(f"GT labels out of bounds [0, {self.nc-1}]. Got min: {gt_labels.min()}, max: {gt_labels.max()}")
-            elif M > 0:
-                 return (torch.zeros(A, dtype=torch.bool, device=device),
-                        torch.full((A,), -1, dtype=torch.long, device=device),
-                        torch.zeros((A, 4), device=device),
-                        torch.zeros(A, device=device))
+        anchor_centers = torch.cat(centres_l, 0)     # (A,2)
+        anchor_strides = torch.cat(strides_l, 0)     # (A,)
+        A = anchor_centers.size(0)
 
-            # --- Cost matrix preparation (common terms) ---
-            # 1. IoU between GTs and anchor boxes
-            s_div_2 = anchor_strides.unsqueeze(1) / 2.0
-            anchor_candidate_boxes = torch.cat([anchor_centers - s_div_2, anchor_centers + s_div_2], dim=1)
-            iou = tvops.box_iou(gt_boxes, anchor_candidate_boxes) # Shape: (M, A)
+        # 2. IoU and centre-radius mask
+        s_div_2 = anchor_strides.unsqueeze(1) / 2.0
+        anchor_candidate_boxes = torch.cat([anchor_centers - s_div_2,
+                                            anchor_centers + s_div_2], 1)
+        iou = tvops.box_iou(gt_boxes, anchor_candidate_boxes)     # (M,A)
 
-            # 2. Center Prior Mask
-            gt_centers_xy = (gt_boxes[:, :2] + gt_boxes[:, 2:]) / 2.0 # (M, 2)
-            dist = (anchor_centers.unsqueeze(1) - gt_centers_xy.unsqueeze(0)).abs().max(dim=-1).values # (A, M)
-            center_region_mask = dist < (self.r * anchor_strides.unsqueeze(1)) # (A, M)
+        gt_centres = (gt_boxes[:, :2] + gt_boxes[:, 2:]) / 2.0
+        dist = (anchor_centers.unsqueeze(1)
+                - gt_centres.unsqueeze(0)).abs().max(dim=-1).values   # (A,M)
+        centre_mask = dist < (self.r * anchor_strides.unsqueeze(1))   # (A,M)
 
-            # --- Dynamic-k Candidate Selection (Foreground Estimation) ---
-            # This selects initial candidates for fg_mask.
-            iou_sum_per_gt = iou.sum(dim=1) # (M,)
-            # Corrected dynamic_ks: Clamp also by self.k (max candidates per GT)
-            dynamic_ks = torch.clamp(iou_sum_per_gt.int(), min=1, max=self.k) # (M,)
+        # 3. dynamic-k candidates
+        iou_sum_per_gt = iou.sum(1)
+        dynamic_ks = torch.clamp(iou_sum_per_gt.ceil().int(),  # ceil not floor
+                                 min=3, max=self.k)
+        fg_cand_mask = torch.zeros(A, dtype=torch.bool, device=device)
 
-            fg_mask_candidates = torch.zeros(A, dtype=torch.bool, device=device)
-            for gt_idx in range(M):
-                # Anchors in the center region of this GT
-                anchors_in_center_for_gt = center_region_mask[:, gt_idx] # (A,)
-                
-                if not anchors_in_center_for_gt.any():
-                    continue # No anchors in center region for this GT
+        for g in range(M):
+            valid_idx = centre_mask[:, g].nonzero(as_tuple=False).squeeze(1)
+            if valid_idx.numel():
+                ious_local = iou[g, valid_idx]
+                k = min(dynamic_ks[g].item(), valid_idx.numel())
+                topk_idx = torch.topk(ious_local, k).indices
+                fg_cand_mask[valid_idx[topk_idx]] = True
 
-                # Consider only IoUs of anchors within the center region for this GT
-                # Mask out IoUs of anchors far from this GT
-                ious_for_gt_in_center = iou[gt_idx] * anchors_in_center_for_gt # (A,)
-                
-                # Number of anchors to select for this GT:
-                # min(dynamic_k_for_this_gt, num_anchors_actually_in_center_region)
-                # Also, k cannot exceed the total number of anchors A.
-                num_candidates_for_gt = min(dynamic_ks[gt_idx].item(), anchors_in_center_for_gt.sum().item())
-                num_candidates_for_gt = min(num_candidates_for_gt, A) # Ensure k <= A
+        # 4. cost matrix
+        cost_loc = 1.0 - iou
+        cost_cls = (self.cls_cost_weight * torch.ones_like(cost_loc)
+                    if (self.cls_cost_weight > 0 and self.nc > 1) else 0)
+        large_pen = torch.tensor(1e4, device=device, dtype=cost_loc.dtype)
+        cost = (cost_loc + cost_cls
+                + (~centre_mask.T) * large_pen
+                + (~fg_cand_mask.unsqueeze(0)) * large_pen)
 
-                if num_candidates_for_gt > 0:
-                    # Select top-k anchors (by IoU, within center region) for this GT
-                    _, topk_indices_for_gt = ious_for_gt_in_center.topk(num_candidates_for_gt, largest=True)
-                    fg_mask_candidates[topk_indices_for_gt] = True
-            
-            # --- Cost Matrix for Final Assignment ---
-            # Only consider anchors that are candidates (in fg_mask_candidates)
-            # Cost_loc = 1.0 - IoU
-            cost_loc = (1.0 - iou) # (M, A)
+        assign_gt = cost.argmin(0)                # (A,)
 
-            # Cost_cls: Penalizes assigning an anchor to a GT of a different class.
-            # For multi-class, this helps prevent high-IoU but wrong-class matches.
-            # Create a one-hot representation of GT labels: (M, nc)
-            # gt_labels_one_hot = F.one_hot(gt_labels, num_classes=self.nc).float() # (M, nc)
-            
-            # For each anchor, imagine it's predicted uniformly for all classes (or some other prior).
-            # A simple cls cost can be derived by assuming an anchor *could* match any class,
-            # and penalizing if it doesn't match the GT's class.
-            # Or, more directly, for a given (gt_m, anchor_a) pair, if we assign anchor_a to gt_m,
-            # the classification "loss" if anchor_a's (hypothetical perfect) prediction for gt_m's class is 1
-            # and 0 for others.
-            # A simpler heuristic: add a cost if anchor_class_prediction != gt_class.
-            # Since we don't have anchor predictions here, we can introduce a class cost
-            # that is low when GT label matches a "hypothetical" anchor prediction (which we don't have).
-            # More practically, from TAL papers like OTA:
-            # cls_cost is often based on -log(pred_score_for_gt_class)
-            # If no prediction:
-            # We can use a fixed penalty if this GT is not the "primary" class for an anchor.
-            # For prediction-free:
-            #   Consider a scenario where anchor_a is assigned to gt_m.
-            #   If this assignment is "good" class-wise, cost_cls should be low.
-            #   The original SimOTA in YOLOX uses predicted classification scores.
-            #   If prediction-free, a common simplification is to either omit cls_cost
-            #   or use a very simple one.
-            #   Let's use a simplified one that penalizes assigning anchor `a` to `gt_m`
-            #   if `gt_m`'s class is not the class `anchor_a` is "most likely" to predict (if it could).
-            #   Since we don't know what an anchor is likely to predict, we can use a small,
-            #   uniform classification cost. This is a bit of a placeholder if not using scores.
-            #   The provided suggestion `if multi-class keep a small class-cost (e.g. 0.5)`
-            #   implies a constant cost for *all* potential (gt, anchor) pairs if they were to be matched.
-            #   This doesn't help discriminate *between* GTs for a given anchor if their IoUs are similar.
+        # 5. final fg mask = candidate ∧ in-centre of its chosen GT
+        fg_final = torch.zeros(A, dtype=torch.bool, device=device)
+        cand_idx = fg_cand_mask.nonzero(as_tuple=False).squeeze(1)
+        if cand_idx.numel():
+            in_centre = centre_mask[cand_idx, assign_gt[cand_idx]]
+            fg_final[cand_idx[in_centre]] = True
 
-            # Let's re-think the `cls_cost` from the user's suggestion "keep a small class-cost (e.g. 0.5)".
-            # This usually means adding a fixed value to the cost if this pair is chosen.
-            # This doesn't differentiate class compatibility if IoUs are similar.
-            # However, if the intent is to ensure that the IoU needs to be significantly better
-            # to overcome this "base" cost of matching, then it's a global addition.
+        # 6. build outputs
+        gt_lbl_out = torch.full((A,), -1, dtype=torch.long,  device=device)
+        gt_box_out = torch.zeros((A, 4), dtype=torch.float32, device=device)
+        iou_out    = torch.zeros((A,),  dtype=torch.float32, device=device)
 
-            # A more effective prediction-free class cost would be if we had prior class probabilities for anchors.
-            # Lacking that, let's make it a small constant if self.cls_cost_weight > 0, effectively
-            # making localization (IoU) slightly more important to overcome this base cost.
-            cost_cls = torch.zeros_like(cost_loc) # (M, A)
-            if self.cls_cost_weight > 0 and self.nc > 1:
-                 # This is a constant addition. Its main effect is to scale the overall cost.
-                 # It doesn't help an anchor decide *which* GT class to match if multiple GTs
-                 # have similar IoU.
-                 # A more sophisticated prediction-free cls_cost might involve e.g.,
-                 # if an anchor is very specialized for one class due to its aspect ratio/scale.
-                 # For now, let's follow the spirit of a "small class-cost".
-                 cost_cls += self.cls_cost_weight # Add a small constant cost
+        if fg_final.any():
+            fg_idx  = fg_final.nonzero(as_tuple=False).squeeze(1)
+            gt_idx  = assign_gt[fg_idx]
+            gt_lbl_out[fg_idx] = gt_labels[gt_idx]
+            gt_box_out[fg_idx] = gt_boxes[gt_idx]
+            iou_out[fg_idx]    = iou[gt_idx, fg_idx]
 
-            # Total cost:
-            # Add a large penalty if anchor is not in GT's center region (transposed mask)
-            # Add a large penalty if anchor is not a candidate (from dynamic-k selection)
-            cost_matrix = (
-                cost_loc
-                + cost_cls
-                + (~center_region_mask.T) * 1e4  # Penalty for not in center region
-                + (~fg_mask_candidates.unsqueeze(0)) * 1e4 # Penalty for not being a dynamic-k candidate
-            ) # Shape: (M, A)
+        # 7. lightweight debug  -----------------------------------------
+        if self._dbg_mod and (self._dbg_iter % (1000 * self._dbg_mod) == 0):
+            num_fg   = fg_final.sum().item()
+            num_cand = fg_cand_mask.sum().item()
+            mean_iou = iou_out[fg_final].mean().item() if num_fg else 0
+            k_bar    = dynamic_ks.float().mean().item()
+            print(f"[SimOTA] fg={num_fg:4d} cand={num_cand:4d} "
+                  f"avgIoU={mean_iou:4.3f} k̄={k_bar:3.1f}")
+            if num_fg and (iou_out[fg_final] < 0.05).float().mean() > 0.2:
+                print("  ⚠️  >20 % FG IoU < 0.05 – verify anchor order / scales")
+        self._dbg_iter += 1
+        # ----------------------------------------------------------------
 
-            # For each anchor (column in cost_matrix), find the GT (row) that has the minimum cost
-            # This resolves conflicts if an anchor is a candidate for multiple GTs.
-            assigned_gt_idx_per_anchor = cost_matrix.argmin(dim=0) # Shape: (A,)
+        return fg_final, gt_lbl_out, gt_box_out, iou_out
 
-            # --- Final Foreground Mask and Targets ---
-            # An anchor is a final foreground if:
-            # 1. It was a candidate from dynamic-k selection (fg_mask_candidates)
-            # 2. It's in the center region of the GT it was finally assigned to.
-            # 3. The GT it was assigned to must also accept this anchor (based on cost).
-            
-            # Gather the center_region_mask values for the (assigned_gt, anchor) pairs
-            # assigned_gt_idx_per_anchor: (A,)
-            # center_region_mask: (A, M)
-            # We need center_region_mask[anchor_idx, assigned_gt_idx_per_anchor[anchor_idx]]
-            # This can be done with gather or by iterating.
-            # Easier: make final_fg_mask based on fg_mask_candidates and then check if the assigned GT
-            # for that candidate also considers it "in_center".
-            
-            final_fg_mask = torch.zeros(A, dtype=torch.bool, device=device)
-            
-            # Indices of anchors that were candidates
-            candidate_anchor_indices = torch.where(fg_mask_candidates)[0] # (num_candidates,)
-
-            if candidate_anchor_indices.numel() > 0:
-                # For these candidates, get their assigned GT index
-                gt_indices_for_candidates = assigned_gt_idx_per_anchor[candidate_anchor_indices] # (num_candidates,)
-
-                # Check if these candidates are in the center region of their *assigned* GT
-                # center_region_mask is (A, M)
-                # We need: center_region_mask[candidate_anchor_indices[i], gt_indices_for_candidates[i]]
-                in_center_for_assigned_gt = center_region_mask[candidate_anchor_indices, gt_indices_for_candidates] # (num_candidates,)
-
-                # Final foreground anchors are candidates that are also in center of their assigned GT
-                final_fg_anchor_indices_relative_to_candidates = torch.where(in_center_for_assigned_gt)[0]
-                
-                if final_fg_anchor_indices_relative_to_candidates.numel() > 0:
-                    actual_final_fg_indices = candidate_anchor_indices[final_fg_anchor_indices_relative_to_candidates]
-                    final_fg_mask[actual_final_fg_indices] = True
-
-            # --- Prepare Output Tensors ---
-            assigned_gt_labels_full = torch.full((A,), -1, dtype=torch.long, device=device)
-            assigned_gt_boxes_full  = torch.zeros((A, 4), dtype=torch.float32, device=device)
-            assigned_iou_full       = torch.zeros((A,), dtype=torch.float32, device=device)
-
-            num_final_fg = final_fg_mask.sum().item()
-            if num_final_fg > 0:
-                # Get the GT indices ONLY for the final foreground anchors
-                gt_indices_for_final_fg_anchors = assigned_gt_idx_per_anchor[final_fg_mask]
-
-                assigned_gt_labels_full[final_fg_mask] = gt_labels[gt_indices_for_final_fg_anchors]
-                assigned_gt_boxes_full[final_fg_mask]  = gt_boxes[gt_indices_for_final_fg_anchors]
-                
-                # IoU between each final_fg_anchor and its *assigned* GT.
-                final_fg_mask_indices_tensor = torch.where(final_fg_mask)[0]
-                assigned_iou_full[final_fg_mask] = iou[gt_indices_for_final_fg_anchors, final_fg_mask_indices_tensor]
-
-            return final_fg_mask, assigned_gt_labels_full, assigned_gt_boxes_full, assigned_iou_full
-
-        except Exception as e_outer:
-            print(f"\n[SimOTACache CRITICAL ERROR] Exception caught in __call__ method: {type(e_outer).__name__}: {e_outer}")
-            import traceback
-            traceback.print_exc()
-            raise e_outer
 
 # ───────────────────── COCO Label Mapping Helper ─────────────────────
 def create_coco_contiguous_label_map(coco_api):
@@ -404,6 +291,11 @@ def train_epoch(
             assigned_gt_boxes_img_full, assigned_iou_img_full = assigner(
                 fmap_shapes, device, target_dict_for_assigner
             )
+            if False:
+                pos = fg_mask_img.sum().item()
+                neg = fg_mask_img.numel() - pos
+                print(f"E{epoch} B{i}: pos={pos} neg={neg}  "
+                      f"IoU mean={assigned_iou_img_full[fg_mask_img].mean():.3f}")
 
             num_fg_img = fg_mask_img.sum().item()
             if num_fg_img == 0: continue 
@@ -436,7 +328,8 @@ def train_epoch(
                     reduction='sum'
                 )
                 loss_cls = loss_cls_unreduced / float(num_fg_img) # Normalize by number of positive anchors
-            else:  # Varifocal Loss, isn't working as well, might be buggy
+            else:  # Varifocal Loss, isn't working as well, works better if switched to after initial epochs
+                # if this still has constant cost, that is likely an issue
                 vfl_targets_img = torch.zeros_like(joint_logits_img)
                 fg_gt_labels = assigned_gt_labels_img_full[fg_mask_img]
                 fg_iou_quality = assigned_iou_img_full[fg_mask_img]
@@ -465,12 +358,6 @@ def train_epoch(
             ) 
             strides_fg_img = strides_all_anchors_img[fg_mask_img].unsqueeze(-1) 
 
-            # DFL Targets
-            # Clamp target offsets for DFL: divide by stride, then clamp to [0, reg_max - eps]
-            target_offsets_for_dfl = (box_targets_fg_img / strides_fg_img).clamp(min=0., max=head_reg_max_for_loss - 1e-6)
-            dfl_target_dist = build_dfl_targets(target_offsets_for_dfl, head_reg_max_for_loss) 
-            loss_dfl = dfl_loss(reg_p_fg_img, dfl_target_dist)
-
             # IoU Loss (using predicted boxes from DFL output)
             pred_ltrb_offsets_fg_img = PicoDetHead.dfl_decode_for_training(
                 reg_p_fg_img, 
@@ -483,6 +370,27 @@ def train_epoch(
                  for H_lvl, W_lvl, s_lvl_val in fmap_shapes], dim=0
             ) 
             anchor_centers_fg_img = anchor_centers_all_img[fg_mask_img] 
+            
+            # DFL Targets
+            # target_offsets_for_dfl = (box_targets_fg_img / strides_fg_img).clamp(min=0., max=head_reg_max_for_loss - 1e-6)
+            # dfl_target_dist = build_dfl_targets(target_offsets_for_dfl, head_reg_max_for_loss)
+            #   anchor_centers_fg_img : (N_fg, 2)  in pixels
+            #   box_targets_fg_img    : (N_fg, 4)  in pixels (x1 y1 x2 y2)
+            #   strides_fg_img        : (N_fg, 1)
+            
+            ltrb_offsets = torch.stack([
+                anchor_centers_fg_img[:, 0] - box_targets_fg_img[:, 0],  # left
+                anchor_centers_fg_img[:, 1] - box_targets_fg_img[:, 1],  # top
+                box_targets_fg_img[:, 2] - anchor_centers_fg_img[:, 0],  # right
+                box_targets_fg_img[:, 3] - anchor_centers_fg_img[:, 1],  # bottom
+            ], dim=1) / strides_fg_img           # convert to stride units
+            
+            ltrb_offsets = ltrb_offsets.clamp_(0, head_reg_max_for_loss - 1e-6)
+            
+            dfl_target_dist = build_dfl_targets(
+                    ltrb_offsets, head_reg_max_for_loss)
+            
+            loss_dfl = dfl_loss(reg_p_fg_img, dfl_target_dist)
 
             # Predicted boxes for foreground anchors: scale offsets by stride
             # strides_fg_img is (num_fg_img, 1), pred_ltrb_offsets_fg_img is (num_fg_img, 4)
@@ -500,6 +408,9 @@ def train_epoch(
 
             w_iou = 2.0 
             current_sample_total_loss = loss_cls + loss_dfl + w_iou * loss_iou
+            if num_samples_with_loss_in_batch == 0 and total_samples_contributing_to_loss_epoch == 0:
+                print(f"cls {loss_cls.item():.3f}  dfl {loss_dfl.item():.3f}  "
+                      f"iou {loss_iou.item():.3f}  tot {current_sample_total_loss.item():.3f}")
             batch_total_loss += current_sample_total_loss
             num_samples_with_loss_in_batch += 1
             
@@ -510,7 +421,7 @@ def train_epoch(
             scaler.step(opt); scaler.update()
             tot_loss_accum += averaged_batch_loss.item() * num_samples_with_loss_in_batch
             total_samples_contributing_to_loss_epoch += num_samples_with_loss_in_batch
-        if i % 50 == 0 and num_samples_with_loss_in_batch > 0: # Print batch loss
+        if i % 500 == 0 and num_samples_with_loss_in_batch > 0: # Print batch loss
             # Make sure loss_cls, loss_dfl, loss_iou are defined even if num_fg_img was 0 for the last sample in batch
             # This is generally okay as they are overwritten each sample loop.
             # If num_fg_img is 0, that sample is skipped, so these would hold values from previous sample.
@@ -644,7 +555,7 @@ def apply_nms_and_padding_to_raw_outputs_with_debug( # Renamed
     score_thresh: float,
     iou_thresh: float,
     max_detections: int
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[int], List[int]]: # Added debug lists
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[int], List[int]]:
     
     device = raw_boxes_batch.device
     batch_size = raw_boxes_batch.shape[0]
@@ -1001,6 +912,7 @@ def append_nms_to_onnx(
         det_boxes  [N,4]   det_scores [N]
         class_idx  [N]     batch_idx  [N]
     """
+    # may get better end-to-end latency by doing class-wise “fast NMS” (sigma-decay) or -better- topk-pre-NMS so this feeds at most 2 k anchors into NonMaxSuppression instead of 18 k.
     m = onnx.load(in_path)
     g = m.graph
 
@@ -1137,36 +1049,88 @@ def main(argv: List[str] | None = None):
                            "Ensure CocoDetection dataset is used and initialized correctly.")
 
     if False:
-        head_biases = [p for n,p in model.named_parameters() if ".bias" in n]
-        others      = [p for n,p in model.named_parameters() if ".bias" not in n]
-        opt = AdamW([{'params': head_biases, 'weight_decay':0.0},
-                     {'params': others     , 'weight_decay':1e-4}],
-                    lr=4e-4)
-        warm, total = 500, cfg.epochs * len(tr_loader)        # 500 iters warm-up
-        def lr_lambda(step):
-            if step < warm:
-                return step / warm                     # linear warm-up
-            progress = (step - warm) / (total - warm)
-            return 0.5 * (1 + math.cos(math.pi * progress))
+        peak_lr_adamw = 1e-3  # Peak learning rate after warmup
+        weight_decay_adamw = 0.01
+        beta1_adamw = 0.9
+        beta2_adamw = 0.999
+        eps_adamw = 1e-8
+        warmup_epochs = 3
+        cosine_decay_to_fraction_adamw = 0.01 # Decay to 1% of peak_lr_adamw
+        # Separate parameters for applying/not applying weight decay
+        param_groups = [
+            {'params': [], 'weight_decay': weight_decay_adamw, 'name': 'decay'}, # Params with weight decay
+            {'params': [], 'weight_decay': 0.0, 'name': 'no_decay'}  # Params without weight decay
+        ]
+        # Populate param_groups
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
+            if len(param.shape) == 1 or name.endswith(".bias") or "norm" in name.lower() or "bn" in name.lower():
+                param_groups[1]['params'].append(param) # no_decay group
+            else:
+                param_groups[0]['params'].append(param) # decay group
         
-        sch = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda)
+        print(f"[INFO] AdamW: {len(param_groups[0]['params'])} params with WD, {len(param_groups[1]['params'])} params without WD.")
+        opt = AdamW(
+            param_groups,
+            lr=peak_lr_adamw, # This is the target LR that LinearLR will reach
+            betas=(beta1_adamw, beta2_adamw),
+            eps=eps_adamw
+        )
+        warmup_scheduler = LinearLR(
+            opt,
+            start_factor=1e-5, # Start at peak_lr_adamw * 1e-4 (e.g., 1e-7 if peak is 1e-3)
+            end_factor=1.0,    # End at the peak_lr_adamw (defined in optimizer)
+            total_iters=warmup_epochs # Number of epochs for warmup
+        )
+        # Ensure T_max is at least 1 if cfg.epochs <= warmup_epochs
+        cosine_t_max = max(1, cfg.epochs - warmup_epochs)
+        
+        cosine_scheduler = CosineAnnealingLR(
+            opt,
+            T_max=cosine_t_max, # Remaining epochs after warm-up
+            eta_min=peak_lr_adamw * cosine_decay_to_fraction_adamw
+        )
+        sch = SequentialLR(
+            opt,
+            schedulers=[warmup_scheduler, cosine_scheduler],
+            milestones=[warmup_epochs]
+        )
     else:
-        opt = SGD(model.parameters(), lr=0.03, momentum=0.9, weight_decay=5e-5)
-        sch = CosineAnnealingLR(opt, T_max=cfg.epochs, eta_min=0.0005)
+        base_lr = 0.0075
+        warmup_epochs = 3
+        cosine_decay_alpha = 0.0
+        opt = SGD(model.parameters(), lr=base_lr, momentum=0.9, weight_decay=1e-4)
+        # sch = CosineAnnealingLR(opt, T_max=cfg.epochs, eta_min=base_lr * 0.01)
+        warmup_scheduler = LinearLR(
+            opt,
+            start_factor=1e-5,
+            end_factor=1.0,    # End at the peak_lr
+            total_iters=warmup_epochs
+        )
+        cosine_scheduler = CosineAnnealingLR(
+            opt,
+            T_max=cfg.epochs - warmup_epochs, # Remaining epochs after warm-up
+            eta_min=base_lr * cosine_decay_alpha # This will be 0 if cosine_decay_alpha is 0.0
+        )
+        sch = SequentialLR(
+            opt,
+            schedulers=[warmup_scheduler, cosine_scheduler],
+            milestones=[warmup_epochs]
+        )
     scaler = torch.amp.GradScaler(enabled=dev.type == 'cuda')
     
-    # Assigner.nc should match model.head.nc, which is the number of *mapped* classes the model predicts.
     assigner = SimOTACache(
-        nc=model.head.nc,  # Number of classes from the model's head
-        ctr=2.5,           # Center radius factor (default from new SimOTA)
-        topk=10,           # Max candidates per GT (default from new SimOTA)
-        cls_cost_weight=0.5 # Small classification cost weight for multi-class (default from new SimOTA)
+        nc=model.head.nc,
+        ctr=2.0,  # 2.5
+        topk=15,  # 10
+        cls_cost_weight=0.5,
+        debug_epochs=5,
     )
 
 
     original_model_head_nc = model.head.nc
     original_model_head_reg_max = model.head.reg_max
-    # Fetch the dfl_project_buffer from the original model's head
     original_dfl_project_buffer = model.head.dfl_project_buffer
 
 
@@ -1201,8 +1165,11 @@ def main(argv: List[str] | None = None):
             max_detections=model.head.max_det,
             epoch_num=ep, run_name="in epoch",
         )
+        for param_group in opt.param_groups:
+            current_lr = param_group['lr']
+        print(f'Epoch {ep + 1}/{cfg.epochs}  loss {l:.3f}  IoU {m:.3f} lr={current_lr:.6f}')
         sch.step()
-        print(f'Epoch {ep + 1}/{cfg.epochs}  loss {l:.3f}  IoU {m:.3f}')
+        assigner._dbg_iter = 0   
 
     print("[INFO] Evaluating FP32 model...")
     model.eval()

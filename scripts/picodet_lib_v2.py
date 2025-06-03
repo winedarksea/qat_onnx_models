@@ -46,20 +46,19 @@ class GhostConv(nn.Module):
         # utility to query channels
         return self.primary[0].out_channels + (self.cheap[0].out_channels if self.cheap else 0)
 
-class DWConv5x5(nn.Module):
-    def __init__(self, c: int, inplace_act: bool = False): # Added inplace_act
+class DWConv5x5(nn.Module):  # might be worth parameterizing to allow a 3x3 option
+    def __init__(self, c: int, inplace_act: bool = False):
         super().__init__()
         self.dw = nn.Conv2d(c, c, 5, 1, 2, groups=c, bias=False)
         self.bn = nn.BatchNorm2d(c)
-        self.act = nn.ReLU6(inplace=inplace_act) # Use param
+        self.act = nn.ReLU6(inplace=inplace_act)
 
     def forward(self, x):
         return self.act(self.bn(self.dw(x)))
 
 class CSPBlock(nn.Module):
-    def __init__(self, c: int, n: int = 1, inplace_act: bool = False): # Added inplace_act
+    def __init__(self, c: int, n: int = 1, inplace_act: bool = False):
         super().__init__()
-        # Pass inplace_act to GhostConv instances
         self.cv1 = GhostConv(c, c // 2, 1, inplace_act=inplace_act)
         self.cv2 = GhostConv(c, c // 2, 1, inplace_act=inplace_act)
         self.m = nn.Sequential(*[GhostConv(c // 2, c // 2, inplace_act=inplace_act) for _ in range(n)])
@@ -70,7 +69,7 @@ class CSPBlock(nn.Module):
 
 # ───────────────────────────── neck ────────────────────────────────
 class CSPPAN(nn.Module):
-    def __init__(self, in_chs=(40, 112, 160), out_ch=96, inplace_act: bool = False): # Added inplace_act
+    def __init__(self, in_chs=(40, 112, 160), out_ch=96, inplace_act: bool = False): # out_ch=64 would be faster than 96
         super().__init__()
         self.reduce = nn.ModuleList([GhostConv(c, out_ch, 1, inplace_act=inplace_act) for c in in_chs])
         self.lat    = nn.ModuleList([DWConv5x5(out_ch, inplace_act=inplace_act) for _ in in_chs[:-1]])
@@ -142,14 +141,16 @@ def dfl_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
 
 
 class PicoDetHead(nn.Module):
-    def __init__(self, num_classes: int = 80, reg_max: int = 16, num_feats: int = 96,
+    def __init__(self, num_classes: int = 80,
+                 reg_max: int = 8,
+                 num_feats: int = 96,
                  num_levels: int = 3, 
                  # NMS parameters are stored for use by external NMS/ONNX appending
                  max_det: int = 100, 
                  score_thresh: float = 0.05, 
                  nms_iou: float = 0.6,
                  img_size: int = 224,
-                 inplace_act: bool = False): # Added inplace_act
+                 inplace_act: bool = False):
         super().__init__()
         self.nc = num_classes
         self.reg_max = reg_max
@@ -310,13 +311,13 @@ class PicoDetHead(nn.Module):
 class PicoDet(nn.Module):
     def __init__(self, backbone: nn.Module, feat_chs: Tuple[int, int, int],
                  num_classes: int = 80,
-                 neck_out_ch: int = 96,  # 96, 128
+                 neck_out_ch: int = 96,  # suggestion: 64 if img≤320; 96 if 320 < img≤512; 128 if larger.
                  img_size: int = 224,
-                 head_reg_max: int = 16, 
+                 head_reg_max: int = 8,  # suggestion: 256 px → 7/8, 320 px → 11, 640 px → 15 or 16
                  head_max_det: int = 100, # Will be used by ONNX NMS logic
                  head_score_thresh: float = 0.05, # Will be used by ONNX NMS logic
                  head_nms_iou: float = 0.6, # Will be used by ONNX NMS logic
-                 inplace_act_for_head_neck: bool = False): # control inplace for head/neck
+                 inplace_act_for_head_neck: bool = False):
         super().__init__()
         self.pre = ResizeNorm(size=(img_size, img_size)) 
         self.backbone = backbone # Assume backbone doesn't use inplace=True if not handled there
@@ -401,7 +402,7 @@ def _get_dynamic_feat_chs(model: nn.Module, img_size: int, device: torch.device)
         raise ValueError(f"Backbone expected to return 3 feature maps, got {len(features) if isinstance(features, (list,tuple)) else type(features)}")
     return tuple(f.shape[1] for f in features)
 
-def get_backbone(arch: str, ckpt: str | None, img_size: int = 224): # Added img_size for dummy input
+def get_backbone(arch: str, ckpt: str | None, img_size: int = 224):
     pretrained = ckpt is None
     # Use a temporary device for dummy forward pass if model is on CPU initially
     # to avoid issues if _get_dynamic_feat_chs needs CUDA for some ops within model
