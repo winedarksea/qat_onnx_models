@@ -12,8 +12,13 @@ import timm
 
 # ───────────────────────────── layers ──────────────────────────────
 class GhostConv(nn.Module):
-    def __init__(self, c_in: int, c_out: int, k: int = 1, s: int = 1,
-                 dw_size: int = 3, ratio: int = 2, inplace_act: bool = False):  # dw_size 3, 5
+    def __init__(
+            self, c_in: int, c_out: int,
+            k: int = 1, s: int = 1,
+            dw_size: int = 3,  # dw_size 3, 5
+            ratio: int = 2,  # can set to 1.5 for faster
+            inplace_act: bool = False
+         ):
         super().__init__()
         self.c_out = c_out # Store c_out
         init_ch = math.ceil(c_out / ratio)

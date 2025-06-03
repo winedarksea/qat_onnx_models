@@ -1,14 +1,15 @@
 # train_picodet_qat.py – minimal pipeline: COCO ➜ FP32 ➜ QAT ➜ INT8 ➜ ONNX (with NMS)
 from __future__ import annotations
-import argparse, random, time, warnings, math
+import argparse, random, time, warnings, math, os
 from typing import List, Tuple
 import traceback
 
 import torch, torch.nn as nn
-import torchvision.transforms.v2 as T_v2
-import torchvision.datasets as tvsets
+from torchvision.transforms import v2 as T
+from torchvision.datasets import CocoDetection, wrap_dataset_for_transforms_v2
+from torchvision.tv_tensors import BoundingBoxes
 import torchvision.ops as tvops
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader, RandomSampler, SubsetRandomSampler
 from torch.optim import SGD, AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 import torch.nn.functional as F
@@ -30,51 +31,66 @@ SEED = 42; random.seed(SEED); torch.manual_seed(SEED)
 IMG_SIZE = 256  # also subset for speed, 224, PicoDet’s anchors assume stride-divisible sizes. Divisible by 32
 
 # ───────────────────── data & transforms ───────────────────────
-import torchvision.transforms.functional as F_tv
+# ---------- contiguous label map ----------
+def build_coco_label_map(coco):
+    cat_ids = sorted(coco.getCatIds())                 # 1 … 90,92,93…
+    return {cid: i for i, cid in enumerate(cat_ids)}   # 0-based contiguous
 
-def build_transforms(train: bool):
-    tfs: List[torch.nn.Module] = []
-    if train:
-        tfs += [
-            T_v2.RandomResizedCrop((IMG_SIZE, IMG_SIZE), scale=(0.5, 1.0), antialias=True),
-            T_v2.ColorJitter(0.2, 0.2, 0.2, 0.1),
-            T_v2.RandomHorizontalFlip()
-        ]
-    else:
-        tfs.append(T_v2.Resize((IMG_SIZE, IMG_SIZE), antialias=True))
-    return T_v2.Compose(tfs)
+# ---------- COCO → tv_tensors utility ----------
+def _coco_to_tvt(annots, lb_map, canvas):
+    boxes, labels = [], []
+    W, H = canvas                                    # PIL size is (W,H)
+    for a in annots:
+        if a.get("iscrowd", 0):
+            continue
+        cid = a["category_id"]
+        if cid not in lb_map:                        # skip classes >79
+            continue
+        x, y, w, h = a["bbox"]                       # COCO XYWH
+        boxes.append([x, y, x + w, y + h])
+        labels.append(lb_map[cid])
 
-def collate(batch):
-    imgs, tgts = zip(*batch)
-    img_ts = []
-    for im in imgs:
-        t = F_tv.pil_to_tensor(im).contiguous()  # uint8
-        img_ts.append(t)
-    stacked = torch.stack(img_ts)
-    # normalise boxes to absolute pixels (they already are). nothing else.
-    return stacked, list(tgts)
+    if not boxes:                                    # keep training stable
+        boxes  = torch.zeros((0, 4), dtype=torch.float32)
+        labels = torch.zeros((0,),  dtype=torch.int64)
 
-def get_loader(root: str, split: str, bsz: int, workers: int = 0, subset_size: int = None):
-    ds = tvsets.CocoDetection(
-        img_folder := f"{root}/{split}2017",
-        ann_file := f"{root}/annotations/instances_{split}2017.json",
-        transform=build_transforms(split == 'train')
+    bbx = BoundingBoxes(
+        torch.as_tensor(boxes, dtype=torch.float32),
+        format="XYXY", canvas_size=(H, W)
     )
-    ds_to_load = ds # By default, use the full dataset
+    return {"boxes": bbx, "labels": torch.as_tensor(labels, dtype=torch.int64)}
 
-    if subset_size is not None:
-        if subset_size > len(ds):
-            print(f"[WARNING] subset_size ({subset_size}) is larger than dataset size ({len(ds)}). Using full dataset for {split}.")
-        else:
-            all_indices = list(range(len(ds)))
-            random.shuffle(all_indices) # Shuffle all indices
-            selected_indices = all_indices[:subset_size] # Take the first N shuffled indices
-            ds_to_load = Subset(ds, selected_indices)
-            print(f"[INFO] Using a subset of the {split} dataset: {len(ds_to_load)} images.")
-    return DataLoader(ds_to_load, batch_size=bsz, shuffle=split == 'train',
-                      collate_fn=collate, num_workers=workers, pin_memory=True,
-                      persistent_workers=bool(workers))
+# ---------- dataset wrapper ----------
+class CocoDetectionV2(CocoDetection):
+    """COCO dataset ready for torchvision-v2 transforms."""
+    def __init__(self, img_dir, ann_file, lb_map, transforms=None):
+        super().__init__(img_dir, ann_file)           # PIL, list[dict]
+        self.lb_map = lb_map
+        self._tf    = transforms
 
+    def __getitem__(self, idx):
+        img, anns = super().__getitem__(idx)
+        tgt = _coco_to_tvt(anns, self.lb_map, img.size)
+        if self._tf is not None:                      # v2 ops work on (img,tgt)
+            img, tgt = self._tf(img, tgt)
+        return img, tgt
+
+# ---------- transforms ----------
+def build_transforms(size, train):
+    aug = [
+        T.ToImage(),                                 # PIL → tv_tensors.Image
+        T.RandomHorizontalFlip(0.5) if train else T.Identity(),
+        T.RandomResizedCrop(size, scale=(0.6, 1.0), antialias=True)
+            if train else T.Resize(size, antialias=True),
+        T.ColorJitter(0.2, 0.2, 0.2, 0.1) if train else T.Identity(),
+        T.ToDtype(torch.uint8, scale=True),          # keep uint8, model normalises
+    ]
+    return T.Compose(aug)
+
+# ---------- collate ----------
+def collate_v2(batch):
+    imgs, tgts = zip(*batch)
+    return torch.stack(imgs, 0), list(tgts)
 
 # ───────────────────── assigner (SimOTA, cached) ────────────────
 class SimOTACache:
@@ -92,6 +108,7 @@ class SimOTACache:
         # debug
         self._dbg_mod  = debug_epochs
         self._dbg_iter = 0
+        self.use_obj_logit = True 
 
     # ------------------------------------------------------------
     #  main call
@@ -100,7 +117,8 @@ class SimOTACache:
     def __call__(self,
                  f_shapes,               # List[(H,W,stride)]
                  device: torch.device,
-                 tgt: dict              # {"boxes":(M,4), "labels":(M,)}
+                 tgt: dict,              # {"boxes":(M,4), "labels":(M,)}
+                 cls_logits: torch.Tensor,
                  ):
 
         # 0. early-exit if no GT
@@ -161,9 +179,33 @@ class SimOTACache:
                 fg_cand_mask[valid_idx[topk_idx]] = True
 
         # 4. cost matrix
-        cost_loc = 1.0 - iou
-        cost_cls = (self.cls_cost_weight * torch.ones_like(cost_loc)
-                    if (self.cls_cost_weight > 0 and self.nc > 1) else 0)
+        # cost_loc = 1.0 - iou
+        # cost_cls = (self.cls_cost_weight * torch.ones_like(cost_loc) if (self.cls_cost_weight > 0 and self.nc > 1) else 0)
+        # ---- new classification cost -----------------------------------------
+        # Turn logits → probability *for the GT class only*.
+        #   cls_logits : (A, nc)    gt_labels : (M,)
+        # We build a (M, A) matrix where each row g uses P(anchor, class=gt_g)
+        p_cls = cls_logits.sigmoid()                        # (A, nc)
+        
+        # Gather once to avoid an inner loop:
+        #   idx tensor shape (M, A, 2)  where [:, :, 0] = anchor-idx,
+        #                                [:, :, 1] = class-idx
+        anchor_idx = torch.arange(p_cls.size(0), device=device).view(1, -1).repeat(gt_labels.size(0), 1)
+        class_idx  = gt_labels.view(-1, 1).repeat(1, p_cls.size(0))
+        p_mat      = p_cls[anchor_idx, class_idx]          # (M, A)
+        
+        # Optionally include objectness (= max probability over classes)
+        if self.use_obj_logit:
+            obj_prob = p_cls.max(dim=1).values.unsqueeze(0)  # (1, A)
+            p_mat = p_mat * obj_prob                         # joint score
+        
+        eps = 1e-8
+        cost_cls = -torch.log(p_mat + eps)                  # BCE( p, 1 )
+        cost_cls = self.cls_cost_weight * cost_cls          # weight λ
+        # ----------------------------------------------------------------------
+        
+        cost_loc = 1.0 - iou                                # (M, A)
+        #####
         large_pen = torch.tensor(1e4, device=device, dtype=cost_loc.dtype)
         cost = (cost_loc + cost_cls
                 + (~centre_mask.T) * large_pen
@@ -260,45 +302,75 @@ def train_epoch(
         num_samples_with_loss_in_batch = 0
 
         for b_idx in range(bs):
-            current_sample_annots_raw = tgts_batch[b_idx]
-            processed_boxes, processed_labels = [], []
-            for annot_item in current_sample_annots_raw:
-                if not isinstance(annot_item, dict) or 'bbox' not in annot_item or 'category_id' not in annot_item:
-                    continue
-                original_coco_id = annot_item['category_id']
-                mapped_label = coco_label_map.get(original_coco_id)
-                if mapped_label is not None and mapped_label < head_nc_for_loss:
-                    processed_boxes.append([
-                        annot_item['bbox'][0], annot_item['bbox'][1],
-                        annot_item['bbox'][0] + annot_item['bbox'][2], annot_item['bbox'][1] + annot_item['bbox'][3]
-                    ])
-                    processed_labels.append(mapped_label)
+            tgt_i = tgts_batch[b_idx]                    # dict with tv-tensors
             
-            if not processed_labels: continue
+            # Extract and move GT boxes and labels to device
+            # These are potentially affected by transforms like RandomResizedCrop
+            gt_boxes_unfiltered = tgt_i["boxes"].to(dtype=torch.float32, device=device, non_blocking=True)
+            gt_labels_unfiltered = tgt_i["labels"].to(device=device, non_blocking=True)
 
-            gt_boxes_img = torch.tensor(processed_boxes, dtype=torch.float32, device=device)
-            gt_labels_img = torch.tensor(processed_labels, dtype=torch.int64, device=device)
+            gt_boxes_img = gt_boxes_unfiltered
+            gt_labels_img = gt_labels_unfiltered
+
+            if gt_boxes_unfiltered.numel() > 0:
+                # Calculate widths and heights
+                widths = gt_boxes_unfiltered[:, 2] - gt_boxes_unfiltered[:, 0]
+                heights = gt_boxes_unfiltered[:, 3] - gt_boxes_unfiltered[:, 1]
+                
+                # Create a mask for valid boxes (positive width and height)
+                # Using a small epsilon for float comparison is robust
+                epsilon_wh = 1e-3 
+                valid_gt_mask = (widths > epsilon_wh) & (heights > epsilon_wh)
+                
+                gt_boxes_img = gt_boxes_unfiltered[valid_gt_mask]
+                gt_labels_img = gt_labels_unfiltered[valid_gt_mask]
+
             target_dict_for_assigner = {'boxes': gt_boxes_img, 'labels': gt_labels_img}
             
-            if assigner.nc != head_nc_for_loss: # This check is good to keep
-                 warnings.warn(f"Warning: assigner.nc ({assigner.nc}) != head_nc_for_loss ({head_nc_for_loss}).")
+            if epoch == 0 and i < 2: # Only for initial batches/epochs for brevity
+                H_img_shape, W_img_shape = imgs[b_idx].shape[-2:]
+                
+                # Debug print for UNFILTERED boxes (to see the original problem)
+                if gt_boxes_unfiltered.numel() > 0:
+                    lo_unfiltered = gt_boxes_unfiltered.min(0).values
+                    hi_unfiltered = gt_boxes_unfiltered.max(0).values
+                    # This is the logic that likely produced "bad_coords=True" in the user's log
+                    bad_coords_original_logic = (
+                        (gt_boxes_unfiltered[:, 0] < 0) | (gt_boxes_unfiltered[:, 1] < 0) |
+                        (gt_boxes_unfiltered[:, 2] > W_img_shape) | (gt_boxes_unfiltered[:, 3] > H_img_shape) | # Note: x2=W or y2=H is often fine for exclusive upper bounds
+                        (gt_boxes_unfiltered[:, 2] <= gt_boxes_unfiltered[:, 0]) | # Degenerate width
+                        (gt_boxes_unfiltered[:, 3] <= gt_boxes_unfiltered[:, 1])  # Degenerate height
+                    ).any()
+                    print(f"[DEBUG PRE-FILTER] img_batch {i}, sample {b_idx}: "
+                          f"Unfiltered boxes: {gt_boxes_unfiltered.shape[0]}, "
+                          f"min_coords={lo_unfiltered.tolist()}, max_coords={hi_unfiltered.tolist()}, "
+                          f"bad_coords_original_logic={bad_coords_original_logic.item()}")
+                else:
+                    print(f"[DEBUG PRE-FILTER] img_batch {i}, sample {b_idx}: No unfiltered GT boxes.")
 
-            # fg_mask_img: (A,), bool
-            # assigned_gt_labels_img_full: (A,), long, label for fg_mask positions, -1 else
-            # assigned_gt_boxes_img_full: (A, 4), float, box for fg_mask positions, 0 else
-            # assigned_iou_img_full: (A,), float, IoU for fg_mask positions, 0 else
-            fg_mask_img, assigned_gt_labels_img_full, \
-            assigned_gt_boxes_img_full, assigned_iou_img_full = assigner(
-                fmap_shapes, device, target_dict_for_assigner
-            )
-            if False:
-                pos = fg_mask_img.sum().item()
-                neg = fg_mask_img.numel() - pos
-                print(f"E{epoch} B{i}: pos={pos} neg={neg}  "
-                      f"IoU mean={assigned_iou_img_full[fg_mask_img].mean():.3f}")
-
-            num_fg_img = fg_mask_img.sum().item()
-            if num_fg_img == 0: continue 
+                # Debug print for FILTERED boxes (to verify the fix)
+                if gt_boxes_img.numel() > 0:
+                    lo_filtered = gt_boxes_img.min(0).values
+                    hi_filtered = gt_boxes_img.max(0).values
+                    # Check again with a robust check on filtered boxes
+                    widths_filtered = gt_boxes_img[:, 2] - gt_boxes_img[:, 0]
+                    heights_filtered = gt_boxes_img[:, 3] - gt_boxes_img[:, 1]
+                    bad_coords_after_filter = (
+                        (gt_boxes_img[:, 0] < -epsilon_wh) | (gt_boxes_img[:, 1] < -epsilon_wh) |
+                        (gt_boxes_img[:, 2] > W_img_shape + epsilon_wh) | (gt_boxes_img[:, 3] > H_img_shape + epsilon_wh) |
+                        (widths_filtered <= 0) | (heights_filtered <= 0)
+                    ).any()
+                    print(f"[DEBUG POST-FILTER] img_batch {i}, sample {b_idx}: "
+                          f"Filtered boxes: {gt_boxes_img.shape[0]}, "
+                          f"min_coords={lo_filtered.tolist()}, max_coords={hi_filtered.tolist()}, "
+                          f"bad_coords_after_filter={bad_coords_after_filter.item()}")
+                else:
+                     print(f"[DEBUG POST-FILTER] img_batch {i}, sample {b_idx}: No GT boxes left after filtering.")
+                
+                # Original [CHECK] print showing the first box from tgts_batch (unfiltered)
+                first_tgt_original_boxes = tgts_batch[b_idx]["boxes"] 
+                first_box_original_coords = first_tgt_original_boxes[:1].tolist() if first_tgt_original_boxes.numel() else None
+                print(f"[CHECK] Img shape {imgs[b_idx].shape}, sample {b_idx} first original box: {first_box_original_coords}")
 
             # Concatenate predictions for all levels for this image
             cls_p_img = torch.cat([lvl[b_idx].permute(1, 2, 0).reshape(-1, head_nc_for_loss) for lvl in cls_preds_levels], dim=0)
@@ -307,6 +379,15 @@ def train_epoch(
 
             # --- Varifocal Loss (VFL) ---
             joint_logits_img = cls_p_img + obj_p_img.unsqueeze(-1)
+
+            fg_mask_img, assigned_gt_labels_img_full, \
+            assigned_gt_boxes_img_full, assigned_iou_img_full = assigner(
+                    fmap_shapes, device, target_dict_for_assigner,
+                    cls_p_img
+            )
+
+            num_fg_img = fg_mask_img.sum().item()
+            if num_fg_img == 0: continue 
 
             loss_cls = torch.tensor(0.0, device=device) # Initialize loss_cls
 
@@ -406,7 +487,7 @@ def train_epoch(
 
             loss_iou = tvops.complete_box_iou_loss(pred_boxes_fg_img, box_targets_fg_img, reduction='sum') / num_fg_img
 
-            w_iou = 2.0 
+            w_iou = 5 if epoch < 7 else 2.0
             current_sample_total_loss = loss_cls + loss_dfl + w_iou * loss_iou
             if num_samples_with_loss_in_batch == 0 and total_samples_contributing_to_loss_epoch == 0:
                 print(f"cls {loss_cls.item():.3f}  dfl {loss_dfl.item():.3f}  "
@@ -654,6 +735,11 @@ def quick_val_iou(
             print(f"[Debug Eval Batch 0] raw_pred_boxes_batch shape: {raw_pred_boxes_batch.shape}")
             print(f"[Debug Eval Batch 0] raw_pred_scores_batch shape: {raw_pred_scores_batch.shape}")
 
+            print(f"[DEBUG] batch {batch_idx}")
+            print("  images  :", imgs_batch.shape, imgs_batch.dtype, imgs_batch.min().item(), imgs_batch.max().item())
+            bb = tgts_batch[0]["boxes"]
+            print("  boxes   :", bb.shape, "format:", getattr(bb, 'format', 'tensor'), "sample:", bb[:4])
+
         # Apply NMS and padding to raw outputs
         # This function itself needs to use the passed score_thresh and iou_thresh
         # It returns padded outputs and also needs to give us info for debugging
@@ -672,15 +758,18 @@ def quick_val_iou(
         for i in range(imgs_batch.size(0)): # Iterate through images in the batch
             num_images_processed += 1
             current_img_annots_raw = tgts_batch[i]
-            gt_boxes_list = []
-            for annot in current_img_annots_raw:
-                if 'bbox' in annot:
-                    x, y, w, h = annot['bbox']
-                    gt_boxes_list.append([x, y, x + w, y + h])
+            boxes_xyxy = current_img_annots_raw["boxes"]      # BoundingBoxes
+            if boxes_xyxy.numel():                            # image has GT
+                gt_boxes_tensor = boxes_xyxy.to(device).to(torch.float32)
+                gt_boxes_list = gt_boxes_tensor.tolist()      # for stats / prints
+            else:
+                gt_boxes_tensor = torch.empty((0, 4), device=device)
+                gt_boxes_list   = []
 
             if not gt_boxes_list:
                 if batch_idx == 0 and i < 2: # Log for first few images if no GT
-                    print(f"[Debug Eval Img {num_images_processed-1}] No GT boxes. Score Thresh: {score_thresh}. Num preds after NMS for this image: {debug_num_preds_after_nms_batch[i]}")
+                    print(f"[Debug Eval Img {num_images_processed-1}] GTs: {len(gt_boxes_list)}. "
+          f"Score Thresh: {score_thresh}.")
                 continue # Skip if no ground truth for this image
 
             num_images_with_gt += 1
@@ -1010,7 +1099,7 @@ def main(argv: List[str] | None = None):
     pa = argparse.ArgumentParser()
     pa.add_argument('--coco_root', default='coco')
     pa.add_argument('--arch', choices=['mnv3', 'mnv4s', 'mnv4m'], default='mnv3')
-    pa.add_argument('--epochs', type=int, default=12) 
+    pa.add_argument('--epochs', type=int, default=10) 
     pa.add_argument('--batch', type=int, default=16)
     pa.add_argument('--workers', type=int, default=0)
     pa.add_argument('--device', default=None)
@@ -1032,21 +1121,55 @@ def main(argv: List[str] | None = None):
         img_size=IMG_SIZE,
         inplace_act_for_head_neck=not cfg.no_inplace_head_neck # Control from arg
     ).to(dev)
+
+    # Load data
+    root = cfg.coco_root
+    coco_train_raw = CocoDetection(
+        f"{root}/train2017",
+        f"{root}/annotations/instances_train2017.json",
+    )
+    coco_label_map = build_coco_label_map(coco_train_raw.coco)   # 80 contiguous ids
     
-    tr_loader = get_loader(cfg.coco_root, 'train', cfg.batch, cfg.workers, subset_size=70000)
-    vl_loader = get_loader(cfg.coco_root, 'val', cfg.batch, cfg.workers, subset_size=2000)
+    train_ds = CocoDetectionV2(
+        f"{root}/train2017",
+        f"{root}/annotations/instances_train2017.json",
+        coco_label_map,
+        transforms=build_transforms((IMG_SIZE, IMG_SIZE), train=True),
+    )
+    val_ds   = CocoDetectionV2(
+        f"{root}/val2017",
+        f"{root}/annotations/instances_val2017.json",
+        coco_label_map,
+        transforms=build_transforms((IMG_SIZE, IMG_SIZE), train=False),
+    )
+    
+    # ------- (optional) random subset for quick runs -------
+    TRAIN_SUBSET = 20_000
+    VAL_SUBSET   = 2_000
+    train_sampler = torch.utils.data.RandomSampler(
+        train_ds, replacement=False,
+        num_samples=min(TRAIN_SUBSET, len(train_ds))
+    )
+    g = torch.Generator().manual_seed(42)
+    val_idx  = torch.randperm(len(val_ds), generator=g)[:VAL_SUBSET].tolist()
+    val_sampler = torch.utils.data.SubsetRandomSampler(val_idx)
+    
+    tr_loader = DataLoader(
+        train_ds, batch_size=cfg.batch, sampler=train_sampler,
+        num_workers=cfg.workers, collate_fn=collate_v2,
+        pin_memory=True, persistent_workers=bool(cfg.workers)
+    )
+    vl_loader = DataLoader(
+        val_ds,   batch_size=cfg.batch, sampler=val_sampler,
+        num_workers=cfg.workers, collate_fn=collate_v2,
+        pin_memory=True, persistent_workers=bool(cfg.workers)
+    )
+    
+    print(f"[INFO] COCO contiguous label map built – {len(coco_label_map)} classes")
+    if len(coco_label_map) != model.head.nc:
+        print(f"[WARN] num classes in map ({len(coco_label_map)}) ≠ model.head.nc ({model.head.nc})")
 
-    train_base_ds = unwrap_dataset(tr_loader.dataset)
-    if hasattr(train_base_ds, 'coco') and train_base_ds.coco is not None:
-        coco_label_map = create_coco_contiguous_label_map(train_base_ds.coco)
-
-        if len(coco_label_map) != model.head.nc:
-            print(f"[main WARNING] Number of categories in generated map ({len(coco_label_map)}) "
-                  f"does not match model.head.nc ({model.head.nc}). "
-                  "Annotations will be filtered in train_epoch if mapped label >= model.head.nc.")
-    else:
-        raise RuntimeError("Could not access COCO API to create label map. "
-                           "Ensure CocoDetection dataset is used and initialized correctly.")
+    id2name = {v: coco_train_raw.coco.loadCats([k])[0]["name"] for k, v in coco_label_map.items()}  # noqa
 
     if False:
         peak_lr_adamw = 1e-3  # Peak learning rate after warmup
@@ -1167,6 +1290,7 @@ def main(argv: List[str] | None = None):
         )
         for param_group in opt.param_groups:
             current_lr = param_group['lr']
+
         print(f'Epoch {ep + 1}/{cfg.epochs}  loss {l:.3f}  IoU {m:.3f} lr={current_lr:.6f}')
         sch.step()
         assigner._dbg_iter = 0   
