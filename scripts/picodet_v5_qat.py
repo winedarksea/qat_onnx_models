@@ -1,6 +1,6 @@
 # train_picodet_qat.py – minimal pipeline: COCO ➜ FP32 ➜ QAT ➜ INT8 ➜ ONNX (with NMS)
 from __future__ import annotations
-import argparse, random, time, warnings, math, os
+import argparse, random, time, warnings, math, copy
 from typing import List, Tuple
 import traceback
 
@@ -1136,8 +1136,9 @@ def append_nms_to_onnx(
 
 def save_intermediate_onnx(qat_model, cfg, model):
     # --- Convert QAT model to INT8 ---
-    qat_model.cpu().eval()
-    int8_model_with_preprocessor = convert_fx(qat_model) # This model still contains 'pre'
+    qat_copy = copy.deepcopy(qat_model).cpu().eval()
+
+    int8_model_with_preprocessor = convert_fx(qat_copy) # This model still contains 'pre'
     print("[INFO] QAT model converted to INT8.")
 
     # ---------------- Create the wrapper for ONNX export ----------------
@@ -1187,13 +1188,16 @@ def main(argv: List[str] | None = None):
     pa = argparse.ArgumentParser()
     pa.add_argument('--coco_root', default='coco')
     pa.add_argument('--arch', choices=['mnv3', 'mnv4s', 'mnv4m'], default='mnv3')
-    pa.add_argument('--epochs', type=int, default=10) 
+    pa.add_argument('--epochs', type=int, default=70) 
     pa.add_argument('--batch', type=int, default=16)
     pa.add_argument('--workers', type=int, default=0)
     pa.add_argument('--device', default=None)
     pa.add_argument('--out', default='picodet_int8.onnx')
     pa.add_argument('--no_inplace_head_neck', action='store_true', help="Disable inplace activations in head/neck")
     cfg = pa.parse_args(argv)
+
+    TRAIN_SUBSET = 70000
+    VAL_SUBSET   = 2000
 
     if cfg.device is None:
         cfg.device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -1232,8 +1236,6 @@ def main(argv: List[str] | None = None):
     )
     
     # ------- (optional) random subset for quick runs -------
-    TRAIN_SUBSET = 20_000
-    VAL_SUBSET   = 2_000
     train_sampler = torch.utils.data.RandomSampler(
         train_ds, replacement=False,
         num_samples=min(TRAIN_SUBSET, len(train_ds))
