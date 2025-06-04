@@ -79,8 +79,8 @@ class CocoDetectionV2(CocoDetection):
 def build_transforms(size, train):
     aug = [
         T.ToImage(),                                 # PIL → tv_tensors.Image
-        T.RandomHorizontalFlip(0.5) if train else T.Identity(),
-        T.RandomResizedCrop(size, scale=(0.6, 1.0), antialias=True)
+        T.RandomHorizontalFlip(0.25) if train else T.Identity(),
+        T.RandomResizedCrop(size, scale=(0.8, 1.0), antialias=True)
             if train else T.Resize(size, antialias=True),
         T.ColorJitter(0.2, 0.2, 0.2, 0.1) if train else T.Identity(),
         T.ToDtype(torch.uint8, scale=True),          # keep uint8, model normalises
@@ -99,7 +99,8 @@ class SimOTACache:
                  ctr: float = 2.5,
                  topk: int = 10,
                  cls_cost_weight: float = 0.5,
-                 debug_epochs: int = 0):         # 0 = silent
+                 debug_epochs: int = 0,         # 0 = silent
+                 ):
         self.nc = nc
         self.r = ctr
         self.k = topk
@@ -118,7 +119,8 @@ class SimOTACache:
                  f_shapes,               # List[(H,W,stride)]
                  device: torch.device,
                  tgt: dict,              # {"boxes":(M,4), "labels":(M,)}
-                 cls_logits: torch.Tensor,
+                 cls_logits: torch.Tensor, # Raw class logits (A, C) from model
+                 obj_logits: torch.Tensor | None = None,
                  ):
 
         # 0. early-exit if no GT
@@ -196,7 +198,11 @@ class SimOTACache:
         
         # Optionally include objectness (= max probability over classes)
         if self.use_obj_logit:
-            obj_prob = p_cls.max(dim=1).values.unsqueeze(0)  # (1, A)
+            if obj_logits is not None:
+                obj_prob = obj_logits.sigmoid().unsqueeze(0) # (1, A)
+            else:
+                # warnings.warn("SimOTACache: use_obj_logit is True but obj_logits not provided. Falling back to p_cls.max().")
+                obj_prob = p_cls.max(dim=1).values.unsqueeze(0)  # (1, A)
             p_mat = p_mat * obj_prob                         # joint score
         
         eps = 1e-8
@@ -267,21 +273,27 @@ def create_coco_contiguous_label_map(coco_api):
 
 # ───────────────────── train / val loops ────────────────────────
 def train_epoch(
-        model: nn.Module, loader, opt, scaler, assigner: SimOTACache, # Assigner type is now the new one
+        model: nn.Module, loader, opt, scaler, assigner: SimOTACache,
         device: torch.device, epoch: int, coco_label_map: dict,
-        head_nc_for_loss: int, 
+        head_nc_for_loss: int,
         head_reg_max_for_loss: int,
         dfl_project_buffer_for_decode: torch.Tensor,
-        max_epochs: int = 500, # Make sure this matches total training epochs for alpha_dyn
-        quality_floor_vfl: float = 0.2 # Example value, can be tuned
+        max_epochs: int = 500,
+        quality_floor_vfl: float = 0.2,
+        w_obj_loss: float = 2.0, # Weight for the new objectness loss
+        w_iou_initial: float = 5.0, # Initial weight for IoU loss
+        w_iou_final: float = 2.0,   # Final weight for IoU loss
+        iou_weight_change_epoch: int = 7, # Epoch to change IoU weight
+        use_focal_loss: bool = True,
+        debug_prints: bool = True,
 ):
     model.train()
     _, tot_loss_accum = time.time(), 0.
     total_samples_contributing_to_loss_epoch = 0
-    
+
     for i, (imgs, tgts_batch) in enumerate(loader):
         imgs = imgs.to(device)
-        model_outputs = model(imgs) 
+        model_outputs = model(imgs)
 
         if not model.training:
              raise RuntimeError("train_epoch called with model not in training mode.")
@@ -292,20 +304,19 @@ def train_epoch(
         cls_preds_levels, obj_preds_levels, reg_preds_levels, strides_per_level_tensors = model_outputs
 
         bs = imgs.size(0)
-        fmap_shapes = [] 
+        fmap_shapes = []
         for lv in range(len(cls_preds_levels)):
             H, W = cls_preds_levels[lv].shape[2:]
-            s = strides_per_level_tensors[lv].item() 
+            s = strides_per_level_tensors[lv].item()
             fmap_shapes.append((H, W, s))
 
         batch_total_loss = torch.tensor(0.0, device=device, dtype=torch.float32)
         num_samples_with_loss_in_batch = 0
 
+        loss_cls_print, loss_obj_print, loss_dfl_print, loss_iou_print = [torch.tensor(0.0) for _ in range(4)]
+
         for b_idx in range(bs):
-            tgt_i = tgts_batch[b_idx]                    # dict with tv-tensors
-            
-            # Extract and move GT boxes and labels to device
-            # These are potentially affected by transforms like RandomResizedCrop
+            tgt_i = tgts_batch[b_idx]
             gt_boxes_unfiltered = tgt_i["boxes"].to(dtype=torch.float32, device=device, non_blocking=True)
             gt_labels_unfiltered = tgt_i["labels"].to(device=device, non_blocking=True)
 
@@ -313,46 +324,21 @@ def train_epoch(
             gt_labels_img = gt_labels_unfiltered
 
             if gt_boxes_unfiltered.numel() > 0:
-                # Calculate widths and heights
                 widths = gt_boxes_unfiltered[:, 2] - gt_boxes_unfiltered[:, 0]
                 heights = gt_boxes_unfiltered[:, 3] - gt_boxes_unfiltered[:, 1]
-                
-                # Create a mask for valid boxes (positive width and height)
-                # Using a small epsilon for float comparison is robust
-                epsilon_wh = 1e-3 
+                epsilon_wh = 1e-3
                 valid_gt_mask = (widths > epsilon_wh) & (heights > epsilon_wh)
-                
                 gt_boxes_img = gt_boxes_unfiltered[valid_gt_mask]
                 gt_labels_img = gt_labels_unfiltered[valid_gt_mask]
 
             target_dict_for_assigner = {'boxes': gt_boxes_img, 'labels': gt_labels_img}
-            
-            if epoch == 0 and i < 2: # Only for initial batches/epochs for brevity
-                H_img_shape, W_img_shape = imgs[b_idx].shape[-2:]
-                
-                # Debug print for UNFILTERED boxes (to see the original problem)
-                if gt_boxes_unfiltered.numel() > 0:
-                    lo_unfiltered = gt_boxes_unfiltered.min(0).values
-                    hi_unfiltered = gt_boxes_unfiltered.max(0).values
-                    # This is the logic that likely produced "bad_coords=True" in the user's log
-                    bad_coords_original_logic = (
-                        (gt_boxes_unfiltered[:, 0] < 0) | (gt_boxes_unfiltered[:, 1] < 0) |
-                        (gt_boxes_unfiltered[:, 2] > W_img_shape) | (gt_boxes_unfiltered[:, 3] > H_img_shape) | # Note: x2=W or y2=H is often fine for exclusive upper bounds
-                        (gt_boxes_unfiltered[:, 2] <= gt_boxes_unfiltered[:, 0]) | # Degenerate width
-                        (gt_boxes_unfiltered[:, 3] <= gt_boxes_unfiltered[:, 1])  # Degenerate height
-                    ).any()
-                    print(f"[DEBUG PRE-FILTER] img_batch {i}, sample {b_idx}: "
-                          f"Unfiltered boxes: {gt_boxes_unfiltered.shape[0]}, "
-                          f"min_coords={lo_unfiltered.tolist()}, max_coords={hi_unfiltered.tolist()}, "
-                          f"bad_coords_original_logic={bad_coords_original_logic.item()}")
-                else:
-                    print(f"[DEBUG PRE-FILTER] img_batch {i}, sample {b_idx}: No unfiltered GT boxes.")
 
-                # Debug print for FILTERED boxes (to verify the fix)
+            if assigner.nc != head_nc_for_loss and i == 1:
+                 warnings.warn(f"Warning: assigner.nc ({assigner.nc}) != head_nc_for_loss ({head_nc_for_loss}).")
+
+            if debug_prints and epoch == 0 and i == 0:
+                H_img_shape, W_img_shape = imgs[b_idx].shape[-2:]
                 if gt_boxes_img.numel() > 0:
-                    lo_filtered = gt_boxes_img.min(0).values
-                    hi_filtered = gt_boxes_img.max(0).values
-                    # Check again with a robust check on filtered boxes
                     widths_filtered = gt_boxes_img[:, 2] - gt_boxes_img[:, 0]
                     heights_filtered = gt_boxes_img[:, 3] - gt_boxes_img[:, 1]
                     bad_coords_after_filter = (
@@ -360,155 +346,167 @@ def train_epoch(
                         (gt_boxes_img[:, 2] > W_img_shape + epsilon_wh) | (gt_boxes_img[:, 3] > H_img_shape + epsilon_wh) |
                         (widths_filtered <= 0) | (heights_filtered <= 0)
                     ).any()
-                    print(f"[DEBUG POST-FILTER] img_batch {i}, sample {b_idx}: "
-                          f"Filtered boxes: {gt_boxes_img.shape[0]}, "
-                          f"min_coords={lo_filtered.tolist()}, max_coords={hi_filtered.tolist()}, "
-                          f"bad_coords_after_filter={bad_coords_after_filter.item()}")
-                else:
-                     print(f"[DEBUG POST-FILTER] img_batch {i}, sample {b_idx}: No GT boxes left after filtering.")
-                
-                # Original [CHECK] print showing the first box from tgts_batch (unfiltered)
-                first_tgt_original_boxes = tgts_batch[b_idx]["boxes"] 
+                    print(f"[DEBUG POST-FILTER] ... bad_coords_after_filter={bad_coords_after_filter.item()}")
+                first_tgt_original_boxes = tgts_batch[b_idx]["boxes"]
                 first_box_original_coords = first_tgt_original_boxes[:1].tolist() if first_tgt_original_boxes.numel() else None
                 print(f"[CHECK] Img shape {imgs[b_idx].shape}, sample {b_idx} first original box: {first_box_original_coords}")
 
-            # Concatenate predictions for all levels for this image
+
             cls_p_img = torch.cat([lvl[b_idx].permute(1, 2, 0).reshape(-1, head_nc_for_loss) for lvl in cls_preds_levels], dim=0)
-            obj_p_img = torch.cat([lvl[b_idx].permute(1, 2, 0).reshape(-1) for lvl in obj_preds_levels], dim=0)
+            obj_p_img = torch.cat([lvl[b_idx].permute(1, 2, 0).reshape(-1) for lvl in obj_preds_levels], dim=0) # Shape (A,)
             reg_p_img = torch.cat([lvl[b_idx].permute(1, 2, 0).reshape(-1, 4 * (head_reg_max_for_loss + 1)) for lvl in reg_preds_levels], dim=0)
 
-            # --- Varifocal Loss (VFL) ---
-            joint_logits_img = cls_p_img + obj_p_img.unsqueeze(-1)
+            obj_logits_for_assigner = obj_p_img if use_focal_loss else None
 
             fg_mask_img, assigned_gt_labels_img_full, \
             assigned_gt_boxes_img_full, assigned_iou_img_full = assigner(
                     fmap_shapes, device, target_dict_for_assigner,
-                    cls_p_img
+                    cls_logits=cls_p_img, # Raw class logits
+                    obj_logits=obj_logits_for_assigner # Raw objectness logits (or None)
             )
 
             num_fg_img = fg_mask_img.sum().item()
-            if num_fg_img == 0: continue 
+            if num_fg_img == 0: continue
 
-            loss_cls = torch.tensor(0.0, device=device) # Initialize loss_cls
+            loss_cls = torch.tensor(0.0, device=device)
+            loss_obj = torch.tensor(0.0, device=device)
 
-            use_focal_loss = True
             if use_focal_loss:
-                # Standard Focal Loss parameters
+                # --- Standard Focal Loss for Classification ---
+                # Applied ONLY to foreground anchors and their class predictions
                 focal_loss_alpha = 0.25
                 focal_loss_gamma = 2.0
-                focal_targets_img = torch.zeros_like(joint_logits_img) # (A, C)
-                fg_indices = fg_mask_img.nonzero(as_tuple=True)[0]
-                gt_labels_for_fg = assigned_gt_labels_img_full[fg_mask_img]
-                focal_targets_img[fg_indices, gt_labels_for_fg] = 1.0
 
+                focal_targets_one_hot = torch.zeros_like(cls_p_img)  # (A, C)
+                pos_idx = fg_mask_img.nonzero(as_tuple=True)[0] 
+                
+                if pos_idx.numel() > 0: # Ensure there are positive anchors before indexing
+                    # Get assigned GT labels for these foreground anchors
+                    # assigned_gt_labels_img_full is (A,), long; select based on fg_mask_img
+                    gt_labels_for_fg_anchors = assigned_gt_labels_img_full[fg_mask_img] # (num_fg_img,)
+                    
+                    # Set the target to 1 only for positive anchors at their assigned GT class
+                    focal_targets_one_hot[pos_idx, gt_labels_for_fg_anchors] = 1.0
+                
+                # Compute Focal Loss over ALL anchors
                 loss_cls_unreduced = tvops.sigmoid_focal_loss(
-                    joint_logits_img,
-                    focal_targets_img,
+                    cls_p_img,                          # Logits for ALL anchors (A, C)
+                    focal_targets_one_hot,              # Targets for ALL anchors (A, C)
                     alpha=focal_loss_alpha,
                     gamma=focal_loss_gamma,
                     reduction='sum'
                 )
-                loss_cls = loss_cls_unreduced / float(num_fg_img) # Normalize by number of positive anchors
-            else:  # Varifocal Loss, isn't working as well, works better if switched to after initial epochs
-                # if this still has constant cost, that is likely an issue
+                # Normalize by the number of positive (foreground) anchors
+                loss_cls = loss_cls_unreduced / float(num_fg_img)
+
+                # --- Objectness Loss (BCE) ---
+                # Applied to ALL anchors (obj_p_img), targets are 1 for FG, 0 for BG
+                obj_targets_all_anchors = fg_mask_img.float() # (A,) tensor of 0.0s and 1.0s
+                num_total_anchors = obj_p_img.size(0) # Get total number of anchors A
+                
+                loss_obj_unreduced = F.binary_cross_entropy_with_logits(
+                    obj_p_img, # (A,)
+                    obj_targets_all_anchors, # (A,)
+                    reduction='sum'
+                )
+                # Normalize objectness loss by the total number of anchors.
+                loss_obj = loss_obj_unreduced / float(num_total_anchors + 1e-6) # Add epsilon for stability
+
+            else:  # Varifocal Loss path (uses joint_logits) - this path remains mostly as before
+                joint_logits_img = cls_p_img + obj_p_img.unsqueeze(-1) # VFL uses this
                 vfl_targets_img = torch.zeros_like(joint_logits_img)
                 fg_gt_labels = assigned_gt_labels_img_full[fg_mask_img]
                 fg_iou_quality = assigned_iou_img_full[fg_mask_img]
 
                 final_vfl_quality = torch.maximum(fg_iou_quality, torch.tensor(quality_floor_vfl, device=device))
-
                 vfl_targets_img[fg_mask_img.nonzero(as_tuple=True)[0], fg_gt_labels] = final_vfl_quality
 
                 progress = epoch / max_epochs if max_epochs > 0 else 0.0
                 alpha_dyn = 0.25 + (0.75 - 0.25) * 0.5 * (1 - math.cos(math.pi * progress))
-                
-                # Using gamma=2.0 for VFL as generally recommended
+
                 current_vfl_instance = VarifocalLoss(alpha=alpha_dyn, gamma=2.0, reduction='sum')
-                loss_cls_unreduced = current_vfl_instance(joint_logits_img, vfl_targets_img)
-                loss_cls = loss_cls_unreduced / float(num_fg_img) # Normalize by num_fg_img
+                loss_cls_unreduced = current_vfl_instance(joint_logits_img, vfl_targets_img) # This is the "classification" part for VFL
+                loss_cls = loss_cls_unreduced / float(num_fg_img)
+                # In VFL, objectness is implicitly handled by the joint_logits and quality target.
+                # So, loss_obj would typically be 0 or not explicitly calculated here.
+                # For simplicity, if VFL is used, we won't add a separate loss_obj for now.
+                loss_obj = torch.tensor(0.0, device=device)
+
 
             # --- Distribution Focal Loss (DFL) & IoU Loss for BBox Regression ---
-            # These losses apply only to foreground anchors
-            reg_p_fg_img = reg_p_img[fg_mask_img]                         
-            box_targets_fg_img = assigned_gt_boxes_img_full[fg_mask_img] 
+            # (These are independent of the classification/objectness choice above and operate on reg_p_img)
+            reg_p_fg_img = reg_p_img[fg_mask_img]
+            box_targets_fg_img = assigned_gt_boxes_img_full[fg_mask_img]
 
-            # Strides for foreground anchors
             strides_all_anchors_img = torch.cat(
                 [torch.full((H_lvl * W_lvl,), float(s_lvl_val), device=device)
                  for H_lvl, W_lvl, s_lvl_val in fmap_shapes], dim=0
-            ) 
-            strides_fg_img = strides_all_anchors_img[fg_mask_img].unsqueeze(-1) 
+            )
+            strides_fg_img = strides_all_anchors_img[fg_mask_img].unsqueeze(-1)
 
-            # IoU Loss (using predicted boxes from DFL output)
             pred_ltrb_offsets_fg_img = PicoDetHead.dfl_decode_for_training(
-                reg_p_fg_img, 
+                reg_p_fg_img,
                 dfl_project_buffer_for_decode.to(reg_p_fg_img.device),
                 head_reg_max_for_loss
-            ) # (num_fg_img, 4) - these are l,t,r,b *offsets* (not scaled by stride yet)
-            
+            )
+
             anchor_centers_all_img = torch.cat(
                 [assigner.cache[(H_lvl, W_lvl, s_lvl_val, str(device))]
                  for H_lvl, W_lvl, s_lvl_val in fmap_shapes], dim=0
-            ) 
-            anchor_centers_fg_img = anchor_centers_all_img[fg_mask_img] 
-            
-            # DFL Targets
-            # target_offsets_for_dfl = (box_targets_fg_img / strides_fg_img).clamp(min=0., max=head_reg_max_for_loss - 1e-6)
-            # dfl_target_dist = build_dfl_targets(target_offsets_for_dfl, head_reg_max_for_loss)
-            #   anchor_centers_fg_img : (N_fg, 2)  in pixels
-            #   box_targets_fg_img    : (N_fg, 4)  in pixels (x1 y1 x2 y2)
-            #   strides_fg_img        : (N_fg, 1)
-            
+            )
+            anchor_centers_fg_img = anchor_centers_all_img[fg_mask_img]
+
+            # if not torch.allclose(anchor_centers_all_img[:10], assigner.cache_first_call[:10]):
+            #     print("[WARNING] anchor-order mismatch occurred")
+
             ltrb_offsets = torch.stack([
-                anchor_centers_fg_img[:, 0] - box_targets_fg_img[:, 0],  # left
-                anchor_centers_fg_img[:, 1] - box_targets_fg_img[:, 1],  # top
-                box_targets_fg_img[:, 2] - anchor_centers_fg_img[:, 0],  # right
-                box_targets_fg_img[:, 3] - anchor_centers_fg_img[:, 1],  # bottom
-            ], dim=1) / strides_fg_img           # convert to stride units
-            
+                anchor_centers_fg_img[:, 0] - box_targets_fg_img[:, 0],
+                anchor_centers_fg_img[:, 1] - box_targets_fg_img[:, 1],
+                box_targets_fg_img[:, 2] - anchor_centers_fg_img[:, 0],
+                box_targets_fg_img[:, 3] - anchor_centers_fg_img[:, 1],
+            ], dim=1) / strides_fg_img
             ltrb_offsets = ltrb_offsets.clamp_(0, head_reg_max_for_loss - 1e-6)
-            
-            dfl_target_dist = build_dfl_targets(
-                    ltrb_offsets, head_reg_max_for_loss)
-            
+            dfl_target_dist = build_dfl_targets(ltrb_offsets, head_reg_max_for_loss)
             loss_dfl = dfl_loss(reg_p_fg_img, dfl_target_dist)
 
-            # Predicted boxes for foreground anchors: scale offsets by stride
-            # strides_fg_img is (num_fg_img, 1), pred_ltrb_offsets_fg_img is (num_fg_img, 4)
-            # We need to scale each of l,t,r,b by the corresponding stride.
-            pred_ltrb_pixels_fg_img = pred_ltrb_offsets_fg_img * strides_fg_img # (num_fg_img, 4)
-
+            pred_ltrb_pixels_fg_img = pred_ltrb_offsets_fg_img * strides_fg_img
             pred_boxes_fg_img = torch.stack((
-                anchor_centers_fg_img[:, 0] - pred_ltrb_pixels_fg_img[:, 0], # x1
-                anchor_centers_fg_img[:, 1] - pred_ltrb_pixels_fg_img[:, 1], # y1
-                anchor_centers_fg_img[:, 0] + pred_ltrb_pixels_fg_img[:, 2], # x2
-                anchor_centers_fg_img[:, 1] + pred_ltrb_pixels_fg_img[:, 3]  # y2
-            ), dim=1) 
-
+                anchor_centers_fg_img[:, 0] - pred_ltrb_pixels_fg_img[:, 0],
+                anchor_centers_fg_img[:, 1] - pred_ltrb_pixels_fg_img[:, 1],
+                anchor_centers_fg_img[:, 0] + pred_ltrb_pixels_fg_img[:, 2],
+                anchor_centers_fg_img[:, 1] + pred_ltrb_pixels_fg_img[:, 3]
+            ), dim=1)
             loss_iou = tvops.complete_box_iou_loss(pred_boxes_fg_img, box_targets_fg_img, reduction='sum') / num_fg_img
 
-            w_iou = 5 if epoch < 7 else 2.0
-            current_sample_total_loss = loss_cls + loss_dfl + w_iou * loss_iou
+            # Dynamic IoU loss weight
+            w_iou = w_iou_initial if epoch < iou_weight_change_epoch else w_iou_final
+            
+            current_sample_total_loss = loss_cls + w_obj_loss * loss_obj + loss_dfl + w_iou * loss_iou
+            
+            # Store for printing the first sample's loss breakdown
             if num_samples_with_loss_in_batch == 0 and total_samples_contributing_to_loss_epoch == 0:
-                print(f"cls {loss_cls.item():.3f}  dfl {loss_dfl.item():.3f}  "
-                      f"iou {loss_iou.item():.3f}  tot {current_sample_total_loss.item():.3f}")
+                loss_cls_print, loss_obj_print, loss_dfl_print, loss_iou_print = \
+                    loss_cls.detach(), loss_obj.detach(), loss_dfl.detach(), loss_iou.detach()
+
             batch_total_loss += current_sample_total_loss
             num_samples_with_loss_in_batch += 1
-            
+
         if num_samples_with_loss_in_batch > 0:
             averaged_batch_loss = batch_total_loss / num_samples_with_loss_in_batch
             opt.zero_grad(set_to_none=True)
             scaler.scale(averaged_batch_loss).backward()
+            # torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0) # Optional gradient clipping
             scaler.step(opt); scaler.update()
             tot_loss_accum += averaged_batch_loss.item() * num_samples_with_loss_in_batch
             total_samples_contributing_to_loss_epoch += num_samples_with_loss_in_batch
-        if i % 500 == 0 and num_samples_with_loss_in_batch > 0: # Print batch loss
-            # Make sure loss_cls, loss_dfl, loss_iou are defined even if num_fg_img was 0 for the last sample in batch
-            # This is generally okay as they are overwritten each sample loop.
-            # If num_fg_img is 0, that sample is skipped, so these would hold values from previous sample.
-            # It's better to print averaged_batch_loss as it's more stable.
-            print(f"E{epoch} {i:04d}/{len(loader)} loss {averaged_batch_loss.item():.3f} (batch avg)")
 
+        if debug_prints and i == 0 and total_samples_contributing_to_loss_epoch > 0 : # Print first batch loss breakdown
+             print(f"E{epoch} B0 loss components: "
+                  f"cls {loss_cls_print.item():.3f}  obj {loss_obj_print.item() * w_obj_loss:.3f} (w={w_obj_loss})  "
+                  f"dfl {loss_dfl_print.item():.3f}  iou {loss_iou_print.item() * w_iou:.3f} (w={w_iou})  "
+                  f"tot_batch_avg {averaged_batch_loss.item():.3f}")
+        elif debug_prints and i % 500 == 0 and i > 0 and num_samples_with_loss_in_batch > 0:
+            print(f"E{epoch} {i:04d}/{len(loader)} loss {averaged_batch_loss.item():.3f} (batch avg)")
 
     if total_samples_contributing_to_loss_epoch > 0:
         avg_epoch_loss_per_sample = tot_loss_accum / total_samples_contributing_to_loss_epoch
@@ -516,7 +514,6 @@ def train_epoch(
     else:
         print(f"E{epoch} No samples contributed to loss this epoch.")
         return 0.0
-
 
 
 # ───────────────────── QAT helpers ───────────────────────────────
@@ -527,49 +524,54 @@ from torch.ao.quantization import (
 from torch.ao.quantization.quantize_fx import prepare_qat_fx, convert_fx
 
 
-def qat_prepare(model: nn.Module, example: torch.Tensor):
-    # backend = 'x86' # or 'fbgemm' which is often the default for x86, 'qnnpack' for arm
-    backend = 'x86' # More explicit, often used for server-side QAT
-    qmap = get_default_qat_qconfig_mapping(backend) # Use fbgemm or qnnpack
+def qat_prepare(model: nn.Module, example_input: torch.Tensor) -> torch.fx.GraphModule:
+    """
+    Prepares the model for Quantization-Aware Training (QAT) using FX graph mode.
 
-    # For weights: Per-channel quantization is good.
-    weight_observer = MovingAveragePerChannelMinMaxObserver.with_args(
-        dtype=torch.qint8, qscheme=torch.per_channel_symmetric # or torch.per_channel_affine_float_qparams
-    )
+    Args:
+        model: The PyTorch nn.Module to prepare for QAT.
+        example_input: A representative example input tensor for tracing the model.
 
-    # For activations: Per-tensor quantization is generally more robust and common.
-    # MovingAverageMinMaxObserver is a per-tensor observer.
-    activation_observer = MovingAverageMinMaxObserver.with_args(
-        dtype=torch.quint8, qscheme=torch.per_tensor_affine # Use per-tensor scheme
-        # reduce_range=False # common default, set True for some mobile backends if needed
-    )
-    
-    # Create a new QConfig with these choices
-    # The default qconfig from get_default_qat_qconfig_mapping might already be good,
-    # but if you want to be explicit:
-    custom_qconfig = QConfig(activation=activation_observer, weight=weight_observer)
-    
-    # Apply this qconfig globally
-    qmap = qmap.set_global(custom_qconfig) # This might be too broad if some ops need special handling
-
-    # Let's refine the global qconfig:
-    # Use per-channel for weights, per-tensor for activations.
-    qconfig_global_refined = QConfig(
+    Returns:
+        A torch.fx.GraphModule prepared for QAT.
+    """
+    # 1. Define the desired QConfig for most layers
+    #    Activations: per-tensor, affine, quint8
+    #    Weights: per-channel, symmetric, qint8 (common for conv/linear layers)
+    global_qconfig = QConfig(
         activation=MovingAverageMinMaxObserver.with_args(
             dtype=torch.quint8, qscheme=torch.per_tensor_affine
-            # reduce_range=True # Sometimes recommended for QNNPACK
         ),
         weight=MovingAveragePerChannelMinMaxObserver.with_args(
-            dtype=torch.qint8, qscheme=torch.per_channel_symmetric # Symmetric for weights is common
+            dtype=torch.qint8, qscheme=torch.per_channel_symmetric
         )
     )
-    qmap_new = get_default_qat_qconfig_mapping(backend) # Start fresh
-    qmap_new = qmap_new.set_global(qconfig_global_refined)
 
-    # Skip quantization for the 'pre' module
-    qmap_new = qmap_new.set_module_name('pre', None)
+    # 2. Get the default QAT qconfig mapping for the chosen backend
+    #    'x86' or 'qnnpack' (for ARM) are common backends.
+    backend_config = "x86"  # Or "qnnpack" explicitly
+    qconfig_mapping = get_default_qat_qconfig_mapping(backend_config)
 
-    return prepare_qat_fx(model.cpu(), qmap_new, (example,))
+    # 3. Apply the global QConfig to the mapping
+    #    This will apply `global_qconfig` to all quantizable module types
+    #    unless overridden by more specific settings (e.g., per module type/instance).
+    qconfig_mapping = qconfig_mapping.set_global(global_qconfig)
+
+    # 4. Specify modules to skip quantization
+    #    The 'pre' module (ResizeNorm) handles uint8 input and normalization;
+    qconfig_mapping = qconfig_mapping.set_module_name('pre', None)
+
+    # 5. Prepare the model for QAT using FX graph mode
+    model.cpu().train() # Ensure model is on CPU and in train mode
+    
+    prepared_model = prepare_qat_fx(
+        model,
+        qconfig_mapping,
+        example_input # Must also be on CPU
+    )
+    
+    return prepared_model
+
 
 def unwrap_dataset(ds):
     while isinstance(ds, torch.utils.data.Subset):
@@ -1034,12 +1036,49 @@ def append_nms_to_onnx(
         "Transpose", [scores3d], [scores_bca],
         perm=[0, 2, 1], name="Transpose_BCA"))  # [B,C,A]
 
-    # ──────────────── Non-Max Suppression ────────────────
-    sel = "selected_idx"                                   # [N,3]
-    g.node.append(oh.make_node(
-        "NonMaxSuppression",
-        [boxes3d, scores_bca, "max_det", "iou_th", "score_th"],
-        [sel], name="NMS"))
+    top_k_before_nms = False  # not yet fully tested
+    if top_k_before_nms:
+        # ──────────────── TopK Selection ────────────────
+        # ReduceMax to get max confidence per anchor: [B, C, TotalAnchors] -> [B, TotalAnchors]
+        max_conf_per_anchor = "max_conf_per_anchor"
+        g.node.append(oh.make_node(
+            "ReduceMax", [scores_bca], [max_conf_per_anchor],
+            axes=[1], keepdims=0, name="ReduceMax_Conf_Over_Classes"))
+    
+        # TopK to get indices of K best anchors: [B, TotalAnchors] -> [B, K_topk] (indices)
+        topk_conf_values = "topk_conf_values" # We don't strictly need these values later, but TopK outputs them
+        topk_anchor_indices = "topk_anchor_indices" # Shape: [B, K_topk]
+        g.node.append(oh.make_node(
+            "TopK", [max_conf_per_anchor, "K_topk_const"], [topk_conf_values, topk_anchor_indices],
+            axis=1, largest=1, sorted=0, name="TopK_Anchors_By_Max_Conf")) # axis=1 to select along anchor dim
+    
+        # Gather the chosen top K anchors for boxes and scores
+        # Boxes: [B, TotalAnchors, 4] -> [B, K_topk, 4]
+        boxes3d_topk = "boxes3d_topk"
+        g.node.append(oh.make_node(
+            "Gather", [boxes3d, topk_anchor_indices], [boxes3d_topk],
+            axis=1, name="Gather_Boxes_TopK")) # axis=1 to gather along TotalAnchors dim
+    
+        # Scores: [B, C, TotalAnchors] -> [B, C, K_topk]
+        scores_bca_topk = "scores_bca_topk"
+        g.node.append(oh.make_node(
+            "Gather", [scores_bca, topk_anchor_indices], [scores_bca_topk],
+            axis=2, name="Gather_Scores_TopK")) # axis=2 to gather along TotalAnchors dim
+    
+        # ──────────────── Non-Max Suppression (operates on TopK results) ────────────────
+        selected_indices_nms = "selected_indices_nms" # Output of NMS: [num_selected, 3]
+        g.node.append(oh.make_node(
+            "NonMaxSuppression",
+            [boxes3d_topk, scores_bca_topk, "max_det", "iou_th", "score_th"], # Use TopK results
+            [selected_indices_nms], name="NMS"))
+
+    else:
+        # ──────────────── Non-Max Suppression ────────────────
+        sel = "selected_idx"                                   # [N,3]
+        g.node.append(oh.make_node(
+            "NonMaxSuppression",
+            [boxes3d, scores_bca, "max_det", "iou_th", "score_th"],
+            [sel], name="NMS"))
 
     # ───────── split batch / class / anchor ─────────
     b_col, c_col, a_col = "b_col", "c_col", "a_col"
@@ -1093,6 +1132,55 @@ def append_nms_to_onnx(
     onnx.checker.check_model(m)
     onnx.save(m, out_path)
     print(f"[SAVE] Final ONNX with NMS → {out_path}")
+
+
+def save_intermediate_onnx(qat_model, cfg, model):
+    # --- Convert QAT model to INT8 ---
+    qat_model.cpu().eval()
+    int8_model_with_preprocessor = convert_fx(qat_model) # This model still contains 'pre'
+    print("[INFO] QAT model converted to INT8.")
+
+    # ---------------- Create the wrapper for ONNX export ----------------
+    if not hasattr(model, 'head') or not isinstance(model.head, PicoDetHead):
+        raise RuntimeError("Original FP32 model or its head is not available for PostprocessorForONNX initialization.")
+
+    # It's crucial that model.head's buffers (strides, dfl_project, anchors) are correctly initialized
+    # for the IMG_SIZE used during training. This should already be the case.
+    onnx_postprocessor = PostprocessorForONNX(model.head) # Pass the head of the original FP32 model
+    
+    # Create the final model that combines the quantized core and the new postprocessor
+    final_exportable_int8_model = ONNXExportablePicoDet(
+        int8_model_with_preprocessor, # The FX GraphModule from convert_fx
+        onnx_postprocessor
+    )
+    final_exportable_int8_model.cpu().eval() # Ensure CPU and eval mode for export
+
+    # ---------------- ONNX export (model WITH preprocessor AND wrapped postprocessor, without NMS) ----------------
+    temp_onnx_path = cfg.out.replace(".onnx", "_temp_no_nms.onnx")
+
+    dummy_uint8_input_cpu = torch.randint(0, 256, (1, 3, IMG_SIZE, IMG_SIZE), dtype=torch.uint8, device='cpu')
+    actual_onnx_input_example = dummy_uint8_input_cpu.cpu() # uint8 tensor
+
+    print("[INFO] Exporting final INT8 model with wrapped postprocessing to ONNX...")
+    torch.onnx.export(
+        final_exportable_int8_model,
+        actual_onnx_input_example,
+        temp_onnx_path,
+        input_names=['images_uint8'],
+        # These output names now correspond to the (B, TotalAnchors, 4/NC) tensors
+        output_names=['raw_boxes', 'raw_scores'],
+        dynamic_axes={
+            'images_uint8': {0: 'batch', 2: 'h', 3: 'w'},
+            'raw_boxes':    {0: 'batch', 1: 'anchors'}, # Shape [batch, total_anchors, 4]
+            'raw_scores':   {0: 'batch', 1: 'anchors'}  # Shape [batch, total_anchors, num_classes]
+                                                        # The 3rd dim (num_classes) is static
+        },
+        opset_version=18,
+        keep_initializers_as_inputs=False, # Important for some runtimes
+        do_constant_folding=True,
+    )
+    print(f'[SAVE] Intermediate ONNX (no NMS, with wrapped postprocessor) → {temp_onnx_path}')
+    return final_exportable_int8_model, int8_model_with_preprocessor, actual_onnx_input_example, temp_onnx_path
 
 
 def main(argv: List[str] | None = None):
@@ -1220,7 +1308,7 @@ def main(argv: List[str] | None = None):
             milestones=[warmup_epochs]
         )
     else:
-        base_lr = 0.0075
+        base_lr = 0.006
         warmup_epochs = 3
         cosine_decay_alpha = 0.0
         opt = SGD(model.parameters(), lr=base_lr, momentum=0.9, weight_decay=1e-4)
@@ -1255,6 +1343,7 @@ def main(argv: List[str] | None = None):
     original_model_head_nc = model.head.nc
     original_model_head_reg_max = model.head.reg_max
     original_dfl_project_buffer = model.head.dfl_project_buffer
+    print(f"head iou_th is {float(model.head.iou_th)}")
 
 
     # ... (FP32 training loop) ...
@@ -1338,86 +1427,87 @@ def main(argv: List[str] | None = None):
     qat_model = qat_model.to(dev)
     print("[INFO] QAT model prepared and moved to device.")
 
-    # ... (QAT Finetuning) ...
-    qat_model.train()
+    # --- QAT Finetuning ---
+    qat_model.train() # Ensure model is in training mode for QAT
+
+    qat_epochs = int(cfg.epochs * 0.2)
+    qat_epochs = 3 if qat_epochs < 3 else qat_epochs
+
+    qat_initial_lr = 0.0005
+    
+    # Filter parameters for QAT optimizer
     opt_q_params = filter(lambda p: p.requires_grad, qat_model.parameters())
-    opt_q = SGD(opt_q_params, lr=0.002, momentum=0.9) # Potentially adjust LR for QAT
+    opt_q = SGD(opt_q_params, lr=qat_initial_lr, momentum=0.9, weight_decay=1e-5)
+    scheduler_q = CosineAnnealingLR(opt_q, T_max=qat_epochs, eta_min=qat_initial_lr * 0.01)
     scaler_q = torch.amp.GradScaler(enabled=(dev.type == 'cuda'))
 
-    print("[INFO] Starting QAT finetuning epochs...")
-    qat_epochs = 2  # cfg.epochs // 2 or 1
-    for qep in range(qat_epochs): # Example: finetune for half the FP32 epochs or at least 1
+    print(f"[INFO] Starting QAT finetuning for {qat_epochs} epochs with initial LR {qat_initial_lr:.6f}...")
+    
+    best_qat_iou = -1.0 # To save the best QAT model
+    final_exportable_int8_model = None
+
+    for qep in range(qat_epochs):
+        qat_model.train() # Ensure model is in train mode for each epoch
+        current_lr_qat = opt_q.param_groups[0]['lr']
+        print(f"[QAT] Starting Epoch {qep + 1}/{qat_epochs} with LR {current_lr_qat:.7f}")
+
         lq = train_epoch(
             qat_model, tr_loader, opt_q, scaler_q, assigner, dev, qep, coco_label_map,
             head_nc_for_loss=original_model_head_nc,
             head_reg_max_for_loss=original_model_head_reg_max,
             dfl_project_buffer_for_decode=original_dfl_project_buffer,
-            max_epochs=qat_epochs, # Pass total QAT epochs for VFL alpha scheduling
-            quality_floor_vfl=0.2  # Consistent VFL floor
+            max_epochs=qat_epochs, # For VFL alpha scheduling (relative to QAT duration)
+            quality_floor_vfl=0.2,
+            iou_weight_change_epoch=2,
         )
-        if lq is not None : # Check if loss was computed
-            print(f'[QAT] Epoch {qep + 1}/{(cfg.epochs // 2 or 1)}  loss {lq:.3f}')
+        scheduler_q.step() # Step the QAT LR scheduler
+
+        if lq is not None:
+            print(f'[QAT] Epoch {qep + 1}/{qat_epochs} Train Loss {lq:.3f}')
         else:
-            print(f'[QAT] Epoch {qep + 1}/{(cfg.epochs // 2 or 1)}  loss N/A (no samples contributed)')
+            print(f'[QAT] Epoch {qep + 1}/{qat_epochs} Train Loss N/A (no samples contributed)')
 
-    print("[INFO] Evaluating QAT model...")
-    qat_model.eval()
-    try:
-        qat_iou_high_thresh = quick_val_iou(qat_model, vl_loader, dev,
-                               score_thresh=0.25, # Specifically pass 0.25
-                               iou_thresh=model.head.iou_th,
-                               max_detections=model.head.max_det,
-                               epoch_num=qep,
-                               run_name="score_thresh_0.25")
-        print(f"[INFO] Validation IoU (score_th=0.25): {qat_iou_high_thresh:.4f}")
-    except Exception as e:
-        print(repr(e))
-    qat_model.train()
+        # --- QAT Validation after each epoch ---
+        print(f"[QAT] Evaluating after Epoch {qep + 1}...")
+        qat_model.eval() # Switch qat_model to eval for validation
 
-    # --- Convert QAT model to INT8 ---
-    qat_model.cpu().eval()
-    int8_model_with_preprocessor = convert_fx(qat_model) # This model still contains 'pre'
-    print("[INFO] QAT model converted to INT8.")
+        try:
+            # IMPORTANT: Use the evaluation wrapper for quick_val_iou
+            # model.head is the original FP32 head, used to get parameters for PostprocessorForONNX
+            eval_compatible_qat_model = ONNXExportablePicoDet(qat_model, PostprocessorForONNX(model.head))
+            eval_compatible_qat_model.to(dev).eval() # Ensure it's on device and in eval mode
 
-    # ---------------- Create the wrapper for ONNX export ----------------
-    if not hasattr(model, 'head') or not isinstance(model.head, PicoDetHead):
-        raise RuntimeError("Original FP32 model or its head is not available for PostprocessorForONNX initialization.")
+            # Using a consistent score_thresh for tracking QAT progress, e.g., 0.05 or 0.25
+            # The one used for final ONNX NMS params can be different.
+            current_qat_val_iou = quick_val_iou(
+                                   eval_compatible_qat_model, vl_loader, dev,
+                                   score_thresh=0.05, # Consistent validation score_thresh
+                                   iou_thresh=model.head.iou_th,
+                                   max_detections=model.head.max_det,
+                                   epoch_num=qep, # Pass QAT epoch number
+                                   run_name=f"QAT_ep{qep+1}_score0.05"
+                                )
+            print(f"[QAT Eval] Epoch {qep + 1}/{qat_epochs} Val IoU (score_th=0.05): {current_qat_val_iou:.4f}")
 
-    # It's crucial that model.head's buffers (strides, dfl_project, anchors) are correctly initialized
-    # for the IMG_SIZE used during training. This should already be the case.
-    onnx_postprocessor = PostprocessorForONNX(model.head) # Pass the head of the original FP32 model
-    
-    # Create the final model that combines the quantized core and the new postprocessor
-    final_exportable_int8_model = ONNXExportablePicoDet(
-        int8_model_with_preprocessor, # The FX GraphModule from convert_fx
-        onnx_postprocessor
-    )
-    final_exportable_int8_model.cpu().eval() # Ensure CPU and eval mode for export
+            if current_qat_val_iou > best_qat_iou:
+                best_qat_iou = current_qat_val_iou
+                final_exportable_int8_model, int8_model_with_preprocessor, actual_onnx_input_example, temp_onnx_path = save_intermediate_onnx(
+                    qat_model, cfg, model
+                )
+                # best_qat_model_state = qat_model.state_dict() # If saving in memory
+                # Or save to disk:
+                # torch.save(qat_model.state_dict(), f"best_qat_model_epoch_{qep+1}.pth")
+                print(f"[QAT] New best QAT validation IoU: {best_qat_iou:.4f}. Model saved.")
 
-    # ---------------- ONNX export (model WITH preprocessor AND wrapped postprocessor, without NMS) ----------------
-    temp_onnx_path = cfg.out.replace(".onnx", "_temp_no_nms.onnx")
+        except Exception as e:
+            print(f"Error during QAT model validation (Epoch {qep + 1}): {e}")
+            traceback.print_exc()
 
-    actual_onnx_input_example = dummy_uint8_input_cpu.cpu() # uint8 tensor
+    print(f"[INFO] QAT finetuning completed. Best QAT Val IoU (score_th=0.05): {best_qat_iou:.4f}")
 
-    print("[INFO] Exporting final INT8 model with wrapped postprocessing to ONNX...")
-    torch.onnx.export(
-        final_exportable_int8_model, # <--- Use this new composite model
-        actual_onnx_input_example,
-        temp_onnx_path,
-        input_names=['images_uint8'],
-        # These output names now correspond to the (B, TotalAnchors, 4/NC) tensors
-        output_names=['raw_boxes', 'raw_scores'],
-        dynamic_axes={
-            'images_uint8': {0: 'batch', 2: 'h', 3: 'w'},
-            'raw_boxes':    {0: 'batch', 1: 'anchors'}, # Shape [batch, total_anchors, 4]
-            'raw_scores':   {0: 'batch', 1: 'anchors'}  # Shape [batch, total_anchors, num_classes]
-                                                        # The 3rd dim (num_classes) is static
-        },
-        opset_version=18, # Your script uses 18
-        keep_initializers_as_inputs=False, # Important for some runtimes
-        do_constant_folding=True,
-    )
-    print(f'[SAVE] Intermediate ONNX (no NMS, with wrapped postprocessor) → {temp_onnx_path}')
+
+    if final_exportable_int8_model is None:
+        final_exportable_int8_model, int8_model_with_preprocessor, actual_onnx_input_example, temp_onnx_path = save_intermediate_onnx(qat_model, cfg, model)
 
     # DEBUG: Inspect intermediate ONNX model outputs
     intermediate_model_check = onnx.load(temp_onnx_path)
@@ -1521,9 +1611,9 @@ def main(argv: List[str] | None = None):
     append_nms_to_onnx(
         in_path=temp_onnx_path,
         out_path=cfg.out,
-        score_thresh=float(model.head.score_th), # NMS params from original head
-        iou_thresh=float(model.head.iou_th),
-        max_det=int(model.head.max_det),
+        score_thresh=float(model.head.score_th), # 0.05
+        iou_thresh=float(model.head.iou_th),  # 0.6
+        max_det=int(model.head.max_det),  # 100
     )
 
 
