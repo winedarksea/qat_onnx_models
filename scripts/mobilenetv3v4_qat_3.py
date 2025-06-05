@@ -351,16 +351,16 @@ def evaluate(model, loader, dev):
 
 # --- Main script execution ---
 data_dir: str = "filtered_imagenet2_native" # Example, replace with your actual path
-epochs: int = 550 # Reduced for quick testing, set to your desired value (e.g., 55)
-qat_epochs: int = 8 # Reduced for quick testing, set to your desired value (e.g., 5)
+epochs: int = 75
+qat_epochs: int = 2
 batch: int = 64
 lr: float = 0.025
 qat_lr_factor: float = 0.05
 width_mult: float = 1.0
 device_arg = None
 compile_model: bool = False
-arch: str = "mnv4c" # Change to "mnv2", "mnv3", "mnv4s" as needed
-pretrained: bool = False # Using pretrained weights for FP32 start
+arch: str = "mnv3l" # Change to "mnv2", "mnv3", "mnv3l", "mnv4s", "mnv4m" as needed
+pretrained: bool = True # Using pretrained weights for FP32 start
 drop_rate: float = 0.2
 
 if device_arg is None:
@@ -409,7 +409,10 @@ if not class_map_path.exists():
 
 
 with open(class_map_path) as f:
-    ncls = len(json.load(f));
+    class_map = json.load(f)
+    class_names = list(class_map.keys())
+    ncls = len(class_map)
+    
 print(f"[INFO] #classes = {ncls}")
 
 
@@ -667,14 +670,28 @@ except Exception as e:
     traceback.print_exc()
 
 try:
-    dummy_input_onnx_cpu = (torch.randint(0, 256, (1, 3, IMG_SIZE, IMG_SIZE), dtype=torch.uint8),)
+    float_model = copy.deepcopy(model).train()
+    float_model.meta = {
+        "task":  "classify",
+        "nc":    ncls,
+        "names": {i: n for i, n in enumerate(class_names)},
+        # optional extras:
+        "input_size": [3, IMG_SIZE, IMG_SIZE],
+        "mean":  [0.485, 0.456, 0.406],
+        "std":   [0.229, 0.224, 0.225],
+    }
+
     torch.onnx.export(
-        final_model_for_export,
+        float_model.cpu().eval(),
         dummy_input_onnx_cpu, # Must be a tuple of inputs
-        str(onnx_path).replace(".onnx", "_dynamo.onnx"),
+        str(onnx_path).replace("int8.onnx", "fp32_dynamo.onnx"),
         input_names=["input_u8"],
         output_names=["logits"],
-        dynamic_axes={"input_u8": {0: "batch", 2: "height", 3: "width"}, "logits": {0: "batch"}},
+        # dynamic_axes={"input_u8": {0: "batch", 2: "height", 3: "width"}, "logits": {0: "batch"}},
+        # dynamic for N, H, W — C stays fixed at 3
+        dynamic_shapes={
+            "input": {0: "batch", 2: "height", 3: "width"},
+        },
         opset_version=18, # Using a recent opset, 18 has antialias resize
         dynamo=True,
         keep_initializers_as_inputs=False,
