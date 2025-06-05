@@ -212,7 +212,7 @@ def inspect_onnx_graph(onnx_model_path):
 
 # ───────────────────────────── main ─────────────────────────────
 # onnx_path = "mobilenet_w1_0_mnv3_pretrained_int8_fullpipe.onnx"
-onnx_path = "mobilenet_w1_0_mnv2_pretrained_drp0_0_int8_fullpipe_optimized.onnx"
+onnx_path = "mobilenet_w1_0_mnv4s_pretrained_drp0_2_qat_int8.onnx"
 data_dir = "filtered_imagenet2_native" # Make sure this path is correct
 batch = 1 # Keep batch=1 for per-image timing, but can increase for throughput tests
 provider = "CPUExecutionProvider"  # CPUExecutionProvider, CUDAExecutionProvider
@@ -288,6 +288,9 @@ except Exception as e:
 correct_predictions = 0
 total_samples = 0
 total_inference_time = 0.0
+correct_top5 = 0
+true_labels   = []
+pred_labels   = [] 
 
 print("[INFO] Starting inference...")
 for i, (img_batch, lab_batch) in tqdm(enumerate(vl), total=len(vl), desc="Running Inference"):
@@ -304,6 +307,15 @@ for i, (img_batch, lab_batch) in tqdm(enumerate(vl), total=len(vl), desc="Runnin
     logits = ort_outputs[0]
     predictions = np.argmax(logits, axis=1)
     correct_predictions += (predictions == lab_batch.numpy()).sum()
+    
+    # ─── top-5 ────────────────────────────────────────────────
+    top5_preds = np.argpartition(logits, -5, axis=1)[:, -5:]  # (B,5) unordered
+    for label, top5 in zip(lab_batch.numpy(), top5_preds):
+        correct_top5 += int(label in top5)
+    
+    # ─── collect for macro metrics ───────────────────────────
+    true_labels.extend(lab_batch.numpy())
+    pred_labels.extend(predictions)
 
 # After loop, if profiling was enabled:
 if sess_options.enable_profiling:
@@ -316,10 +328,33 @@ if sess_options.enable_profiling:
 accuracy = correct_predictions / total_samples if total_samples > 0 else 0.0
 average_time_per_image = total_inference_time / total_samples if total_samples > 0 else 0.0
 
+# Top-5 accuracy
+top5_accuracy = correct_top5 / total_samples if total_samples else 0.0
+
+# Macro-precision / recall / F1
+true_labels = np.asarray(true_labels)
+pred_labels = np.asarray(pred_labels)
+n_classes   = np.max(true_labels) + 1
+
+tp = np.bincount(true_labels[pred_labels == true_labels], minlength=n_classes)
+fp = np.bincount(pred_labels[pred_labels != true_labels], minlength=n_classes)
+fn = np.bincount(true_labels[pred_labels != true_labels], minlength=n_classes)
+
+precision_per_class = tp / np.clip(tp + fp, 1, None)
+recall_per_class    = tp / np.clip(tp + fn, 1, None)
+f1_per_class        = 2 * precision_per_class * recall_per_class / np.clip(precision_per_class + recall_per_class, 1e-8, None)
+
+macro_precision = precision_per_class.mean()
+macro_recall    = recall_per_class.mean()
+macro_f1        = f1_per_class.mean()
+
 print("\n─────────────────────────── Results ───────────────────────────")
 print(f"Total images tested: {total_samples}")
 print(f"Correct predictions: {correct_predictions}")
-print(f"Accuracy: {accuracy * 100:.2f}%")
+print(f"Accuracy (top-1): {accuracy * 100:.2f}%")
+print(f"Top-5 accuracy: {top5_accuracy * 100:.2f}%")
+print(f"Macro Precision / Recall / F1: "
+      f"{macro_precision*100:.2f}% / {macro_recall*100:.2f}% / {macro_f1*100:.2f}%")
 print(f"Total inference time: {total_inference_time:.4f} seconds")
 print(f"Average inference time per image: {average_time_per_image * 1000:.4f} ms")
 print(f"Images per second (throughput): {1.0 / average_time_per_image if average_time_per_image > 0 else 0:.2f} IPS")
