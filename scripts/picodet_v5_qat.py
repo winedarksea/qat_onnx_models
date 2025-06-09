@@ -283,8 +283,8 @@ def train_epoch(
         w_obj_loss: float = 2.0, # Weight for the new objectness loss
         w_iou_initial: float = 5.0, # Initial weight for IoU loss
         w_iou_final: float = 2.0,   # Final weight for IoU loss
-        iou_weight_change_epoch: int = 7, # Epoch to change IoU weight
-        use_focal_loss: bool = True,
+        iou_weight_change_epoch: int = None, # Epoch to change IoU weight
+        use_focal_loss: bool = False,
         debug_prints: bool = True,
 ):
     model.train()
@@ -356,7 +356,7 @@ def train_epoch(
             obj_p_img = torch.cat([lvl[b_idx].permute(1, 2, 0).reshape(-1) for lvl in obj_preds_levels], dim=0) # Shape (A,)
             reg_p_img = torch.cat([lvl[b_idx].permute(1, 2, 0).reshape(-1, 4 * (head_reg_max_for_loss + 1)) for lvl in reg_preds_levels], dim=0)
 
-            obj_logits_for_assigner = obj_p_img if use_focal_loss else None
+            obj_logits_for_assigner = obj_p_img
 
             fg_mask_img, assigned_gt_labels_img_full, \
             assigned_gt_boxes_img_full, assigned_iou_img_full = assigner(
@@ -479,6 +479,8 @@ def train_epoch(
             loss_iou = tvops.complete_box_iou_loss(pred_boxes_fg_img, box_targets_fg_img, reduction='sum') / num_fg_img
 
             # Dynamic IoU loss weight
+            if iou_weight_change_epoch is None:
+                iou_weight_change_epoch = int(max_epochs * 0.4)
             w_iou = w_iou_initial if epoch < iou_weight_change_epoch else w_iou_final
             
             current_sample_total_loss = loss_cls + w_obj_loss * loss_obj + loss_dfl + w_iou * loss_iou
@@ -507,6 +509,11 @@ def train_epoch(
                   f"tot_batch_avg {averaged_batch_loss.item():.3f}")
         elif debug_prints and i % 500 == 0 and i > 0 and num_samples_with_loss_in_batch > 0:
             print(f"E{epoch} {i:04d}/{len(loader)} loss {averaged_batch_loss.item():.3f} (batch avg)")
+        if debug_prints and epoch == 10:
+            with torch.no_grad():
+                cls_logits, obj_logits, *_ = model(imgs)   # training batch
+                conf = (cls_logits + obj_logits).sigmoid().flatten()
+            print(torch.quantile(conf, torch.tensor([.5, .9, .99])))
 
     if total_samples_contributing_to_loss_epoch > 0:
         avg_epoch_loss_per_sample = tot_loss_accum / total_samples_contributing_to_loss_epoch
@@ -713,7 +720,8 @@ def quick_val_iou(
     iou_thresh: float,   # Passed in for this specific evaluation run (NMS IoU)
     max_detections: int, # Passed in for this specific evaluation run
     epoch_num: int = -1, # Optional: for logging
-    run_name: str = "N/A" # Optional: for logging if you have multiple eval runs
+    run_name: str = "N/A", # Optional: for logging if you have multiple eval runs
+    debug_prints: bool = True,
 ):
     model.eval()
     total_iou_sum = 0.
@@ -723,8 +731,9 @@ def quick_val_iou(
     total_preds_before_nms_filter_across_images = 0 # Anchors above score_thresh (before NMS)
     total_preds_after_nms_filter_across_images = 0  # Detections after NMS & final filter
 
-    print(f"\n--- quick_val_iou Start (Epoch: {epoch_num}, Run: {run_name}) ---")
-    print(f"Params: score_thresh={score_thresh}, iou_thresh={iou_thresh}, max_detections={max_detections}")
+    if debug_prints:
+        print(f"\n--- quick_val_iou Start (Epoch: {epoch_num}, Run: {run_name}) ---")
+        print(f"Params: score_thresh={score_thresh}, iou_thresh={iou_thresh}, max_detections={max_detections}")
 
     for batch_idx, (imgs_batch, tgts_batch) in enumerate(loader):
         # Model now outputs raw boxes and scores
@@ -733,7 +742,7 @@ def quick_val_iou(
         # raw_pred_scores_batch: (B, Total_Anchors, NC)
 
         # DEBUG: Print shapes of raw model outputs for the first batch
-        if batch_idx == 0:
+        if debug_prints and batch_idx == 0:
             print(f"[Debug Eval Batch 0] raw_pred_boxes_batch shape: {raw_pred_boxes_batch.shape}")
             print(f"[Debug Eval Batch 0] raw_pred_scores_batch shape: {raw_pred_scores_batch.shape}")
 
@@ -769,7 +778,7 @@ def quick_val_iou(
                 gt_boxes_list   = []
 
             if not gt_boxes_list:
-                if batch_idx == 0 and i < 2: # Log for first few images if no GT
+                if debug_prints and batch_idx == 0 and i < 2: # Log for first few images if no GT
                     print(f"[Debug Eval Img {num_images_processed-1}] GTs: {len(gt_boxes_list)}. "
           f"Score Thresh: {score_thresh}.")
                 continue # Skip if no ground truth for this image
@@ -789,7 +798,7 @@ def quick_val_iou(
             actual_predicted_boxes = predicted_boxes_for_img_padded[:num_actual_dets_this_img]
             # actual_predicted_scores = predicted_scores_for_img_padded[:num_actual_dets_this_img]
 
-            if batch_idx == 0 and i < 2: # Log for first few images with GT
+            if debug_prints and batch_idx == 0 and i < 2: # Log for first few images with GT
                 print(f"[Debug Eval Img {num_images_processed-1}] GTs: {len(gt_boxes_list)}. Score Thresh: {score_thresh}.")
                 print(f"  Num Preds BEFORE NMS (passed score_thresh): {debug_num_preds_before_nms_batch[i]}")
                 print(f"  Num Preds AFTER NMS (final): {num_actual_dets_this_img}")
@@ -804,7 +813,7 @@ def quick_val_iou(
             iou_matrix = tvops.box_iou(actual_predicted_boxes, gt_boxes_tensor) # (Num_Preds, Num_GTs)
             
             if iou_matrix.numel() == 0: # Should not happen if actual_predicted_boxes and gt_boxes_tensor are non-empty
-                if batch_idx == 0 and i < 2:
+                if debug_prints and batch_idx == 0 and i < 2:
                     print(f"  IoU matrix is empty for Img {num_images_processed-1} despite having preds and GTs.")
                 continue
                 
@@ -813,20 +822,21 @@ def quick_val_iou(
                 max_iou_per_gt, _ = iou_matrix.max(dim=0) # Max IoU for each GT box
                 image_avg_iou_for_matched_gts = max_iou_per_gt.sum().item() # Sum of best IoUs for GTs in this image
                 total_iou_sum += image_avg_iou_for_matched_gts
-                if batch_idx == 0 and i < 2:
+                if debug_prints and batch_idx == 0 and i < 2:
                      print(f"  Img {num_images_processed-1}: Max IoUs per GT: {max_iou_per_gt.cpu().numpy().round(3)}. Sum for image: {image_avg_iou_for_matched_gts:.3f}")
             # If iou_matrix.shape[0] == 0 (no preds but GTs exist), this block is skipped,
             # and image_avg_iou_for_matched_gts is effectively 0 for this image's contribution.
             # This is handled by the actual_predicted_boxes.numel() == 0 check earlier.
 
-    print(f"--- quick_val_iou End (Epoch: {epoch_num}, Run: {run_name}) ---")
-    print(f"Images processed: {num_images_processed}, Images with GT: {num_images_with_gt}")
-    print(f"Total GT boxes: {total_gt_boxes_across_images}")
-    avg_preds_before_nms = total_preds_before_nms_filter_across_images / num_images_processed if num_images_processed > 0 else 0
-    avg_preds_after_nms = total_preds_after_nms_filter_across_images / num_images_processed if num_images_processed > 0 else 0
-    print(f"Avg preds/img (passed score_thresh, before NMS): {avg_preds_before_nms:.2f}")
-    print(f"Avg preds/img (after NMS & final filter): {avg_preds_after_nms:.2f}")
-    
+    if debug_prints:
+        print(f"--- quick_val_iou End (Epoch: {epoch_num}, Run: {run_name}) ---")
+        print(f"Images processed: {num_images_processed}, Images with GT: {num_images_with_gt}")
+        print(f"Total GT boxes: {total_gt_boxes_across_images}")
+        avg_preds_before_nms = total_preds_before_nms_filter_across_images / num_images_processed if num_images_processed > 0 else 0
+        avg_preds_after_nms = total_preds_after_nms_filter_across_images / num_images_processed if num_images_processed > 0 else 0
+        print(f"Avg preds/img (passed score_thresh, before NMS): {avg_preds_before_nms:.2f}")
+        print(f"Avg preds/img (after NMS & final filter): {avg_preds_after_nms:.2f}")
+        
     # The mAP definition usually averages over classes and IoU thresholds.
     # This quick_val_iou averages the (sum of max_iou_per_gt) over all GT boxes.
     # It's a proxy for recall-oriented localization quality.
@@ -993,135 +1003,147 @@ def append_nms_to_onnx(
         score_thresh: float,
         iou_thresh: float,
         max_det: int,
-        raw_boxes: str = "raw_boxes",
-        raw_scores: str = "raw_scores",
+        *,
+        raw_boxes: str = "raw_boxes",     # [B , A , 4]
+        raw_scores: str = "raw_scores",   # [B , A , C]
+        top_k_before_nms: bool = True,
+        k_value: int = 800,
 ):
-    """
-    Turns an INT8 PicoDet graph that ends with raw anchor boxes / scores into
-    one that emits post-NMS detections:
-
-        det_boxes  [N,4]   det_scores [N]
-        class_idx  [N]     batch_idx  [N]
-    """
-    # may get better end-to-end latency by doing class-wise “fast NMS” (sigma-decay) or -better- topk-pre-NMS so this feeds at most 2 k anchors into NonMaxSuppression instead of 18 k.
     m = onnx.load(in_path)
     g = m.graph
 
-    # ──────────────── constants ────────────────
+    # ───────── constants ─────────
     g.initializer.extend([
-        oh.make_tensor("iou_th",   TP.FLOAT, [], [iou_thresh]),
-        oh.make_tensor("score_th", TP.FLOAT, [], [score_thresh]),
-        oh.make_tensor("max_det",  TP.INT64, [], [max_det]),
-        oh.make_tensor("axis1",    TP.INT64, [1], [1]),       # for Squeeze ops
-        oh.make_tensor("split111", TP.INT64, [3], [1, 1, 1]), # Split(N,3)
-        # reshape helpers
-        oh.make_tensor("shape_boxes",  TP.INT64, [3], [0, -1, 4]),   # [B, A, 4]
-        oh.make_tensor("shape_scores", TP.INT64, [3], [0, 0, -1]),   # keep B,A  flatten rest
+        oh.make_tensor("nms_iou_th",   TP.FLOAT, [], [iou_thresh]),
+        oh.make_tensor("nms_score_th", TP.FLOAT, [], [score_thresh]),
+        oh.make_tensor("nms_max_det",  TP.INT64, [], [max_det]),
+        oh.make_tensor("nms_axis0", TP.INT64, [1], [0]),
+        oh.make_tensor("nms_axis1", TP.INT64, [1], [1]),
+        oh.make_tensor("nms_axis2", TP.INT64, [1], [2]),
+        oh.make_tensor("nms_shape_boxes3d",  TP.INT64, [3], [0, -1, 4]),
+        oh.make_tensor("nms_shape_scores3d", TP.INT64, [3], [0, 0, -1]),
     ])
+    if top_k_before_nms:
+        g.initializer.extend([
+            oh.make_tensor("nms_k_topk", TP.INT64, [1], [k_value]),
+        ])
 
-    # ──────────────── BOXES  [B,?,4] ────────────────
-    boxes3d = "boxes3d"
-    g.node.append(oh.make_node(        # [B,*,4]
-        "Reshape", [raw_boxes, "shape_boxes"], [boxes3d],
-        name="Reshape_Boxes"))
+    # ───────── reshape / transpose raw outputs ─────────
+    boxes3d = "nms_boxes3d"
+    g.node.append(oh.make_node(
+        "Reshape", [raw_boxes, "nms_shape_boxes3d"], [boxes3d],
+        name="nms_Reshape_Boxes3D"))
 
-    # ──────────────── SCORES [B,A,C,(1)] → [B,C,A] ────────────────
-    scores3d = "scores3d"
-    g.node.append(oh.make_node(        # flattens any trailing dims
-        "Reshape", [raw_scores, "shape_scores"], [scores3d],
-        name="Reshape_Scores"))
+    scores3d = "nms_scores3d"
+    g.node.append(oh.make_node(
+        "Reshape", [raw_scores, "nms_shape_scores3d"], [scores3d],
+        name="nms_Reshape_Scores3D"))
 
-    scores_bca = "scores_bca"
+    scores_bca = "nms_scores_bca"
     g.node.append(oh.make_node(
         "Transpose", [scores3d], [scores_bca],
-        perm=[0, 2, 1], name="Transpose_BCA"))  # [B,C,A]
+        perm=[0, 2, 1], name="nms_Transpose_BCA"))  # [B , C , A]
 
-    top_k_before_nms = False  # not yet fully tested
+    # ───────── optional Top-K filter ─────────
     if top_k_before_nms:
-        # ──────────────── TopK Selection ────────────────
-        # ReduceMax to get max confidence per anchor: [B, C, TotalAnchors] -> [B, TotalAnchors]
-        max_conf_per_anchor = "max_conf_per_anchor"
+        max_conf = "nms_max_conf"
         g.node.append(oh.make_node(
-            "ReduceMax", [scores_bca], [max_conf_per_anchor],
-            axes=[1], keepdims=0, name="ReduceMax_Conf_Over_Classes"))
-    
-        # TopK to get indices of K best anchors: [B, TotalAnchors] -> [B, K_topk] (indices)
-        topk_conf_values = "topk_conf_values" # We don't strictly need these values later, but TopK outputs them
-        topk_anchor_indices = "topk_anchor_indices" # Shape: [B, K_topk]
-        g.node.append(oh.make_node(
-            "TopK", [max_conf_per_anchor, "K_topk_const"], [topk_conf_values, topk_anchor_indices],
-            axis=1, largest=1, sorted=0, name="TopK_Anchors_By_Max_Conf")) # axis=1 to select along anchor dim
-    
-        # Gather the chosen top K anchors for boxes and scores
-        # Boxes: [B, TotalAnchors, 4] -> [B, K_topk, 4]
-        boxes3d_topk = "boxes3d_topk"
-        g.node.append(oh.make_node(
-            "Gather", [boxes3d, topk_anchor_indices], [boxes3d_topk],
-            axis=1, name="Gather_Boxes_TopK")) # axis=1 to gather along TotalAnchors dim
-    
-        # Scores: [B, C, TotalAnchors] -> [B, C, K_topk]
-        scores_bca_topk = "scores_bca_topk"
-        g.node.append(oh.make_node(
-            "Gather", [scores_bca, topk_anchor_indices], [scores_bca_topk],
-            axis=2, name="Gather_Scores_TopK")) # axis=2 to gather along TotalAnchors dim
-    
-        # ──────────────── Non-Max Suppression (operates on TopK results) ────────────────
-        selected_indices_nms = "selected_indices_nms" # Output of NMS: [num_selected, 3]
-        g.node.append(oh.make_node(
-            "NonMaxSuppression",
-            [boxes3d_topk, scores_bca_topk, "max_det", "iou_th", "score_th"], # Use TopK results
-            [selected_indices_nms], name="NMS"))
+            "ReduceMax", [scores_bca, "nms_axis1"], [max_conf],
+            keepdims=0, name="nms_ReduceMax"))
 
+        topk_vals = "nms_topk_vals"
+        topk_idx  = "nms_topk_idx"                 # [B , K]
+        g.node.append(oh.make_node(
+            "TopK",
+            [max_conf, "nms_k_topk"],
+            [topk_vals, topk_idx],
+            axis=1, largest=1, sorted=0,
+            name="nms_TopK"))
+
+        topk_idx_unsq = "nms_topk_idx_unsq"        # [B , K , 1]
+        g.node.append(oh.make_node(
+            "Unsqueeze", [topk_idx, "nms_axis2"], [topk_idx_unsq],
+            name="nms_UnsqTopKIdx"))
+
+        boxes_topk = "nms_boxes_topk"              # [B , K , 4]
+        g.node.append(oh.make_node(
+            "GatherND", [boxes3d, topk_idx_unsq], [boxes_topk],
+            batch_dims=1, name="nms_GatherBoxesTopK"))
+
+        scores_bac = "nms_scores_bac"
+        g.node.append(oh.make_node(
+            "Transpose", [scores_bca], [scores_bac],
+            perm=[0, 2, 1], name="nms_Transpose_BAC"))
+
+        scores_bkc = "nms_scores_bkc"              # [B , K , C]
+        g.node.append(oh.make_node(
+            "GatherND", [scores_bac, topk_idx_unsq], [scores_bkc],
+            batch_dims=1, name="nms_GatherScoresTopK"))
+
+        scores_bck = "nms_scores_bck"              # [B , C , K]
+        g.node.append(oh.make_node(
+            "Transpose", [scores_bkc], [scores_bck],
+            perm=[0, 2, 1], name="nms_Transpose_BCK"))
+
+        nms_boxes  = boxes_topk
+        nms_scores = scores_bck
     else:
-        # ──────────────── Non-Max Suppression ────────────────
-        sel = "selected_idx"                                   # [N,3]
-        g.node.append(oh.make_node(
-            "NonMaxSuppression",
-            [boxes3d, scores_bca, "max_det", "iou_th", "score_th"],
-            [sel], name="NMS"))
+        nms_boxes  = boxes3d
+        nms_scores = scores_bca
 
-    # ───────── split batch / class / anchor ─────────
-    b_col, c_col, a_col = "b_col", "c_col", "a_col"
+    # ───────── Non-Max Suppression ─────────
+    sel = "nms_selected"                          # [N , 3]
     g.node.append(oh.make_node(
-        "Split", [sel, "split111"], [b_col, c_col, a_col],
-        axis=1, name="SplitIdx"))
+        "NonMaxSuppression",
+        [nms_boxes, nms_scores,
+         "nms_max_det", "nms_iou_th", "nms_score_th"],
+        [sel], name="nms_NMS"))
+
+    # split indices (batch , class , anchor)
+    g.initializer.extend([
+        oh.make_tensor("nms_split111", TP.INT64, [3], [1, 1, 1]),
+    ])
+    b_col, c_col, a_col = "nms_b", "nms_c", "nms_a"
+    g.node.append(oh.make_node(
+        "Split", [sel, "nms_split111"], [b_col, c_col, a_col],
+        axis=1, name="nms_SplitSel"))
 
     # squeeze to 1-D
     b_idx, cls_idx, anc_idx = "batch_idx", "class_idx", "anchor_idx"
     for src, dst in [(b_col, b_idx), (c_col, cls_idx), (a_col, anc_idx)]:
         g.node.append(oh.make_node(
-            "Squeeze", [src, "axis1"], [dst], name=f"Squeeze_{dst}"))
+            "Squeeze", [src, "nms_axis1"], [dst],
+            name=f"nms_Squeeze_{dst}"))
 
-    # ───────── GatherND helpers ─────────
-    b_u, a_u, cls_u = b_idx + "_u", anc_idx + "_u", cls_idx + "_u"
-    g.node.extend([
-        oh.make_node("Unsqueeze", [b_idx,  "axis1"], [b_u],  name="UnsqB"),
-        oh.make_node("Unsqueeze", [anc_idx,"axis1"], [a_u],  name="UnsqA"),
-        oh.make_node("Unsqueeze", [cls_idx,"axis1"], [cls_u],name="UnsqC"),
-    ])
-
-    # boxes: GatherND(raw_boxes, [batch, anchor])
-    idx_boxes = "idx_boxes"
+    # ───── gather det_boxes  (batch_dims=1, indices=[anchor]) ─────
+    a_unsq = "nms_a_unsq"
     g.node.append(oh.make_node(
-        "Concat", [b_u, a_u], [idx_boxes], axis=1,
-        name="IdxBoxes"))
+        "Unsqueeze", [anc_idx, "nms_axis1"], [a_unsq],
+        name="nms_UnsqAnchor"))
+
     det_boxes = "det_boxes"
     g.node.append(oh.make_node(
-        "GatherND", [boxes3d, idx_boxes], [det_boxes],
-        name="GatherBoxes"))
+        "GatherND", [nms_boxes, a_unsq], [det_boxes],
+        batch_dims=1, name="nms_GatherDetBoxes"))
 
-    # scores: GatherND(scores_bca, [batch, class, anchor])
-    idx_scores = "idx_scores"
+    # ───── gather det_scores  (batch_dims=1, indices=[class,anchor]) ─────
+    cls_unsq = "nms_cls_unsq"
     g.node.append(oh.make_node(
-        "Concat", [b_u, cls_u, a_u], [idx_scores], axis=1,
-        name="IdxScores"))
+        "Unsqueeze", [cls_idx, "nms_axis1"], [cls_unsq],
+        name="nms_UnsqClass"))
+
+    idx_scores = "nms_idx_scores"                 # [N , 2]
+    g.node.append(oh.make_node(
+        "Concat", [cls_unsq, a_unsq], [idx_scores],
+        axis=1, name="nms_CatClassAnchor"))
+
     det_scores = "det_scores"
     g.node.append(oh.make_node(
-        "GatherND", [scores_bca, idx_scores], [det_scores],
-        name="GatherScores"))
+        "GatherND", [nms_scores, idx_scores], [det_scores],
+        batch_dims=1, name="nms_GatherDetScores"))
 
-    # ───────── declare final graph outputs ─────────
-    del g.output[:]   # clear any existing outputs
+    # ───────── declare final outputs ─────────
+    del g.output[:]   # remove existing outputs
     g.output.extend([
         oh.make_tensor_value_info(det_boxes,  TP.FLOAT, ['N', 4]),
         oh.make_tensor_value_info(det_scores, TP.FLOAT, ['N']),
@@ -1132,7 +1154,6 @@ def append_nms_to_onnx(
     onnx.checker.check_model(m)
     onnx.save(m, out_path)
     print(f"[SAVE] Final ONNX with NMS → {out_path}")
-
 
 def save_intermediate_onnx(qat_model, cfg, model):
     # --- Convert QAT model to INT8 ---
@@ -1188,16 +1209,18 @@ def main(argv: List[str] | None = None):
     pa = argparse.ArgumentParser()
     pa.add_argument('--coco_root', default='coco')
     pa.add_argument('--arch', choices=['mnv3', 'mnv4s', 'mnv4m'], default='mnv3')
-    pa.add_argument('--epochs', type=int, default=70) 
+    pa.add_argument('--epochs', type=int, default=10) 
     pa.add_argument('--batch', type=int, default=16)
     pa.add_argument('--workers', type=int, default=0)
     pa.add_argument('--device', default=None)
     pa.add_argument('--out', default='picodet_int8.onnx')
-    pa.add_argument('--no_inplace_head_neck', action='store_true', help="Disable inplace activations in head/neck")
+    pa.add_argument('--no_inplace_head_neck', default=True, action='store_true', help="Disable inplace activations in head/neck")
     cfg = pa.parse_args(argv)
 
     TRAIN_SUBSET = 70000
     VAL_SUBSET   = 2000
+    debug_prints = True
+    BACKBONE_FREEZE_EPOCHS = 2 if cfg.epochs < 12 else 3  # 0 to disable
 
     if cfg.device is None:
         cfg.device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -1335,10 +1358,10 @@ def main(argv: List[str] | None = None):
     
     assigner = SimOTACache(
         nc=model.head.nc,
-        ctr=2.0,  # 2.5
+        ctr=2.5,  # 2.5
         topk=15,  # 10
         cls_cost_weight=0.5,
-        debug_epochs=5,
+        debug_epochs=5 if debug_prints else 0,
     )
 
 
@@ -1350,7 +1373,6 @@ def main(argv: List[str] | None = None):
 
     # ... (FP32 training loop) ...
     for ep in range(cfg.epochs):
-        BACKBONE_FREEZE_EPOCHS = 2  # 0 to disable
         if ep == 0:
             for p in model.backbone.parameters():
                 p.requires_grad = False
@@ -1368,7 +1390,8 @@ def main(argv: List[str] | None = None):
             head_reg_max_for_loss=original_model_head_reg_max,
             dfl_project_buffer_for_decode=original_dfl_project_buffer,
             max_epochs=cfg.epochs, # Pass total epochs for VFL alpha scheduling
-            quality_floor_vfl=0.2  # Example, tune as needed
+            quality_floor_vfl=0.2,  # Example, tune as needed
+            debug_prints=debug_prints,
         )
         # ... (validation) ...
         model.eval() 
@@ -1378,6 +1401,7 @@ def main(argv: List[str] | None = None):
             iou_thresh=model.head.iou_th,
             max_detections=model.head.max_det,
             epoch_num=ep, run_name="in epoch",
+            debug_prints=debug_prints,
         )
         for param_group in opt.param_groups:
             current_lr = param_group['lr']
@@ -1394,7 +1418,9 @@ def main(argv: List[str] | None = None):
                                iou_thresh=model.head.iou_th, # Or your chosen NMS IoU
                                max_detections=model.head.max_det,
                                epoch_num=ep, # If in training loop
-                               run_name="score_thresh_0.05")
+                               run_name="score_thresh_0.05",
+                               debug_prints=debug_prints,
+                               )
         print(f"[INFO] Validation IoU (score_th=0.05): {iou_05:.4f}")
         
         # Run for score_thresh = 0.25
@@ -1403,7 +1429,9 @@ def main(argv: List[str] | None = None):
                                iou_thresh=model.head.iou_th,
                                max_detections=model.head.max_det,
                                epoch_num=ep,
-                               run_name="score_thresh_0.25")
+                               run_name="score_thresh_0.25",
+                               debug_prints=debug_prints,
+                               )
         print(f"[INFO] Validation IoU (score_th=0.25): {iou_25:.4f}")
     except Exception as e:
         print(repr(e))
@@ -1461,6 +1489,7 @@ def main(argv: List[str] | None = None):
             max_epochs=qat_epochs, # For VFL alpha scheduling (relative to QAT duration)
             quality_floor_vfl=0.2,
             iou_weight_change_epoch=2,
+            debug_prints=debug_prints,
         )
         scheduler_q.step() # Step the QAT LR scheduler
 
@@ -1487,7 +1516,8 @@ def main(argv: List[str] | None = None):
                                    iou_thresh=model.head.iou_th,
                                    max_detections=model.head.max_det,
                                    epoch_num=qep, # Pass QAT epoch number
-                                   run_name=f"QAT_ep{qep+1}_score0.05"
+                                   run_name=f"QAT_ep{qep+1}_score0.05",
+                                   debug_prints=debug_prints,
                                 )
             print(f"[QAT Eval] Epoch {qep + 1}/{qat_epochs} Val IoU (score_th=0.05): {current_qat_val_iou:.4f}")
 
@@ -1511,108 +1541,112 @@ def main(argv: List[str] | None = None):
     if final_exportable_int8_model is None:
         final_exportable_int8_model, int8_model_with_preprocessor, actual_onnx_input_example, temp_onnx_path = save_intermediate_onnx(qat_model, cfg, model)
 
-    # DEBUG: Inspect intermediate ONNX model outputs
-    intermediate_model_check = onnx.load(temp_onnx_path)
-    print("[DEBUG] Intermediate ONNX model input ValueInfo:")
-    for input_vi in intermediate_model_check.graph.input:
-        # ... (same detailed print logic as for outputs) ...
-        if hasattr(input_vi.type, 'tensor_type'):
-            tensor_type = input_vi.type.tensor_type
-            elem_type = tensor_type.elem_type
-            shape_dims = [str(d.dim_value) if d.dim_value else d.dim_param for d in tensor_type.shape.dim]
-            print(f"  Name: {input_vi.name}, Type: tensor({onnx.TensorProto.DataType.Name(elem_type)}), Shape: {shape_dims}")
-        else:
-            print(f"  Name: {input_vi.name}, Type (raw): {input_vi.type.WhichOneof('value')}")
-
-
-    print("[DEBUG] Intermediate ONNX model output ValueInfo:")
-    for output_vi in intermediate_model_check.graph.output:
-        if hasattr(output_vi.type, 'tensor_type'):
-            tensor_type = output_vi.type.tensor_type
-            elem_type = tensor_type.elem_type
-            shape_dims = [str(d.dim_value) if d.dim_value else d.dim_param for d in tensor_type.shape.dim]
-            print(f"  Name: {output_vi.name}, Type: tensor({onnx.TensorProto.DataType.Name(elem_type)}), Shape: {shape_dims}")
-        elif hasattr(output_vi.type, 'sequence_type'):
-            seq_type = output_vi.type.sequence_type
-            if hasattr(seq_type.elem_type, 'tensor_type'):
-                tensor_type = seq_type.elem_type.tensor_type
+    if debug_prints:
+        # DEBUG: Inspect intermediate ONNX model outputs
+        intermediate_model_check = onnx.load(temp_onnx_path)
+        print("[DEBUG] Intermediate ONNX model input ValueInfo:")
+        for input_vi in intermediate_model_check.graph.input:
+            # ... (same detailed print logic as for outputs) ...
+            if hasattr(input_vi.type, 'tensor_type'):
+                tensor_type = input_vi.type.tensor_type
                 elem_type = tensor_type.elem_type
                 shape_dims = [str(d.dim_value) if d.dim_value else d.dim_param for d in tensor_type.shape.dim]
-                print(f"  Name: {output_vi.name}, Type: seq(tensor({onnx.TensorProto.DataType.Name(elem_type)})), Shape_of_elem: {shape_dims}")
+                print(f"  Name: {input_vi.name}, Type: tensor({onnx.TensorProto.DataType.Name(elem_type)}), Shape: {shape_dims}")
             else:
-                print(f"  Name: {output_vi.name}, Type: seq(<unknown_elem_type>)")
-        else:
-            print(f"  Name: {output_vi.name}, Type (raw int): {output_vi.type.WhichOneof('value')}")
-
-    print("[DEBUG] Running PyTorch forward pass on int8_model_with_preprocessor...")
-    try:
-        # Ensure model is on CPU for this test if actual_onnx_input_example is on CPU
-        int8_model_with_preprocessor.cpu().eval() # Ensure CPU and eval
-        actual_onnx_input_example_cpu = actual_onnx_input_example.cpu()
-
-        py_outputs = int8_model_with_preprocessor(actual_onnx_input_example_cpu) # Call it
-
-        print(f"  [PyTorch Output] Type of py_outputs: {type(py_outputs)}")
-        if isinstance(py_outputs, (tuple, list)):
-            print(f"  [PyTorch Output] Number of elements: {len(py_outputs)}")
-            for i, item in enumerate(py_outputs):
-                print(f"    Element {i}: Type={type(item)}")
-                if isinstance(item, torch.Tensor):
-                    print(f"      Shape={item.shape}, Dtype={item.dtype}")
-                elif isinstance(item, (list, tuple)):
-                     print(f"      (Nested list/tuple) Length={len(item)}")
-
-        elif isinstance(py_outputs, torch.Tensor):
-             print(f"  [PyTorch Output] (Single Tensor) Shape={py_outputs.shape}, Dtype={py_outputs.dtype}")
-        else:
-            print(f"  [PyTorch Output] Unexpected output type: {type(py_outputs)}")
-
-    except Exception as e:
-        print(f"  [PyTorch Output] Error during PyTorch forward: {e}")
-        traceback.print_exc()
+                print(f"  Name: {input_vi.name}, Type (raw): {input_vi.type.WhichOneof('value')}")
     
-    print("[DEBUG] Inspecting output of int8_model_with_preprocessor directly...")
-    int8_model_with_preprocessor.cpu().eval() # Ensure it's on CPU and eval
-    dummy_input_for_inspection = actual_onnx_input_example.cpu() # Or generate a new one
     
-    try:
-        core_model_outputs = int8_model_with_preprocessor(dummy_input_for_inspection)
-        print(f"  [Core Model Output] Type: {type(core_model_outputs)}")
-        if isinstance(core_model_outputs, tuple):
-            print(f"  [Core Model Output] Number of elements: {len(core_model_outputs)}")
-            for i, item in enumerate(core_model_outputs):
-                if isinstance(item, torch.Tensor):
-                    print(f"    Element {i}: Shape={item.shape}, Dtype={item.dtype}")
+        print("[DEBUG] Intermediate ONNX model output ValueInfo:")
+        for output_vi in intermediate_model_check.graph.output:
+            if hasattr(output_vi.type, 'tensor_type'):
+                tensor_type = output_vi.type.tensor_type
+                elem_type = tensor_type.elem_type
+                shape_dims = [str(d.dim_value) if d.dim_value else d.dim_param for d in tensor_type.shape.dim]
+                print(f"  Name: {output_vi.name}, Type: tensor({onnx.TensorProto.DataType.Name(elem_type)}), Shape: {shape_dims}")
+            elif hasattr(output_vi.type, 'sequence_type'):
+                seq_type = output_vi.type.sequence_type
+                if hasattr(seq_type.elem_type, 'tensor_type'):
+                    tensor_type = seq_type.elem_type.tensor_type
+                    elem_type = tensor_type.elem_type
+                    shape_dims = [str(d.dim_value) if d.dim_value else d.dim_param for d in tensor_type.shape.dim]
+                    print(f"  Name: {output_vi.name}, Type: seq(tensor({onnx.TensorProto.DataType.Name(elem_type)})), Shape_of_elem: {shape_dims}")
                 else:
+                    print(f"  Name: {output_vi.name}, Type: seq(<unknown_elem_type>)")
+            else:
+                print(f"  Name: {output_vi.name}, Type (raw int): {output_vi.type.WhichOneof('value')}")
+    
+        print("[DEBUG] Running PyTorch forward pass on int8_model_with_preprocessor...")
+        try:
+            # Ensure model is on CPU for this test if actual_onnx_input_example is on CPU
+            int8_model_with_preprocessor.cpu().eval() # Ensure CPU and eval
+            actual_onnx_input_example_cpu = actual_onnx_input_example.cpu()
+    
+            py_outputs = int8_model_with_preprocessor(actual_onnx_input_example_cpu) # Call it
+    
+            print(f"  [PyTorch Output] Type of py_outputs: {type(py_outputs)}")
+            if isinstance(py_outputs, (tuple, list)):
+                print(f"  [PyTorch Output] Number of elements: {len(py_outputs)}")
+                for i, item in enumerate(py_outputs):
                     print(f"    Element {i}: Type={type(item)}")
-        elif isinstance(core_model_outputs, torch.Tensor):
-            print(f"  [Core Model Output] (Single Tensor) Shape={core_model_outputs.shape}, Dtype={core_model_outputs.dtype}")
-        else:
-            print(f"  [Core Model Output] Unexpected output type: {type(core_model_outputs)}")
-    except Exception as e:
-        print(f"  [Core Model Output] Error during direct call: {e}")
-        import traceback
-        traceback.print_exc()
-
-
-    print("[DEBUG] Running PyTorch forward pass on final_exportable_int8_model...")
-    try:
-        py_outputs_final_exportable = final_exportable_int8_model(actual_onnx_input_example.cpu())
-        print(f"  [PyTorch Final Exportable Output] Type: {type(py_outputs_final_exportable)}")
-        if isinstance(py_outputs_final_exportable, tuple) and len(py_outputs_final_exportable) == 2:
-            print(f"    raw_boxes shape: {py_outputs_final_exportable[0].shape}, dtype: {py_outputs_final_exportable[0].dtype}")
-            print(f"    raw_scores shape: {py_outputs_final_exportable[1].shape}, dtype: {py_outputs_final_exportable[1].dtype}")
-        else:
-            print("    Unexpected output structure from final_exportable_int8_model.")
-    except Exception as e:
-        print(f"  [PyTorch Final Exportable Output] Error during PyTorch forward: {e}")
-        import traceback
-        traceback.print_exc()
+                    if isinstance(item, torch.Tensor):
+                        print(f"      Shape={item.shape}, Dtype={item.dtype}")
+                    elif isinstance(item, (list, tuple)):
+                         print(f"      (Nested list/tuple) Length={len(item)}")
+    
+            elif isinstance(py_outputs, torch.Tensor):
+                 print(f"  [PyTorch Output] (Single Tensor) Shape={py_outputs.shape}, Dtype={py_outputs.dtype}")
+            else:
+                print(f"  [PyTorch Output] Unexpected output type: {type(py_outputs)}")
+    
+        except Exception as e:
+            print(f"  [PyTorch Output] Error during PyTorch forward: {e}")
+            traceback.print_exc()
+        
+        print("[DEBUG] Inspecting output of int8_model_with_preprocessor directly...")
+        int8_model_with_preprocessor.cpu().eval() # Ensure it's on CPU and eval
+        dummy_input_for_inspection = actual_onnx_input_example.cpu() # Or generate a new one
+        
+        try:
+            core_model_outputs = int8_model_with_preprocessor(dummy_input_for_inspection)
+            print(f"  [Core Model Output] Type: {type(core_model_outputs)}")
+            if isinstance(core_model_outputs, tuple):
+                print(f"  [Core Model Output] Number of elements: {len(core_model_outputs)}")
+                for i, item in enumerate(core_model_outputs):
+                    if isinstance(item, torch.Tensor):
+                        print(f"    Element {i}: Shape={item.shape}, Dtype={item.dtype}")
+                    else:
+                        print(f"    Element {i}: Type={type(item)}")
+            elif isinstance(core_model_outputs, torch.Tensor):
+                print(f"  [Core Model Output] (Single Tensor) Shape={core_model_outputs.shape}, Dtype={core_model_outputs.dtype}")
+            else:
+                print(f"  [Core Model Output] Unexpected output type: {type(core_model_outputs)}")
+        except Exception as e:
+            print(f"  [Core Model Output] Error during direct call: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    
+        print("[DEBUG] Running PyTorch forward pass on final_exportable_int8_model...")
+        try:
+            py_outputs_final_exportable = final_exportable_int8_model(actual_onnx_input_example.cpu())
+            print(f"  [PyTorch Final Exportable Output] Type: {type(py_outputs_final_exportable)}")
+            if isinstance(py_outputs_final_exportable, tuple) and len(py_outputs_final_exportable) == 2:
+                print(f"    raw_boxes shape: {py_outputs_final_exportable[0].shape}, dtype: {py_outputs_final_exportable[0].dtype}")
+                print(f"    raw_scores shape: {py_outputs_final_exportable[1].shape}, dtype: {py_outputs_final_exportable[1].dtype}")
+            else:
+                print("    Unexpected output structure from final_exportable_int8_model.")
+        except Exception as e:
+            print(f"  [PyTorch Final Exportable Output] Error during PyTorch forward: {e}")
+            import traceback
+            traceback.print_exc()
 
     # ---------------- Append NMS to the ONNX model ------------------------------
+    out_dest = cfg.out
+    # out_dest = "picodet_int8.onnx"
+    # temp_onnx_path = "picodet_int8_temp_no_nms.onnx"
     append_nms_to_onnx(
         in_path=temp_onnx_path,
-        out_path=cfg.out,
+        out_path=out_dest,
         score_thresh=float(model.head.score_th), # 0.05
         iou_thresh=float(model.head.iou_th),  # 0.6
         max_det=int(model.head.max_det),  # 100

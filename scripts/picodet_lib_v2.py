@@ -13,10 +13,13 @@ import timm
 # ───────────────────────────── layers ──────────────────────────────
 class GhostConv(nn.Module):
     def __init__(
-            self, c_in: int, c_out: int,
-            k: int = 1, s: int = 1,
-            dw_size: int = 3,  # dw_size 3, 5
-            ratio: int = 2,  # can set to 1.5 for faster
+            self,
+            c_in: int,
+            c_out: int,
+            k: int = 1,
+            s: int = 1,
+            dw_size: int = 3,  # dw_size 5 is maybe a bit slower but more accurate than 3
+            ratio: int = 2,  # 1.5 generally slower, maybe more accurate, 3.0 faster, maybe less accurate
             inplace_act: bool = False
          ):
         super().__init__()
@@ -61,12 +64,24 @@ class DWConv5x5(nn.Module):  # might be worth parameterizing to allow a 3x3 opti
     def forward(self, x):
         return self.act(self.bn(self.dw(x)))
 
+class DWConv(nn.Module):
+    def __init__(
+            self, c: int, k: int = 5,  # k=5 for 5x5, 3 for 3x3
+            inplace_act: bool = False
+    ):
+        super().__init__()
+        self.dw = nn.Conv2d(c, c, k, 1, k // 2, groups=c, bias=False)
+        self.bn = nn.BatchNorm2d(c)
+        self.act = nn.ReLU6(inplace=inplace_act)
+
+    def forward(self, x): return self.act(self.bn(self.dw(x)))
+
 class CSPBlock(nn.Module):
-    def __init__(self, c: int, n: int = 1, inplace_act: bool = False):
+    def __init__(self, c: int, n: int = 1, m_k: int = 1, inplace_act: bool = False):
         super().__init__()
         self.cv1 = GhostConv(c, c // 2, 1, inplace_act=inplace_act)
         self.cv2 = GhostConv(c, c // 2, 1, inplace_act=inplace_act)
-        self.m = nn.Sequential(*[GhostConv(c // 2, c // 2, inplace_act=inplace_act) for _ in range(n)])
+        self.m = nn.Sequential(*[GhostConv(c // 2, c // 2, k=m_k, inplace_act=inplace_act) for _ in range(n)])
         self.cv3 = GhostConv(c, c, 1, inplace_act=inplace_act)
 
     def forward(self, x):
@@ -77,8 +92,12 @@ class CSPPAN(nn.Module):
     def __init__(self, in_chs=(40, 112, 160), out_ch=96, inplace_act: bool = False): # out_ch=64 would be faster than 96
         super().__init__()
         self.reduce = nn.ModuleList([GhostConv(c, out_ch, 1, inplace_act=inplace_act) for c in in_chs])
-        self.lat    = nn.ModuleList([DWConv5x5(out_ch, inplace_act=inplace_act) for _ in in_chs[:-1]])
-        self.out    = nn.ModuleList([CSPBlock(out_ch, inplace_act=inplace_act)  for _ in in_chs])
+        self.lat    = nn.ModuleList([DWConv(out_ch, k=5, inplace_act=inplace_act) for _ in in_chs[:-1]])
+        # self.out    = nn.ModuleList([CSPBlock(out_ch, inplace_act=inplace_act)  for _ in in_chs])
+        lst_ly = len(in_chs) - 1
+        self.out = nn.ModuleList([
+            CSPBlock(out_ch, n=2 if i == lst_ly else 1, m_k = 3 if i == lst_ly else 1, inplace_act=inplace_act) for i in range(len(in_chs))
+        ])
 
     def forward(self, c3, c4, c5):
         # top-down ------------------------------------------------------------
@@ -163,15 +182,24 @@ class PicoDetHead(nn.Module):
         self.max_det = max_det # Store for use in ONNX NMS construction
         self.score_th = score_thresh
         self.iou_th = nms_iou
-        
+        self.reg_conv_depth = 2
+        self.cls_conv_depth = 3  # 2
+        first_cls_conv_k = 3  # 1
+
         strides_tensor = torch.tensor([8, 16, 32][:num_levels], dtype=torch.float32)
         self.register_buffer('strides_buffer', strides_tensor, persistent=False)
         
         dfl_project_tensor = torch.arange(self.reg_max + 1, dtype=torch.float32)
         self.register_buffer('dfl_project_buffer', dfl_project_tensor, persistent=False)
 
-        self.cls_conv = nn.Sequential(*[GhostConv(num_feats, num_feats, inplace_act=inplace_act) for _ in range(2)])
-        self.reg_conv = nn.Sequential(*[GhostConv(num_feats, num_feats, inplace_act=inplace_act) for _ in range(2)])
+        if self.cls_conv_depth <= 1:
+            self.cls_conv = nn.Sequential(GhostConv(num_feats, num_feats, k=first_cls_conv_k, inplace_act=inplace_act) for _ in range(self.cls_conv_depth))
+        else:
+            self.cls_conv = nn.Sequential(
+                GhostConv(num_feats, num_feats, k=first_cls_conv_k, inplace_act=inplace_act),
+                *[GhostConv(num_feats, num_feats, inplace_act=inplace_act) for _ in range(self.cls_conv_depth - 1)]
+            )
+        self.reg_conv = nn.Sequential(*[GhostConv(num_feats, num_feats, inplace_act=inplace_act) for _ in range(self.reg_conv_depth)])
         self.cls_pred = nn.ModuleList([nn.Conv2d(num_feats, self.nc, 1) for _ in range(self.nl)])
         self.obj_pred = nn.ModuleList([nn.Conv2d(num_feats, 1, 1) for _ in range(self.nl)])
         self.reg_pred = nn.ModuleList(
@@ -369,14 +397,6 @@ class ResizeNorm(nn.Module):
 
 
 # ───────────────────────── backbone util ──────────────────────────
-@torch.no_grad()
-def _dummy_out_chs(model: nn.Module, feat_nodes: List[str]):
-    model.eval()
-    x = torch.randn(1, 3, 224, 224)
-    out = model(x)
-    return tuple(out[n].shape[1] for n in feat_nodes)
-
-
 # Helper to wrap torchvision's create_feature_extractor to output a list
 class TVExtractorWrapper(nn.Module):
     def __init__(self, base_model: nn.Module, return_nodes_dict: dict):
@@ -511,7 +531,7 @@ def get_backbone(arch: str, ckpt: str | None, img_size: int = 224):
     
 # Convenience export
 __all__ = [
-    'GhostConv', 'DWConv5x5', 'CSPBlock', 'CSPPAN',
+    'GhostConv', 'DWConv', 'CSPBlock', 'CSPPAN',
     'VarifocalLoss', 'dfl_loss', 'build_dfl_targets',
     'PicoDetHead', 'ResizeNorm', 'get_backbone', 'PicoDet'
 ]
