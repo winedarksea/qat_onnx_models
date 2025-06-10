@@ -212,7 +212,7 @@ def inspect_onnx_graph(onnx_model_path):
 
 # ───────────────────────────── main ─────────────────────────────
 # onnx_path = "mobilenet_w1_0_mnv3_pretrained_int8_fullpipe.onnx"
-onnx_path = "mobilenet_w1_0_mnv4s_pretrained_drp0_2_qat_int8.onnx"
+onnx_path = "mobilenet_w1_0_mnv4s_pretrained_drp0_2_qat_fp32_dynamo.onnx"
 data_dir = "filtered_imagenet2_native" # Make sure this path is correct
 batch = 1 # Keep batch=1 for per-image timing, but can increase for throughput tests
 provider = "CPUExecutionProvider"  # CPUExecutionProvider, CUDAExecutionProvider

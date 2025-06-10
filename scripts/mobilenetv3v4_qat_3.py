@@ -351,15 +351,15 @@ def evaluate(model, loader, dev):
 
 # --- Main script execution ---
 data_dir: str = "filtered_imagenet2_native" # Example, replace with your actual path
-epochs: int = 75
-qat_epochs: int = 2
+epochs: int = 750
+qat_epochs: int = 10
 batch: int = 64
 lr: float = 0.025
 qat_lr_factor: float = 0.05
 width_mult: float = 1.0
 device_arg = None
 compile_model: bool = False
-arch: str = "mnv3l" # Change to "mnv2", "mnv3", "mnv3l", "mnv4s", "mnv4m" as needed
+arch: str = "mnv4s" # Change to "mnv2", "mnv3", "mnv3l", "mnv4s", "mnv4m" as needed
 pretrained: bool = True # Using pretrained weights for FP32 start
 drop_rate: float = 0.2
 
@@ -817,5 +817,61 @@ except Exception as e:
     import traceback
     traceback.print_exc()
     # exit()
+
+try:
+    from torch.ao.quantization import get_default_qconfig_mapping
+    from torch.ao.quantization.backend_config import get_native_backend_config
+    from torch.ao.quantization.quantize_fx import prepare_fx, convert_fx
+    
+    import torch.nn.functional as F
+    
+    # Step 1: Patch dropout to no-op for tracing during prepare_fx
+    _original_dropout = F.dropout
+    F.dropout = lambda x, *args, **kwargs: x  # Patch it to be identity
+    
+    # Step 2: Create CPU + eval copy of the FP32 model
+    fp32_model_for_ptq = copy.deepcopy(model).cpu().eval()
+    
+    # Step 3: Define input and configs
+    example_input = (torch.randint(0, 256, (1, 3, IMG_SIZE, IMG_SIZE), dtype=torch.uint8),)
+    qconfig_mapping = get_default_qconfig_mapping("x86")  # or 'qnnpack' for ARM/mobile
+    backend_config = get_native_backend_config()
+    
+    # Step 4: Prepare for quantization (tracing will now succeed)
+    prepared_model = prepare_fx(
+        fp32_model_for_ptq,
+        qconfig_mapping=qconfig_mapping,
+        example_inputs=example_input,
+        backend_config=backend_config
+    )
+    
+    # Step 5: Restore original dropout
+    F.dropout = _original_dropout
+    print("[INFO] Restored F.dropout after prepare_fx.")
+
+    # Use a subset of validation data for calibration
+    prepared_model.eval()
+    with torch.inference_mode():
+        for i, (images, _) in enumerate(vl):  # `vl` is the val DataLoader
+            if i >= 50: break  # 50 batches for calibration
+            prepared_model(images.to(torch.uint8))
+    int8_ptq_model = convert_fx(prepared_model, backend_config=backend_config)
+    # ONNX export dummy input
+    dummy_input = (torch.randint(0, 256, (1, 3, IMG_SIZE, IMG_SIZE), dtype=torch.uint8),)
+    
+    torch.onnx.export(
+        int8_ptq_model,
+        dummy_input,
+        output_base_name + "fp32_model_ptq_int8.onnx",
+        input_names=["input_u8"],
+        output_names=["logits"],
+        dynamic_axes={"input_u8": {0: "batch", 2: "height", 3: "width"}, "logits": {0: "batch"}},
+        opset_version=18,
+        do_constant_folding=True
+    )
+    print("[SAVE] Exported static PTQ INT8 ONNX model → fp32_model_ptq_int8.onnx")
+
+except Exception as e:
+    print(repr(e))
 
 print("[DONE]")
