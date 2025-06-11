@@ -1,4 +1,5 @@
 # train_picodet_qat.py – minimal pipeline: COCO ➜ FP32 ➜ QAT ➜ INT8 ➜ ONNX (with NMS)
+# built on pytorch version 2.7
 from __future__ import annotations
 import argparse, random, time, warnings, math, copy
 from typing import List, Tuple
@@ -17,6 +18,8 @@ import torch.nn.functional as F
 import onnx
 from onnx import TensorProto as TP, helper as oh
 
+from pycocotools.coco import COCO
+
 try: 
     from picodet_lib_v2 import (
         PicoDet, get_backbone, VarifocalLoss, dfl_loss,
@@ -31,6 +34,28 @@ SEED = 42; random.seed(SEED); torch.manual_seed(SEED)
 IMG_SIZE = 256  # also subset for speed, 224, PicoDet’s anchors assume stride-divisible sizes. Divisible by 32
 
 # ───────────────────── data & transforms ───────────────────────
+# COCO’s official 80-class list (order matters!)
+CANONICAL_COCO80_IDS: list[int] = [
+     1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 13, 14, 15, 16, 17,
+    18, 19, 20, 21, 22, 23, 24, 25, 27, 28, 31, 32, 33, 34, 35, 36,
+    37, 38, 39, 40, 41, 42, 43, 44, 46, 47, 48, 49, 50, 51, 52, 53,
+    54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 67, 70, 72, 73,
+    74, 75, 76, 77, 78, 79, 80, 81, 82, 84, 85, 86, 87, 88, 89, 90,
+]
+
+# { COCO-category-id  →  contiguous-id 0-79 }
+CANONICAL_COCO80_MAP: dict[int, int] = {
+    coco_id: i for i, coco_id in enumerate(CANONICAL_COCO80_IDS)
+}
+
+# (optional) contiguous-id → class-name  helper
+def contiguous_id_to_name(coco_api: COCO) -> dict[int, str]:
+    """Return {0-79 → class-name} using the official 80-class list."""
+    return {
+        i: coco_api.loadCats([coco_id])[0]["name"]
+        for i, coco_id in enumerate(CANONICAL_COCO80_IDS)
+    }
+
 # ---------- contiguous label map ----------
 def build_coco_label_map(coco):
     cat_ids = sorted(coco.getCatIds())                 # 1 … 90,92,93…
@@ -80,8 +105,7 @@ def build_transforms(size, train):
     aug = [
         T.ToImage(),                                 # PIL → tv_tensors.Image
         T.RandomHorizontalFlip(0.25) if train else T.Identity(),
-        T.RandomResizedCrop(size, scale=(0.8, 1.0), antialias=True)
-            if train else T.Resize(size, antialias=True),
+        T.RandomResizedCrop(size, scale=(0.8, 1.0), antialias=True) if train else T.Resize(size, antialias=True),
         T.ColorJitter(0.2, 0.2, 0.2, 0.1) if train else T.Identity(),
         T.ToDtype(torch.uint8, scale=True),          # keep uint8, model normalises
     ]
@@ -109,7 +133,9 @@ class SimOTACache:
         # debug
         self._dbg_mod  = debug_epochs
         self._dbg_iter = 0
-        self.use_obj_logit = True 
+        self.use_obj_logit = True
+        self.simota_prefilter = False
+        self.dynamic_k_min = 2  # 3, or 1-2
 
     # ------------------------------------------------------------
     #  main call
@@ -117,7 +143,7 @@ class SimOTACache:
     @torch.no_grad()
     def __call__(self,
                  f_shapes,               # List[(H,W,stride)]
-                 device: torch.device,
+                 device: torch.device,  # Use a consistent device key string in order to avoid a cache miss
                  tgt: dict,              # {"boxes":(M,4), "labels":(M,)}
                  cls_logits: torch.Tensor, # Raw class logits (A, C) from model
                  obj_logits: torch.Tensor | None = None,
@@ -165,11 +191,21 @@ class SimOTACache:
         dist = (anchor_centers.unsqueeze(1)
                 - gt_centres.unsqueeze(0)).abs().max(dim=-1).values   # (A,M)
         centre_mask = dist < (self.r * anchor_strides.unsqueeze(1))   # (A,M)
+        # add inside mask filter
+        if self.simota_prefilter:
+            inside_mask = (
+                (anchor_centers[:, 0].unsqueeze(1) >= gt_boxes[:, 0]) &
+                (anchor_centers[:, 0].unsqueeze(1) <= gt_boxes[:, 2]) &
+                (anchor_centers[:, 1].unsqueeze(1) >= gt_boxes[:, 1]) &
+                (anchor_centers[:, 1].unsqueeze(1) <= gt_boxes[:, 3])
+            )                                                            # (A, M)
+            
+            centre_mask = centre_mask & inside_mask   # keep only anchors whose centre lies inside bbox
 
         # 3. dynamic-k candidates
         iou_sum_per_gt = iou.sum(1)
         dynamic_ks = torch.clamp(iou_sum_per_gt.ceil().int(),  # ceil not floor
-                                 min=3, max=self.k)
+                                 min=self.dynamic_k_min, max=self.k)
         fg_cand_mask = torch.zeros(A, dtype=torch.bool, device=device)
 
         for g in range(M):
@@ -185,34 +221,39 @@ class SimOTACache:
         # cost_cls = (self.cls_cost_weight * torch.ones_like(cost_loc) if (self.cls_cost_weight > 0 and self.nc > 1) else 0)
         # ---- new classification cost -----------------------------------------
         # Turn logits → probability *for the GT class only*.
-        #   cls_logits : (A, nc)    gt_labels : (M,)
-        # We build a (M, A) matrix where each row g uses P(anchor, class=gt_g)
-        p_cls = cls_logits.sigmoid()                        # (A, nc)
+        #   cls_logits : (A, nc) raw class logits
+        #   obj_logits : (A,) raw objectness logits (if provided)
+        #   gt_labels : (M,)
+        # We build a (M, A) matrix where each row g uses P_joint(anchor, class=gt_g)
         
-        # Gather once to avoid an inner loop:
-        #   idx tensor shape (M, A, 2)  where [:, :, 0] = anchor-idx,
-        #                                [:, :, 1] = class-idx
-        anchor_idx = torch.arange(p_cls.size(0), device=device).view(1, -1).repeat(gt_labels.size(0), 1)
-        class_idx  = gt_labels.view(-1, 1).repeat(1, p_cls.size(0))
-        p_mat      = p_cls[anchor_idx, class_idx]          # (M, A)
+        eps = 1e-8 # Define eps here if not already in scope
+
+        # Get raw class logits for the GT class of each GT object, for every anchor
+        # cls_logits is (A, C) raw logits. gt_labels is (M,).
+        # logit_cls_gt will be (M, A)
+        num_anchors_total = cls_logits.size(0)
+        idx_anchor_dim = torch.arange(num_anchors_total, device=device).unsqueeze(0).repeat(M, 1) # Shape (M, A)
+        idx_class_dim = gt_labels.unsqueeze(1).repeat(1, num_anchors_total) # Shape (M, A)
+        logit_cls_gt = cls_logits[idx_anchor_dim, idx_class_dim] # Shape (M, A)
+
+        cost_values_for_cls_term = torch.zeros((M, A), device=device, dtype=cls_logits.dtype)
+
+        if self.use_obj_logit and obj_logits is not None:
+            # obj_logits is (A,), unsqueeze to (1,A) for broadcasting with (M,A) logit_cls_gt
+            obj_logits_expanded = obj_logits.unsqueeze(0) # Shape (1, A)
+            joint_logits_for_gt_class_anchor_pairs = logit_cls_gt + obj_logits_expanded # (M, A)
+            prob_joint_gt = joint_logits_for_gt_class_anchor_pairs.sigmoid() # (M, A)
+            cost_values_for_cls_term = -torch.log(prob_joint_gt + eps) # BCE-like cost for P_joint with target 1
+        else:
+            # Fallback if obj_logits are not used or not provided (cost based on P(cls_gt) only)
+            prob_cls_gt = logit_cls_gt.sigmoid() # (M, A)
+            cost_values_for_cls_term = -torch.log(prob_cls_gt + eps)
         
-        # Optionally include objectness (= max probability over classes)
-        if self.use_obj_logit:
-            if obj_logits is not None:
-                obj_prob = obj_logits.sigmoid().unsqueeze(0) # (1, A)
-            else:
-                # warnings.warn("SimOTACache: use_obj_logit is True but obj_logits not provided. Falling back to p_cls.max().")
-                obj_prob = p_cls.max(dim=1).values.unsqueeze(0)  # (1, A)
-            p_mat = p_mat * obj_prob                         # joint score
-        
-        eps = 1e-8
-        cost_cls = -torch.log(p_mat + eps)                  # BCE( p, 1 )
-        cost_cls = self.cls_cost_weight * cost_cls          # weight λ
+        cost_cls = self.cls_cost_weight * cost_values_for_cls_term
         # ----------------------------------------------------------------------
         
         cost_loc = 1.0 - iou                                # (M, A)
-        #####
-        large_pen = torch.tensor(1e4, device=device, dtype=cost_loc.dtype)
+        large_pen = torch.tensor(1e4, device=device, dtype=cost_loc.dtype) # Ensure dtype matches
         cost = (cost_loc + cost_cls
                 + (~centre_mask.T) * large_pen
                 + (~fg_cand_mask.unsqueeze(0)) * large_pen)
@@ -280,7 +321,8 @@ def train_epoch(
         dfl_project_buffer_for_decode: torch.Tensor,
         max_epochs: int = 500,
         quality_floor_vfl: float = 0.2,
-        w_obj_loss: float = 2.0, # Weight for the new objectness loss
+        w_cls_loss: float = 2.0,
+        w_obj_loss: float = None, # Weight for the objectness loss
         w_iou_initial: float = 5.0, # Initial weight for IoU loss
         w_iou_final: float = 2.0,   # Final weight for IoU loss
         iou_weight_change_epoch: int = None, # Epoch to change IoU weight
@@ -309,6 +351,10 @@ def train_epoch(
             H, W = cls_preds_levels[lv].shape[2:]
             s = strides_per_level_tensors[lv].item()
             fmap_shapes.append((H, W, s))
+        if debug_prints and epoch == 0 and i == 0:
+            for lv, (_, _, actual_s) in enumerate(fmap_shapes):
+                expected_s = model.head.strides_buffer[lv].item()
+                print(f"[DEBUG STRIDE CHECK] Level {lv}: actual stride = {actual_s}, expected (head buffer) = {expected_s}")
 
         batch_total_loss = torch.tensor(0.0, device=device, dtype=torch.float32)
         num_samples_with_loss_in_batch = 0
@@ -366,72 +412,61 @@ def train_epoch(
             )
 
             num_fg_img = fg_mask_img.sum().item()
-            if num_fg_img == 0: continue
+            loss_norm_factor = float(num_fg_img)
+            if num_fg_img == 0:
+                # if debug_prints:
+                #     print(f"[DEBUG] Epoch {epoch}, Batch {i}, Image {b_idx} — No foreground samples.")
+                continue
+
+            final_fg_indices = fg_mask_img.nonzero(as_tuple=False).squeeze(1)
+            gt_labels_final_fg = assigned_gt_labels_img_full[final_fg_indices]
 
             loss_cls = torch.tensor(0.0, device=device)
             loss_obj = torch.tensor(0.0, device=device)
 
             if use_focal_loss:
-                # --- Standard Focal Loss for Classification ---
-                # Applied ONLY to foreground anchors and their class predictions
-                focal_loss_alpha = 0.25
-                focal_loss_gamma = 2.0
-
-                focal_targets_one_hot = torch.zeros_like(cls_p_img)  # (A, C)
-                pos_idx = fg_mask_img.nonzero(as_tuple=True)[0] 
-                
-                if pos_idx.numel() > 0: # Ensure there are positive anchors before indexing
-                    # Get assigned GT labels for these foreground anchors
-                    # assigned_gt_labels_img_full is (A,), long; select based on fg_mask_img
-                    gt_labels_for_fg_anchors = assigned_gt_labels_img_full[fg_mask_img] # (num_fg_img,)
-                    
-                    # Set the target to 1 only for positive anchors at their assigned GT class
-                    focal_targets_one_hot[pos_idx, gt_labels_for_fg_anchors] = 1.0
-                
-                # Compute Focal Loss over ALL anchors
-                loss_cls_unreduced = tvops.sigmoid_focal_loss(
-                    cls_p_img,                          # Logits for ALL anchors (A, C)
-                    focal_targets_one_hot,              # Targets for ALL anchors (A, C)
-                    alpha=focal_loss_alpha,
-                    gamma=focal_loss_gamma,
-                    reduction='sum'
-                )
-                # Normalize by the number of positive (foreground) anchors
-                loss_cls = loss_cls_unreduced / float(num_fg_img)
-
-                # --- Objectness Loss (BCE) ---
-                # Applied to ALL anchors (obj_p_img), targets are 1 for FG, 0 for BG
-                obj_targets_all_anchors = fg_mask_img.float() # (A,) tensor of 0.0s and 1.0s
-                num_total_anchors = obj_p_img.size(0) # Get total number of anchors A
-                
-                loss_obj_unreduced = F.binary_cross_entropy_with_logits(
-                    obj_p_img, # (A,)
-                    obj_targets_all_anchors, # (A,)
-                    reduction='sum'
-                )
-                # Normalize objectness loss by the total number of anchors.
-                loss_obj = loss_obj_unreduced / float(num_total_anchors + 1e-6) # Add epsilon for stability
-
-            else:  # Varifocal Loss path (uses joint_logits) - this path remains mostly as before
-                joint_logits_img = cls_p_img + obj_p_img.unsqueeze(-1) # VFL uses this
-                vfl_targets_img = torch.zeros_like(joint_logits_img)
-                fg_gt_labels = assigned_gt_labels_img_full[fg_mask_img]
-                fg_iou_quality = assigned_iou_img_full[fg_mask_img]
-
-                final_vfl_quality = torch.maximum(fg_iou_quality, torch.tensor(quality_floor_vfl, device=device))
-                vfl_targets_img[fg_mask_img.nonzero(as_tuple=True)[0], fg_gt_labels] = final_vfl_quality
-
+                alpha, gamma = 0.25, 2.0
+            
+                cls_targets = torch.zeros_like(cls_p_img)
+                cls_targets[final_fg_indices, gt_labels_final_fg] = 1.0  # one-hot
+            
+                loss_cls = tvops.sigmoid_focal_loss(
+                    cls_p_img, cls_targets, alpha=alpha, gamma=gamma, reduction='sum'
+                ) / loss_norm_factor                          # ← divide by #FG only
+                # -----------------------------------------------------------------
+            
+                # ---------- objectness / quality focal ---------------------------
+                qfl_targets = torch.zeros_like(obj_p_img)          # (A,)
+                qfl_targets[final_fg_indices] = assigned_iou_img_full[final_fg_indices]
+            
+                loss_obj = tvops.sigmoid_focal_loss(
+                    obj_p_img, qfl_targets, alpha=alpha, gamma=gamma, reduction='sum'
+                ) / loss_norm_factor
+            else:  # Varifocal Loss path
                 progress = epoch / max_epochs if max_epochs > 0 else 0.0
                 alpha_dyn = 0.25 + (0.75 - 0.25) * 0.5 * (1 - math.cos(math.pi * progress))
-
                 current_vfl_instance = VarifocalLoss(alpha=alpha_dyn, gamma=2.0, reduction='sum')
-                loss_cls_unreduced = current_vfl_instance(joint_logits_img, vfl_targets_img) # This is the "classification" part for VFL
-                loss_cls = loss_cls_unreduced / float(num_fg_img)
-                # In VFL, objectness is implicitly handled by the joint_logits and quality target.
-                # So, loss_obj would typically be 0 or not explicitly calculated here.
-                # For simplicity, if VFL is used, we won't add a separate loss_obj for now.
-                loss_obj = torch.tensor(0.0, device=device)
 
+                # 1. Classification Loss (VarifocalLoss)
+                # VFL is applied to raw class logits. Target is IoU for the GT class.
+                cls_logits_img = cls_p_img
+                vfl_targets_img = torch.zeros_like(cls_logits_img)
+                gt_iou_final_fg = assigned_iou_img_full[final_fg_indices]
+                
+                final_vfl_quality = torch.maximum(gt_iou_final_fg, torch.tensor(quality_floor_vfl, device=device))
+                vfl_targets_img[final_fg_indices, gt_labels_final_fg] = final_vfl_quality
+
+                loss_cls_unreduced = current_vfl_instance(cls_logits_img, vfl_targets_img)
+                loss_cls = loss_cls_unreduced / loss_norm_factor
+
+                # 2. Objectness Loss (BCEWithLogitsLoss)
+                obj_logits_fg = obj_p_img[final_fg_indices]
+                obj_targets_fg = gt_iou_final_fg
+                
+                loss_obj_unreduced = F.binary_cross_entropy_with_logits(
+                    obj_logits_fg, obj_targets_fg, reduction='sum'
+                )
+                loss_obj = loss_obj_unreduced / loss_norm_factor
 
             # --- Distribution Focal Loss (DFL) & IoU Loss for BBox Regression ---
             # (These are independent of the classification/objectness choice above and operate on reg_p_img)
@@ -456,8 +491,22 @@ def train_epoch(
             )
             anchor_centers_fg_img = anchor_centers_all_img[fg_mask_img]
 
-            # if not torch.allclose(anchor_centers_all_img[:10], assigner.cache_first_call[:10]):
-            #     print("[WARNING] anchor-order mismatch occurred")
+            if debug_prints and epoch == 0 and i == 0 and b_idx == 0:
+                head_anchors_flat_list = []
+                for lvl_idx_head in range(model.head.nl):
+                    # Ensure model.head is accessible; if qat_model is passed, might need model_fp32.head
+                    # Assuming 'model' is the original FP32 model reference for head params
+                    anchor_points_level = getattr(model.head, f'anchor_points_level_{lvl_idx_head}')
+                    head_anchors_flat_list.append(anchor_points_level.to(device))
+                head_anchors_concatenated = torch.cat(head_anchors_flat_list, dim=0)
+            
+                if not torch.allclose(anchor_centers_all_img, head_anchors_concatenated, atol=1e-5):
+                    print("[CRITICAL WARNING] Anchor order mismatch between SimOTA generated anchors and PicoDetHead internal anchors!")
+                    print("SimOTA anchors (first 5):", anchor_centers_all_img[:5])
+                    print("Head anchors (first 5):", head_anchors_concatenated[:5])
+                    # Consider raising an error or adding more detailed comparison
+                else:
+                    print("[INFO] Anchor order check passed for first sample.")
 
             ltrb_offsets = torch.stack([
                 anchor_centers_fg_img[:, 0] - box_targets_fg_img[:, 0],
@@ -482,9 +531,11 @@ def train_epoch(
             if iou_weight_change_epoch is None:
                 iou_weight_change_epoch = int(max_epochs * 0.4)
             w_iou = w_iou_initial if epoch < iou_weight_change_epoch else w_iou_final
+            if w_obj_loss is None:
+                w_obj_loss = 0.5 if use_focal_loss else 2.0
             
             current_sample_total_loss = loss_cls + w_obj_loss * loss_obj + loss_dfl + w_iou * loss_iou
-            
+
             # Store for printing the first sample's loss breakdown
             if num_samples_with_loss_in_batch == 0 and total_samples_contributing_to_loss_epoch == 0:
                 loss_cls_print, loss_obj_print, loss_dfl_print, loss_iou_print = \
@@ -504,16 +555,36 @@ def train_epoch(
 
         if debug_prints and i == 0 and total_samples_contributing_to_loss_epoch > 0 : # Print first batch loss breakdown
              print(f"E{epoch} B0 loss components: "
-                  f"cls {loss_cls_print.item():.3f}  obj {loss_obj_print.item() * w_obj_loss:.3f} (w={w_obj_loss})  "
+                  f"cls {loss_cls_print.item() * w_cls_loss:.3f} (w={w_cls_loss})  obj {loss_obj_print.item() * w_obj_loss:.3f} (w={w_obj_loss})  "
                   f"dfl {loss_dfl_print.item():.3f}  iou {loss_iou_print.item() * w_iou:.3f} (w={w_iou})  "
                   f"tot_batch_avg {averaged_batch_loss.item():.3f}")
         elif debug_prints and i % 500 == 0 and i > 0 and num_samples_with_loss_in_batch > 0:
             print(f"E{epoch} {i:04d}/{len(loader)} loss {averaged_batch_loss.item():.3f} (batch avg)")
-        if debug_prints and epoch == 10:
-            with torch.no_grad():
-                cls_logits, obj_logits, *_ = model(imgs)   # training batch
-                conf = (cls_logits + obj_logits).sigmoid().flatten()
-            print(torch.quantile(conf, torch.tensor([.5, .9, .99])))
+        if debug_prints and epoch == 10 and i == 0:  # only once at start of epoch 10
+            try:
+                with torch.no_grad():
+                    # ─── concatenate logits from all FPN levels ───────────────────
+                    cls_logits_all = torch.cat(
+                        [lvl.detach().permute(0, 2, 3, 1).reshape(-1, head_nc_for_loss)
+                         for lvl in cls_preds_levels], dim=0)                # [A_total , C]
+                    obj_logits_all = torch.cat(
+                        [lvl.detach().permute(0, 2, 3, 1).reshape(-1, 1)
+                         for lvl in obj_preds_levels], dim=0)                # [A_total , 1]
+            
+                    joint_conf = (cls_logits_all + obj_logits_all).sigmoid().flatten()
+            
+                    # sample at most 100 k values to keep it fast
+                    if joint_conf.numel() > 100000:
+                        idx = torch.randperm(joint_conf.numel(), device=joint_conf.device)[:100_000]
+                        joint_conf = joint_conf[idx]
+            
+                    q50, q90, q99 = torch.quantile(
+                        joint_conf.cpu(), torch.tensor([0.5, 0.9, 0.99]))
+                    print(f"[DBG] Epoch {epoch}  Conf quantiles 50/90/99 % : "
+                          f"{q50:.3f}  {q90:.3f}  {q99:.3f}")
+                    # less than 0.1, likely issues. More than 0.9, possibly overfit
+            except Exception as e:
+                print(repr(e))
 
     if total_samples_contributing_to_loss_epoch > 0:
         avg_epoch_loss_per_sample = tot_loss_accum / total_samples_contributing_to_loss_epoch
@@ -594,7 +665,7 @@ def apply_nms_and_padding_to_raw_outputs(
     max_detections: int
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]: # (B, max_det, 4), (B, max_det), (B, max_det)
     
-    device = raw_boxes_batch.device
+    # device = raw_boxes_batch.device
     batch_size = raw_boxes_batch.shape[0]
 
     final_boxes_list = []
@@ -606,20 +677,25 @@ def apply_nms_and_padding_to_raw_outputs(
         scores_img = raw_scores_batch[b_idx]   # (Total_Anchors, NC)
 
         conf_per_anchor, labels_per_anchor = torch.max(scores_img, dim=1)
-        
         keep_by_score_mask = conf_per_anchor >= score_thresh
-        
         boxes_above_thresh = boxes_img[keep_by_score_mask]
         scores_above_thresh = conf_per_anchor[keep_by_score_mask]
         labels_above_thresh = labels_per_anchor[keep_by_score_mask]
-
-        if boxes_above_thresh.numel() == 0:
-            # Pad and append if no boxes pass threshold
-            padded_boxes = torch.zeros((max_detections, 4), dtype=boxes_img.dtype, device=device)
-            padded_scores = torch.zeros((max_detections,), dtype=scores_img.dtype, device=device)
-            padded_labels = torch.full((max_detections,), -1, dtype=torch.long, device=device)
+        
+        if boxes_above_thresh.numel() > 0:
+            nms_keep_indices = tvops.batched_nms(
+                boxes_above_thresh,    # boxes
+                scores_above_thresh,   # scores
+                labels_above_thresh,   # class indexes
+                iou_thresh             # iou_threshold
+            )
         else:
-            nms_keep_indices = tvops.nms(boxes_above_thresh, scores_above_thresh, iou_thresh)
+            nms_keep_indices = tvops.batched_nms(
+                boxes_above_thresh,    # boxes
+                scores_above_thresh,   # scores
+                labels_above_thresh,   # class indexes
+                iou_thresh             # iou_threshold
+            )
             
             boxes_after_nms = boxes_above_thresh[nms_keep_indices[:max_detections]]
             scores_after_nms = scores_above_thresh[nms_keep_indices[:max_detections]]
@@ -682,8 +758,13 @@ def apply_nms_and_padding_to_raw_outputs_with_debug( # Renamed
             padded_labels = torch.full((max_detections,), -1, dtype=torch.long, device=device) # Use -1 for padding label
         else:
             # Perform NMS
-            nms_keep_indices = tvops.nms(boxes_above_thresh, scores_above_thresh, iou_thresh)
-            
+            nms_keep_indices = tvops.batched_nms(
+                boxes_above_thresh,    # boxes
+                scores_above_thresh,   # scores
+                labels_above_thresh,   # class indexes
+                iou_thresh             # iou_threshold
+            )
+
             # Keep only up to max_detections
             boxes_after_nms = boxes_above_thresh[nms_keep_indices[:max_detections]]
             scores_after_nms = scores_above_thresh[nms_keep_indices[:max_detections]]
@@ -922,7 +1003,8 @@ class PostprocessorForONNX(nn.Module):
         boxes_xyxy_level = torch.stack([x1, y1, x2, y2], dim=-1) # Shape (B, num_anchors_level, 4)
 
         # For ONNX, sigmoid should be torch.sigmoid
-        scores_level = torch.sigmoid(cls_logit_perm + obj_logit_perm) # Shape (B, num_anchors_level, NC)
+        scores_level = torch.sigmoid(cls_logit_perm) * torch.sigmoid(obj_logit_perm)
+        # scores_level = torch.sigmoid(cls_logit_perm + obj_logit_perm)
 
         return boxes_xyxy_level, scores_level
 
@@ -1209,7 +1291,7 @@ def main(argv: List[str] | None = None):
     pa = argparse.ArgumentParser()
     pa.add_argument('--coco_root', default='coco')
     pa.add_argument('--arch', choices=['mnv3', 'mnv4s', 'mnv4m'], default='mnv3')
-    pa.add_argument('--epochs', type=int, default=10) 
+    pa.add_argument('--epochs', type=int, default=15) 
     pa.add_argument('--batch', type=int, default=16)
     pa.add_argument('--workers', type=int, default=0)
     pa.add_argument('--device', default=None)
@@ -1217,7 +1299,7 @@ def main(argv: List[str] | None = None):
     pa.add_argument('--no_inplace_head_neck', default=True, action='store_true', help="Disable inplace activations in head/neck")
     cfg = pa.parse_args(argv)
 
-    TRAIN_SUBSET = 70000
+    TRAIN_SUBSET = None
     VAL_SUBSET   = 2000
     debug_prints = True
     BACKBONE_FREEZE_EPOCHS = 2 if cfg.epochs < 12 else 3  # 0 to disable
@@ -1243,8 +1325,9 @@ def main(argv: List[str] | None = None):
         f"{root}/train2017",
         f"{root}/annotations/instances_train2017.json",
     )
-    coco_label_map = build_coco_label_map(coco_train_raw.coco)   # 80 contiguous ids
-    
+    # coco_label_map = build_coco_label_map(coco_train_raw.coco)   # 80 contiguous ids
+    coco_label_map = CANONICAL_COCO80_MAP
+
     train_ds = CocoDetectionV2(
         f"{root}/train2017",
         f"{root}/annotations/instances_train2017.json",
@@ -1259,13 +1342,17 @@ def main(argv: List[str] | None = None):
     )
     
     # ------- (optional) random subset for quick runs -------
-    train_sampler = torch.utils.data.RandomSampler(
-        train_ds, replacement=False,
-        num_samples=min(TRAIN_SUBSET, len(train_ds))
-    )
-    g = torch.Generator().manual_seed(42)
-    val_idx  = torch.randperm(len(val_ds), generator=g)[:VAL_SUBSET].tolist()
-    val_sampler = torch.utils.data.SubsetRandomSampler(val_idx)
+    train_sampler = None
+    if TRAIN_SUBSET is not None:
+        train_sampler = torch.utils.data.RandomSampler(
+            train_ds, replacement=False,
+            num_samples=min(TRAIN_SUBSET, len(train_ds))
+        )
+    val_sampler = None
+    if VAL_SUBSET is not None:
+        g = torch.Generator().manual_seed(42)
+        val_idx  = torch.randperm(len(val_ds), generator=g)[:VAL_SUBSET].tolist()
+        val_sampler = torch.utils.data.SubsetRandomSampler(val_idx)
     
     tr_loader = DataLoader(
         train_ds, batch_size=cfg.batch, sampler=train_sampler,
@@ -1359,7 +1446,7 @@ def main(argv: List[str] | None = None):
     assigner = SimOTACache(
         nc=model.head.nc,
         ctr=2.5,  # 2.5
-        topk=15,  # 10
+        topk=20,  # 10
         cls_cost_weight=0.5,
         debug_epochs=5 if debug_prints else 0,
     )
@@ -1368,8 +1455,6 @@ def main(argv: List[str] | None = None):
     original_model_head_nc = model.head.nc
     original_model_head_reg_max = model.head.reg_max
     original_dfl_project_buffer = model.head.dfl_project_buffer
-    print(f"head iou_th is {float(model.head.iou_th)}")
-
 
     # ... (FP32 training loop) ...
     for ep in range(cfg.epochs):
@@ -1489,7 +1574,7 @@ def main(argv: List[str] | None = None):
             max_epochs=qat_epochs, # For VFL alpha scheduling (relative to QAT duration)
             quality_floor_vfl=0.2,
             iou_weight_change_epoch=2,
-            debug_prints=debug_prints,
+            debug_prints=False,
         )
         scheduler_q.step() # Step the QAT LR scheduler
 

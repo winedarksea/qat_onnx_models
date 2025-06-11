@@ -232,7 +232,7 @@ class PicoDetHead(nn.Module):
         """
         # classification branches
         cls_prior = 0.01
-        cls_bias  = -math.log((1. - cls_prior) / cls_prior)      # –4.595
+        cls_bias  = -math.log((1. - cls_prior) / cls_prior)      # –4.595, use -2.19 for multiplicative sigmoid
         for conv in self.cls_pred:
             if conv.bias is not None:
                 nn.init.constant_(conv.bias, cls_bias)
@@ -240,7 +240,7 @@ class PicoDetHead(nn.Module):
         # objectness branches   (neutral ⇒ bias = 0.0)
         for conv in self.obj_pred:
             if conv.bias is not None:
-                nn.init.constant_(conv.bias, 0.0)
+                nn.init.constant_(conv.bias, 0.0)  # nn.init.constant_(conv.bias, -math.log((1-p)/p)) p=0.15
 
     def _dfl_to_ltrb_inference(self, x_reg_logits_3d: torch.Tensor) -> torch.Tensor:
         b, n_anchors_img, _ = x_reg_logits_3d.shape
@@ -275,35 +275,38 @@ class PicoDetHead(nn.Module):
         return ltrb_offsets
 
     def _decode_predictions_for_level(
-            self,
-            cls_logit: torch.Tensor, obj_logit: torch.Tensor,
-            reg_logit: torch.Tensor,
-            level_idx: int
-        ) -> Tuple[torch.Tensor, torch.Tensor]:
+        self,
+        cls_logit: torch.Tensor, obj_logit: torch.Tensor, reg_logit: torch.Tensor,
+        level_idx: int
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         B, _, H_feat, W_feat = cls_logit.shape
         stride = self.strides_buffer[level_idx]
-        num_anchors_level = H_feat * W_feat
 
-        anchor_points_center = getattr(self, f'anchor_points_level_{level_idx}')
-        # anchor_points_center = anchor_points_center.to(cls_logit.device) # ensure device match if called standalone
+        # build grid *on the fly* so it always matches H_feat,W_feat
+        yv, xv = torch.meshgrid(
+            torch.arange(H_feat, device=cls_logit.device),
+            torch.arange(W_feat, device=cls_logit.device),
+            indexing='ij'
+        )
+        anchor_centers = (torch.stack((xv, yv), dim=2).view(-1, 2) + 0.5) * stride
 
-        cls_logit_perm = cls_logit.permute(0, 2, 3, 1).reshape(B, num_anchors_level, self.nc)
-        obj_logit_perm = obj_logit.permute(0, 2, 3, 1).reshape(B, num_anchors_level, 1)
-        reg_logit_perm = reg_logit.permute(0, 2, 3, 1).reshape(B, num_anchors_level, 4 * (self.reg_max + 1))
+        cls_logit_perm = cls_logit.permute(0,2,3,1).reshape(B, H_feat*W_feat, self.nc)
+        obj_logit_perm = obj_logit.permute(0,2,3,1).reshape(B, H_feat*W_feat, 1)
+        reg_logit_perm = reg_logit.permute(0,2,3,1).reshape(B, H_feat*W_feat, 4*(self.reg_max+1))
 
-        ltrb_offsets = self._dfl_to_ltrb_inference(reg_logit_perm) 
-        ltrb_offsets_scaled = ltrb_offsets * stride
+        ltrb = self._dfl_to_ltrb_inference(reg_logit_perm) * stride
 
-        ap_expanded = anchor_points_center.unsqueeze(0) # Ensure broadcasting to batch
-        x1 = ap_expanded[..., 0] - ltrb_offsets_scaled[..., 0]
-        y1 = ap_expanded[..., 1] - ltrb_offsets_scaled[..., 1]
-        x2 = ap_expanded[..., 0] + ltrb_offsets_scaled[..., 2]
-        y2 = ap_expanded[..., 1] + ltrb_offsets_scaled[..., 3]
-        boxes_xyxy_level = torch.stack([x1, y1, x2, y2], dim=-1)
+        x1 = anchor_centers[:,0].unsqueeze(0) - ltrb[...,0]
+        y1 = anchor_centers[:,1].unsqueeze(0) - ltrb[...,1]
+        x2 = anchor_centers[:,0].unsqueeze(0) + ltrb[...,2]
+        y2 = anchor_centers[:,1].unsqueeze(0) + ltrb[...,3]
+        boxes = torch.stack([x1,y1,x2,y2], dim=-1)
 
-        scores_level = (cls_logit_perm + obj_logit_perm).sigmoid()
-        
-        return boxes_xyxy_level, scores_level
+        scores = (cls_logit_perm + obj_logit_perm).sigmoid()
+        # scores = cls_logit_perm.sigmoid() * obj_logit_perm.sigmoid()
+        # alpha = min(1.0, epoch / warmup_epochs)
+        # scores = ((1 - alpha) * (cls_logit_perm + obj_logit_perm).sigmoid() + alpha * (cls_logit_perm.sigmoid() * obj_logit_perm.sigmoid()))
+        return boxes, scores
 
     def forward(self, neck_feature_maps: Tuple[torch.Tensor, ...]):
         raw_cls_logits_levels: List[torch.Tensor] = [] # len nl
@@ -353,27 +356,37 @@ class PicoDet(nn.Module):
                  inplace_act_for_head_neck: bool = False):
         super().__init__()
         self.pre = ResizeNorm(size=(img_size, img_size)) 
-        self.backbone = backbone # Assume backbone doesn't use inplace=True if not handled there
+        self.backbone = backbone
         self.neck = CSPPAN(in_chs=feat_chs, out_ch=neck_out_ch, inplace_act=inplace_act_for_head_neck)
-        num_fpn_levels = len(feat_chs) 
+        num_fpn_levels = len(feat_chs)
+        self.debug_count = 0
         
         self.head = PicoDetHead(
             num_classes=num_classes, 
             reg_max=head_reg_max,
             num_feats=neck_out_ch,
             num_levels=num_fpn_levels,
-            max_det=head_max_det, # Pass to head so it can store them
+            max_det=head_max_det,
             score_thresh=head_score_thresh,
             nms_iou=head_nms_iou,
             img_size=img_size,
             inplace_act=inplace_act_for_head_neck
         )
 
-    def forward(self, x: torch.Tensor): # (Same as before)
+    def forward(self, x: torch.Tensor):
         x = self.pre(x)
         backbone_features = self.backbone(x)
         c3, c4, c5 = backbone_features[0], backbone_features[1], backbone_features[2]
         p3, p4, p5 = self.neck(c3, c4, c5)
+        
+        if self.debug_count == 0:
+            input_img_h = x.shape[2]
+            print(f"[DEBUG P_STRIDES] Input H: {input_img_h}")
+            print(f"[DEBUG P_STRIDES] P3 shape: {p3.shape}, Actual Stride P3: {input_img_h / p3.shape[2]}")
+            print(f"[DEBUG P_STRIDES] P4 shape: {p4.shape}, Actual Stride P4: {input_img_h / p4.shape[2]}")
+            print(f"[DEBUG P_STRIDES] P5 shape: {p5.shape}, Actual Stride P5: {input_img_h / p5.shape[2]}")
+            print(f"[DEBUG P_STRIDES] Head expected strides: {self.head.strides_buffer.tolist()}")
+            self.debug_count = 1
         return self.head((p3, p4, p5))
 
 
@@ -409,125 +422,197 @@ class TVExtractorWrapper(nn.Module):
         # Assuming 3 features are always returned, otherwise adjust Tuple annotation
         return tuple(feature_dict[key] for key in self.output_keys) # Return as tuple
 
+def pick_nodes_by_stride(model: nn.Module, img_size: int = 256, desired: Tuple[int, ...] = (8, 16, 32)) -> dict:
+    tmp = {}
+    # Ensure model is on the correct device for the dummy forward pass
+    device = next(model.parameters()).device if len(list(model.parameters())) > 0 else torch.device('cpu')
+    
+    hooks = [m.register_forward_hook(
+        lambda mod, inp, out, n=name: tmp.setdefault(n, out.detach().clone().cpu())) # Detach, clone, move to CPU to save GPU mem
+             for name, m in model.named_modules()]
+    
+    # Perform dummy forward pass
+    model.eval() # Ensure eval mode for dummy pass to disable dropout etc.
+    try:
+        model(torch.randn(1, 3, img_size, img_size, device=device))
+    finally:
+        for h in hooks: h.remove()
+    model.train() # Set back to train mode
+
+    H_in = img_size
+    stride_to_name = {}
+    # Sort tmp by length of name to prefer shorter, higher-level module names if multiple have same feature shape
+    # Or sort by some other heuristic if needed, e.g. depth in the network. For now, simple iteration.
+    sorted_items = sorted(tmp.items(), key=lambda x: len(x[0]))
+
+    for name, feat_tensor in sorted_items:
+        if not isinstance(feat_tensor, torch.Tensor) or feat_tensor.ndim < 4: # Basic check for valid feature map
+            continue
+        
+        # Check if feature map height is a divisor of input height
+        if H_in % feat_tensor.shape[-2] == 0:
+            stride = H_in // feat_tensor.shape[-2] # H and W are assumed equal after square resize
+            if stride in desired and stride not in stride_to_name:
+                # Basic check to avoid picking trivial layers like initial stem conv if not intended
+                # This heuristic might need adjustment depending on the backbone.
+                # Here, we assume a feature map is "significant" if its channel count isn't tiny.
+                # For MobileNetV3-Small, stride 8 has 24 channels, stride 16 has 40, stride 32 has 576 (before final classifier)
+                # The features.12 (last conv before pooling/classifier in mnv3) is what we want for C5.
+                # Heuristic: pick module if it's not too shallow (e.g. name contains a certain depth)
+                # or if it's a common pattern like 'features.X'
+                if '.' in name: # Prefer modules with some depth in their name
+                    stride_to_name[stride] = name
+    
+    if len(stride_to_name) != len(desired):
+        warnings.warn(
+            f"pick_nodes_by_stride: Could not find all desired strides {desired}. "
+            f"Found: {stride_to_name}. Check backbone structure or adjust selection logic."
+        )
+        # Potentially return a partial map or raise an error, or fallback
+        # For now, let's allow partial if user wants to debug
+
+    # Map found strides to C3, C4, C5 based on sorted stride values
+    # Example: if desired=(8,16,32), then stride 8 -> C3, 16 -> C4, 32 -> C5
+    # sorted_found_strides = sorted(s for s in desired if s in stride_to_name) # Strides that were actually found
+    
+    # Ensure desired strides are present before trying to map them
+    final_return_nodes = {}
+    map_idx_to_c_label = {s_val: f"C{i+3}" for i, s_val in enumerate(sorted(list(desired)))}
+
+    for s_val in desired:
+        if s_val in stride_to_name:
+            final_return_nodes[stride_to_name[s_val]] = map_idx_to_c_label[s_val]
+        else:
+            warnings.warn(f"Desired stride {s_val} not found by pick_nodes_by_stride.")
+            # Optionally, you could add a fallback here to hardcoded values if a stride is missing.
+            # e.g., if s_val == 8: final_return_nodes['fallback_name_for_s8'] = 'C3'
+
+    return final_return_nodes
+
+
 @torch.no_grad()
 def _get_dynamic_feat_chs(model: nn.Module, img_size: int, device: torch.device) -> Tuple[int, int, int]:
-    """Helper to get output channels from a model that returns a list/tuple of 3 feature maps."""
+    # ... (no change to this helper itself, but it relies on 'model' (TVExtractorWrapper or timm model) being correct)
     model.eval()
     dummy_input = torch.randn(1, 3, img_size, img_size, device=device)
-    # If model is not on device yet, move it temporarily
-    original_device = next(model.parameters()).device if len(list(model.parameters())) > 0 else 'cpu' # Handle no params case
+    original_device = next(model.parameters()).device if len(list(model.parameters())) > 0 else 'cpu'
     model.to(device)
     
     features = model(dummy_input)
     
-    model.to(original_device) # Move back
-    model.train() # Set back to train mode
+    model.to(original_device)
+    # model.train() # Caller of _get_dynamic_feat_chs should manage train/eval state if needed.
+                  # get_backbone sets net.train() at the end.
     
     if not isinstance(features, (list, tuple)) or len(features) != 3:
-        raise ValueError(f"Backbone expected to return 3 feature maps, got {len(features) if isinstance(features, (list,tuple)) else type(features)}")
+        # If using pick_nodes_by_stride, the number of features should match len(desired_strides)
+        # that were successfully found and mapped.
+        num_expected_features = 3 # Assuming C3, C4, C5
+        current_len = len(features) if isinstance(features, (list, tuple)) else 0
+        raise ValueError(
+            f"Backbone expected to return {num_expected_features} feature maps, "
+            f"got {current_len} (type: {type(features)}). "
+            f"This might be due to pick_nodes_by_stride not finding all required feature layers."
+        )
     return tuple(f.shape[1] for f in features)
+
 
 def get_backbone(arch: str, ckpt: str | None, img_size: int = 224):
     pretrained = ckpt is None
-    # Use a temporary device for dummy forward pass if model is on CPU initially
-    # to avoid issues if _get_dynamic_feat_chs needs CUDA for some ops within model
     temp_device_for_init = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     if arch == "mnv3":
         weights = MobileNet_V3_Small_Weights.IMAGENET1K_V1 if pretrained else None
-        # Ensure dropout is 0.0 as per your original get_backbone intent
-        # MobileNetV3 constructor doesn't take dropout, but we can set it if default is non-zero for eval
         base = mobilenet_v3_small(weights=weights, width_mult=1.0)
+        base.to(temp_device_for_init) # Move base model to device for pick_nodes_by_stride
 
-        return_nodes = {
-            'features.3': 'C3',  # Stride 8
-            'features.6': 'C4',  # Stride 16
-            'features.12': 'C5', # Stride 32 (output of the last ConvBNReLU in the 'features' sequence)
-        }
-        # Wrap the feature extractor
-        net = TVExtractorWrapper(base, return_nodes)
-        # Dynamically get feature channels
+        # Use the helper function to get return_nodes
+        # It's important that 'base' is the nn.Module whose layer names are being sought.
+        desired_strides_tuple = (8, 16, 32)
+        return_nodes = pick_nodes_by_stride(base, img_size=img_size, desired=desired_strides_tuple)
+        
+        base.cpu() # Move back to CPU if it was on temp_device for pick_nodes
+
+        if len(return_nodes) != len(desired_strides_tuple):
+            warnings.warn(
+                f"pick_nodes_by_stride for '{arch}' did not find all {len(desired_strides_tuple)} desired strides. "
+                f"Found nodes for: {list(return_nodes.values())}. Falling back to hardcoded defaults for '{arch}'."
+            )
+            # Fallback to original hardcoded nodes if auto-detection fails
+            # (Ensure these hardcoded names are correct for the version of torchvision being used)
+            return_nodes = {
+                'features.3': 'C3',  # Stride 8
+                'features.6': 'C4',  # Stride 16
+                'features.12': 'C5', # Stride 32 (output of the last ConvBNReLU in the 'features' sequence)
+            }
+        
+        print(f"[INFO] Using return_nodes for {arch}: {return_nodes}")
+
+        net = TVExtractorWrapper(base, return_nodes) # Wrap the original base model
         feat_chs = _get_dynamic_feat_chs(net, img_size, temp_device_for_init)
         
-        # To load a checkpoint for the base MobileNetV3 model (not the wrapped one):
-        if ckpt is not None and pretrained is False: # only load if not using default imagenet pretrained
+        # Checkpoint loading for mnv3 (for 'base' model)
+        if ckpt is not None and not pretrained:
             sd = torch.load(ckpt, map_location='cpu')
-            # The state_dict will be for `base`, so load into `net.extractor.model` (which is `base`)
+            # Load into base model (net.extractor.model is 'base')
             missing, unexpected = base.load_state_dict(sd, strict=False)
-            if missing: warnings.warn(f'Missing keys in base model ckpt: {missing}')
-            if unexpected: warnings.warn(f'Unexpected keys in base model ckpt: {unexpected}')
-            # Re-calculate feat_chs if model changed, though typically channels are fixed by arch
+            if missing: warnings.warn(f'Missing keys in base model ckpt ({arch}): {missing}')
+            if unexpected: warnings.warn(f'Unexpected keys in base model ckpt ({arch}): {unexpected}')
+            # Re-calculate feat_chs might be needed if ckpt changed arch details, though unlikely for channels
             feat_chs = _get_dynamic_feat_chs(net, img_size, temp_device_for_init)
 
     elif arch in {'mnv4s', 'mnv4m'}:
+        # ... (timm logic remains largely the same, as it uses feature_info.reduction())
+        # The pick_nodes_by_stride is less critical here but could be a sanity check.
         name_map = {
-            'mnv4s': 'mobilenetv4_conv_small.pyt_in1k', # Using a specific pretrained tag
+            'mnv4s': 'mobilenetv4_conv_small.pyt_in1k',
             'mnv4m': 'mobilenetv4_conv_medium.pyt_in1k'
         }
         model_name = name_map[arch]
 
-        # Create a temporary model to get correct indices for strides 8, 16, 32
-        temp_model = timm.create_model(model_name, pretrained=False, features_only=True) # Get all stages
-        desired_strides = {8, 16, 32}
-        actual_reductions = temp_model.feature_info.reduction()
-        out_indices_mnv4 = [i for i, r in enumerate(actual_reductions) if r in desired_strides]
+        # Use timm's feature_info to determine out_indices
+        temp_model_for_info = timm.create_model(model_name, pretrained=False, features_only=True)
+        desired_strides_set = {8, 16, 32}
+        actual_reductions = temp_model_for_info.feature_info.reduction()
+        out_indices_mnv4 = [i for i, r in enumerate(actual_reductions) if r in desired_strides_set]
         
         if len(out_indices_mnv4) != 3:
-            warnings.warn(f"Could not find exactly 3 features for strides 8,16,32 in {model_name}. "
+            warnings.warn(f"Could not find exactly 3 features for strides 8,16,32 in {model_name} using feature_info. "
                           f"Found indices {out_indices_mnv4} for reductions {actual_reductions}. "
-                          f"Defaulting to (2,3,4) or previously used (2,4,6) if this seems off.")
-            # Fallback to a common default or your previously used one if dynamic check fails badly
-            out_indices_mnv4 = (2,3,4) # Or (2,4,6) if you had better success with it
-
-        del temp_model
+                          f"Defaulting to (2,3,4).") # Or a more informed default based on timm docs
+            out_indices_mnv4 = (2,3,4) # Example fallback
+        del temp_model_for_info
 
         net = timm.create_model(
             model_name,
             pretrained=pretrained,
             features_only=True,
-            out_indices=out_indices_mnv4,
-            num_classes=0,      # Not used for features_only
-            drop_rate=0.0,      # Standardize for detection
-            drop_path_rate=0.0  # Standardize for detection
+            out_indices=out_indices_mnv4, # Use dynamically determined indices
+            num_classes=0,
+            drop_rate=0.0,
+            drop_path_rate=0.0
         )
-        # feat_chs = tuple(net.feature_info.channels()) # Channels for the selected out_indices
-        # More robust: get from a dummy forward pass of the configured `net`
         feat_chs = _get_dynamic_feat_chs(net, img_size, temp_device_for_init)
 
-
-        # Load checkpoint for the timm model directly
-        if ckpt is not None and pretrained is False:
+        if ckpt is not None and not pretrained:
             sd = torch.load(ckpt, map_location='cpu')
             missing, unexpected = net.load_state_dict(sd, strict=False)
-            if missing: warnings.warn(f'Missing keys in timm model ckpt: {missing}')
-            if unexpected: warnings.warn(f'Unexpected keys in timm model ckpt: {unexpected}')
+            if missing: warnings.warn(f'Missing keys in timm model ckpt ({arch}): {missing}')
+            if unexpected: warnings.warn(f'Unexpected keys in timm model ckpt ({arch}): {unexpected}')
             feat_chs = _get_dynamic_feat_chs(net, img_size, temp_device_for_init)
     else:
         raise ValueError(f'Unknown arch {arch}')
 
-    # If ckpt is for a fully wrapped model (e.g. saved PicoDet.backbone)
-    # and not for the base model (handled for mnv3 above, timm direct)
-    # This part of checkpoint loading is tricky: is it for base or wrapped?
-    # The training script implies `ckpt` might be for the `get_backbone` output.
-    # The mnv3 logic above loads a *base* model checkpoint.
-    # If `ckpt` is intended for the `net` object itself (already wrapped/configured):
-    if ckpt is not None and arch == "mnv3" and pretrained is True: # If imagenet was loaded, but we have a specific wrapped ckpt
-        # This case is if `ckpt` is for a `TVExtractorWrapper` saved state
-        sd = torch.load(ckpt, map_location='cpu')
-        missing, unexpected = net.load_state_dict(sd, strict=False)
-        if missing: warnings.warn(f'Missing keys in wrapped mnv3 ckpt: {missing}')
-        if unexpected: warnings.warn(f'Unexpected keys in wrapped mnv3 ckpt: {unexpected}')
-        feat_chs = _get_dynamic_feat_chs(net, img_size, temp_device_for_init)
-    elif ckpt is not None and arch != "mnv3" and pretrained is True: # If imagenet was loaded for timm, but specific ckpt for net
-        sd = torch.load(ckpt, map_location='cpu')
-        missing, unexpected = net.load_state_dict(sd, strict=False)
-        if missing: warnings.warn(f'Missing keys in timm net ckpt: {missing}')
-        if unexpected: warnings.warn(f'Unexpected keys in timm net ckpt: {unexpected}')
-        feat_chs = _get_dynamic_feat_chs(net, img_size, temp_device_for_init)
+    # General checkpoint loading for the 'net' object itself (if 'ckpt' is for the wrapped/feature extractor model)
+    # This logic seems a bit complex with `pretrained` flag.
+    # If ckpt is provided and pretrained is True, it implies ImageNet weights were loaded AND then a specific ckpt for 'net' should be loaded.
+    # If ckpt is provided and pretrained is False, the above blocks handle loading into 'base' (mnv3) or 'net' (timm).
+    # This might need simplification depending on the intended use of 'ckpt' and 'pretrained'.
+    # For now, let's assume the above blocks handle the primary ckpt loading.
 
-
-    net.train() # Ensure model is in train mode by default after potential .eval() in helper
+    net.train()
     return net, feat_chs
+
     
 # Convenience export
 __all__ = [
