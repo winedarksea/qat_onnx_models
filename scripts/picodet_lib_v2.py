@@ -1,7 +1,7 @@
 # picodet_lib.py
 # PyTorch 2.7 / opset‑18
 from __future__ import annotations
-import math, warnings
+import math, warnings, sys, os
 from typing import List, Tuple
 
 import torch, torch.nn as nn, torch.nn.functional as F
@@ -9,6 +9,14 @@ from torchvision.models import mobilenet_v3_small, MobileNet_V3_Small_Weights
 
 from torchvision.models.feature_extraction import create_feature_extractor
 import timm
+
+try:
+    folder_to_add = r"/home/colin/qat_onnx_models/scripts"
+    sys.path.append(folder_to_add)
+    from customMobilenetNetv4 import MobileNetV4ConvSmallPico
+except ImportError:
+    print("Warning: customMobilenetNetv4.py not found. 'mnv4_custom' backbone will not be available.")
+    MobileNetV4ConvSmallPico = None
 
 # ───────────────────────────── layers ──────────────────────────────
 class GhostConv(nn.Module):
@@ -54,15 +62,6 @@ class GhostConv(nn.Module):
         # utility to query channels
         return self.primary[0].out_channels + (self.cheap[0].out_channels if self.cheap else 0)
 
-class DWConv5x5(nn.Module):  # might be worth parameterizing to allow a 3x3 option
-    def __init__(self, c: int, inplace_act: bool = False):
-        super().__init__()
-        self.dw = nn.Conv2d(c, c, 5, 1, 2, groups=c, bias=False)
-        self.bn = nn.BatchNorm2d(c)
-        self.act = nn.ReLU6(inplace=inplace_act)
-
-    def forward(self, x):
-        return self.act(self.bn(self.dw(x)))
 
 class DWConv(nn.Module):
     def __init__(
@@ -76,6 +75,7 @@ class DWConv(nn.Module):
 
     def forward(self, x): return self.act(self.bn(self.dw(x)))
 
+
 class CSPBlock(nn.Module):
     def __init__(self, c: int, n: int = 1, m_k: int = 1, inplace_act: bool = False):
         super().__init__()
@@ -83,6 +83,10 @@ class CSPBlock(nn.Module):
         self.cv2 = GhostConv(c, c // 2, 1, inplace_act=inplace_act)
         self.m = nn.Sequential(*[GhostConv(c // 2, c // 2, k=m_k, inplace_act=inplace_act) for _ in range(n)])
         self.cv3 = GhostConv(c, c, 1, inplace_act=inplace_act)
+        for m in self.cv3.modules():
+            # this may improve stability
+            if isinstance(m, nn.BatchNorm2d):
+                nn.init.zeros_(m.weight)
 
     def forward(self, x):
         return self.cv3(torch.cat((self.m(self.cv1(x)), self.cv2(x)), 1))
@@ -101,24 +105,17 @@ class CSPPAN(nn.Module):
 
     def forward(self, c3, c4, c5):
         # top-down ------------------------------------------------------------
-        p5 = self.reduce[2](c5)                               # stride 32
-        # print(f"Shape of c5: {c5.shape}")
-        # print(f"Shape of p5 (after reduce[2]): {p5.shape}")
+        p5 = self.reduce[2](c5)
         reduced_c4 = self.reduce[1](c4)
-        # print(f"Shape of c4: {c4.shape}")
-        # print(f"Shape of reduced_c4 (self.reduce[1](c4)): {reduced_c4.shape}")
         interpolated_p5 = F.interpolate(p5, scale_factor=2, mode='nearest')
-        # print(f"Shape of interpolated_p5: {interpolated_p5.shape}")
-        # p4 = self.reduce[1](c4) + F.interpolate(p5, 2, mode='nearest')  # s16
         p4 = reduced_c4 + interpolated_p5
-        # p3 = self.reduce[0](c3) + F.interpolate(p4, 2, mode='nearest')  # s8
         p3 = self.reduce[0](c3) + F.interpolate(p4, scale_factor=2, mode='nearest')
 
         p4, p3 = self.lat[1](p4), self.lat[0](p3)
 
         # bottom-up  ---------------------------------------------------------
-        p4 = p4 + F.max_pool2d(p3, 2)   # 28→14 or 56→28 etc.
-        p5 = p5 + F.max_pool2d(p4, 2)   # 14→7  or 28→14 etc.
+        p4 = p4 + F.max_pool2d(p3, 2)
+        p5 = p5 + F.max_pool2d(p4, 2)
 
         return (self.out[0](p3), self.out[1](p4), self.out[2](p5))
 
@@ -193,7 +190,9 @@ class PicoDetHead(nn.Module):
         self.register_buffer('dfl_project_buffer', dfl_project_tensor, persistent=False)
 
         if self.cls_conv_depth <= 1:
-            self.cls_conv = nn.Sequential(GhostConv(num_feats, num_feats, k=first_cls_conv_k, inplace_act=inplace_act) for _ in range(self.cls_conv_depth))
+            self.cls_conv = nn.Sequential(
+                GhostConv(num_feats, num_feats, k=first_cls_conv_k, inplace_act=inplace_act)
+            )
         else:
             self.cls_conv = nn.Sequential(
                 GhostConv(num_feats, num_feats, k=first_cls_conv_k, inplace_act=inplace_act),
@@ -230,17 +229,25 @@ class PicoDetHead(nn.Module):
         This prevents the network from being over-confidently negative and
         makes it possible for early positive boxes to cross a 0.05 threshold.
         """
+        MULTIPLY_LOGITS = True
         # classification branches
-        cls_prior = 0.01
+        cls_prior = 0.02 if MULTIPLY_LOGITS else 0.01
         cls_bias  = -math.log((1. - cls_prior) / cls_prior)      # –4.595, use -2.19 for multiplicative sigmoid
         for conv in self.cls_pred:
             if conv.bias is not None:
                 nn.init.constant_(conv.bias, cls_bias)
 
         # objectness branches   (neutral ⇒ bias = 0.0)
+        obj_prior = 0.1 if MULTIPLY_LOGITS else 0.5
+        obj_bias = -math.log((1 - obj_prior) / obj_prior)
         for conv in self.obj_pred:
             if conv.bias is not None:
-                nn.init.constant_(conv.bias, 0.0)  # nn.init.constant_(conv.bias, -math.log((1-p)/p)) p=0.15
+                nn.init.constant_(conv.bias, obj_bias)
+
+        # regression branch
+        # for conv in self.reg_pred:
+        #     nn.init.zeros_(conv.bias)
+        #     nn.init.normal_(conv.weight, mean=0.0, std=0.001)
 
     def _dfl_to_ltrb_inference(self, x_reg_logits_3d: torch.Tensor) -> torch.Tensor:
         b, n_anchors_img, _ = x_reg_logits_3d.shape
@@ -250,11 +257,11 @@ class PicoDetHead(nn.Module):
         ltrb_offsets = (x_softmax * proj).sum(dim=3)
         return ltrb_offsets
 
-    @staticmethod # Make it a static method
+    @staticmethod
     def dfl_decode_for_training(
         x_reg_logits: torch.Tensor, 
-        dfl_project_buffer: torch.Tensor, # Pass this explicitly
-        reg_max_val: int                  # Pass this explicitly
+        dfl_project_buffer: torch.Tensor,
+        reg_max_val: int
     ) -> torch.Tensor:
         
         input_shape = x_reg_logits.shape
@@ -266,8 +273,6 @@ class PicoDetHead(nn.Module):
             # Use dfl_project_buffer passed as argument
             proj = dfl_project_buffer.view(1, 1, -1) 
             ltrb_offsets = (x_softmax * proj).sum(dim=2) # (N_total_anchors, 4)
-        # The other ndim cases (3D, 4D) from original are less likely for this training helper
-        # but can be added if needed, always using passed reg_max_val and dfl_project_buffer
         else:
             raise ValueError(
                 f"PicoDetHead.dfl_decode_for_training expects 2D input (N, 4*(M+1)), got {x_reg_logits.ndim}D"
@@ -302,16 +307,16 @@ class PicoDetHead(nn.Module):
         y2 = anchor_centers[:,1].unsqueeze(0) + ltrb[...,3]
         boxes = torch.stack([x1,y1,x2,y2], dim=-1)
 
-        scores = (cls_logit_perm + obj_logit_perm).sigmoid()
-        # scores = cls_logit_perm.sigmoid() * obj_logit_perm.sigmoid()
+        # scores = (cls_logit_perm + obj_logit_perm).sigmoid()
+        scores = cls_logit_perm.sigmoid() * obj_logit_perm.sigmoid()
         # alpha = min(1.0, epoch / warmup_epochs)
         # scores = ((1 - alpha) * (cls_logit_perm + obj_logit_perm).sigmoid() + alpha * (cls_logit_perm.sigmoid() * obj_logit_perm.sigmoid()))
         return boxes, scores
 
     def forward(self, neck_feature_maps: Tuple[torch.Tensor, ...]):
-        raw_cls_logits_levels: List[torch.Tensor] = [] # len nl
-        raw_obj_logits_levels: List[torch.Tensor] = [] # len nl
-        raw_reg_logits_levels: List[torch.Tensor] = [] # len nl
+        raw_cls_logits_levels: List[torch.Tensor] = []
+        raw_obj_logits_levels: List[torch.Tensor] = []
+        raw_reg_logits_levels: List[torch.Tensor] = []
 
         for i, f_map_level in enumerate(neck_feature_maps):
             cls_common_feat = self.cls_conv(f_map_level)
@@ -325,13 +330,12 @@ class PicoDetHead(nn.Module):
             strides_outputs_list = [self.strides_buffer[i] for i in range(self.nl)] # List[Tensor]
 
             return (
-                tuple(raw_cls_logits_levels), # Now a tuple of tensors
-                tuple(raw_obj_logits_levels), # Now a tuple of tensors
-                tuple(raw_reg_logits_levels), # Now a tuple of tensors
-                tuple(strides_outputs_list)   # Now a tuple of tensors
+                tuple(raw_cls_logits_levels),
+                tuple(raw_obj_logits_levels),
+                tuple(raw_reg_logits_levels),
+                tuple(strides_outputs_list)
             )
         else: # Inference path
-            # This path returns two Tensors
             decoded_boxes_all_levels: List[torch.Tensor] = []
             decoded_scores_all_levels: List[torch.Tensor] = []
             for i in range(self.nl):
@@ -432,12 +436,12 @@ def pick_nodes_by_stride(model: nn.Module, img_size: int = 256, desired: Tuple[i
              for name, m in model.named_modules()]
     
     # Perform dummy forward pass
-    model.eval() # Ensure eval mode for dummy pass to disable dropout etc.
+    model.eval()
     try:
         model(torch.randn(1, 3, img_size, img_size, device=device))
     finally:
         for h in hooks: h.remove()
-    model.train() # Set back to train mode
+    model.train()
 
     H_in = img_size
     stride_to_name = {}
@@ -501,8 +505,6 @@ def _get_dynamic_feat_chs(model: nn.Module, img_size: int, device: torch.device)
     features = model(dummy_input)
     
     model.to(original_device)
-    # model.train() # Caller of _get_dynamic_feat_chs should manage train/eval state if needed.
-                  # get_backbone sets net.train() at the end.
     
     if not isinstance(features, (list, tuple)) or len(features) != 3:
         # If using pick_nodes_by_stride, the number of features should match len(desired_strides)
@@ -561,8 +563,55 @@ def get_backbone(arch: str, ckpt: str | None, img_size: int = 224):
             # Re-calculate feat_chs might be needed if ckpt changed arch details, though unlikely for channels
             feat_chs = _get_dynamic_feat_chs(net, img_size, temp_device_for_init)
 
+    elif arch == "mnv4c":
+        if MobileNetV4ConvSmallPico is None:
+            raise ImportError("Cannot create 'mnv4_custom' backbone. `customMobilenetNetv4.py` not found or failed to import.")
+        
+        print("[INFO] Creating custom MobileNetV4-Small backbone for PicoDet.")
+        
+        # Define the feature levels we want, corresponding to strides 8, 16, 32
+        # The custom model's _DEFAULT_FEATURE_INDICES makes this easy and reliable.
+        feature_indices = (
+            MobileNetV4ConvSmallPico._DEFAULT_FEATURE_INDICES['p3_s8'],  # Block index for stride 8
+            MobileNetV4ConvSmallPico._DEFAULT_FEATURE_INDICES['p4_s16'], # Block index for stride 16
+            MobileNetV4ConvSmallPico._DEFAULT_FEATURE_INDICES['p5_s32'], # Block index for stride 32
+        )
+
+        net = MobileNetV4ConvSmallPico(
+            width_multiplier=1.2,
+            features_only=True,
+            out_features_indices=feature_indices,
+        )
+
+        ckpt = "mobilenet_w1_2_mnv4c_pretrained_drp0_2_fp32_backbone.pt"
+        if os.path.exists(ckpt):
+            print(f"[INFO] Loading pre-trained backbone weights from: {ckpt}")
+            # Load the state_dict saved from classifier script
+            backbone_sd = torch.load(ckpt, map_location='cpu')
+            
+            # The keys should match perfectly because you are using the same
+            # MobileNetV4ConvSmallPico class, just instantiated differently
+            # (with features_only=True vs. num_classes>0). The block names are identical.
+            missing_keys, unexpected_keys = net.load_state_dict(backbone_sd, strict=False)
+            
+            # Since the detector backbone has no classifier head, 'unexpected_keys'
+            # should be empty if the checkpoint was saved correctly (backbone only).
+            # 'missing_keys' should also be empty.
+            if missing_keys:
+                warnings.warn(f"Warning: Missing keys when loading backbone weights: {missing_keys}")
+            if unexpected_keys:
+                warnings.warn(f"Warning: Unexpected keys when loading backbone weights: {unexpected_keys}")
+            
+            print("[INFO] Successfully loaded backbone weights.")
+        else:
+            print("[INFO] Initializing backbone with random weights (no checkpoint provided).")
+        
+        # Now get the feature channel dimensions dynamically.
+        # The custom backbone already returns a list of features, so no wrapper is needed.
+        feat_chs = _get_dynamic_feat_chs(net, img_size, temp_device_for_init)
+        print(f"[INFO] Custom MNv4 feature channels: {feat_chs}")
+
     elif arch in {'mnv4s', 'mnv4m'}:
-        # ... (timm logic remains largely the same, as it uses feature_info.reduction())
         # The pick_nodes_by_stride is less critical here but could be a sanity check.
         name_map = {
             'mnv4s': 'mobilenetv4_conv_small.pyt_in1k',

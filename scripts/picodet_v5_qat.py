@@ -7,10 +7,10 @@ import traceback
 
 import torch, torch.nn as nn
 from torchvision.transforms import v2 as T
-from torchvision.datasets import CocoDetection, wrap_dataset_for_transforms_v2
+from torchvision.datasets import CocoDetection
 from torchvision.tv_tensors import BoundingBoxes
 import torchvision.ops as tvops
-from torch.utils.data import DataLoader, RandomSampler, SubsetRandomSampler
+from torch.utils.data import DataLoader
 from torch.optim import SGD, AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 import torch.nn.functional as F
@@ -48,7 +48,7 @@ CANONICAL_COCO80_MAP: dict[int, int] = {
     coco_id: i for i, coco_id in enumerate(CANONICAL_COCO80_IDS)
 }
 
-# (optional) contiguous-id → class-name  helper
+
 def contiguous_id_to_name(coco_api: COCO) -> dict[int, str]:
     """Return {0-79 → class-name} using the official 80-class list."""
     return {
@@ -116,6 +116,14 @@ def collate_v2(batch):
     imgs, tgts = zip(*batch)
     return torch.stack(imgs, 0), list(tgts)
 
+def logit_of_product(cls_raw, obj_raw):
+    p = torch.sigmoid(cls_raw) * torch.sigmoid(obj_raw)
+    eps = 1e-7
+    return torch.log(p.clamp_min(eps)) - torch.log1p(-p)
+
+def blend_joint_logit(cls_raw, obj_raw, alpha):
+    return (1 - alpha) * (cls_raw + obj_raw) + alpha * logit_of_product(cls_raw, obj_raw)
+
 # ───────────────────── assigner (SimOTA, cached) ────────────────
 class SimOTACache:
     def __init__(self,
@@ -136,6 +144,7 @@ class SimOTACache:
         self.use_obj_logit = True
         self.simota_prefilter = False
         self.dynamic_k_min = 2  # 3, or 1-2
+        self.alpha = 0.0  # additive default
 
     # ------------------------------------------------------------
     #  main call
@@ -164,7 +173,7 @@ class SimOTACache:
         # 1. collect anchor centres & strides (with cache)
         centres_l, strides_l = [], []
         for H, W, s_val in f_shapes:
-            key = (H, W, s_val, str(device))
+            key = (H, W, s_val, torch.device(device).type)  
             if key not in self.cache:
                 yv, xv = torch.meshgrid(torch.arange(H, device=device),
                                         torch.arange(W, device=device),
@@ -191,8 +200,8 @@ class SimOTACache:
         dist = (anchor_centers.unsqueeze(1)
                 - gt_centres.unsqueeze(0)).abs().max(dim=-1).values   # (A,M)
         centre_mask = dist < (self.r * anchor_strides.unsqueeze(1))   # (A,M)
-        # add inside mask filter
         if self.simota_prefilter:
+            # add inside mask filter (this needs further debugging as it removes too many boxes)
             inside_mask = (
                 (anchor_centers[:, 0].unsqueeze(1) >= gt_boxes[:, 0]) &
                 (anchor_centers[:, 0].unsqueeze(1) <= gt_boxes[:, 2]) &
@@ -216,21 +225,8 @@ class SimOTACache:
                 topk_idx = torch.topk(ious_local, k).indices
                 fg_cand_mask[valid_idx[topk_idx]] = True
 
-        # 4. cost matrix
-        # cost_loc = 1.0 - iou
-        # cost_cls = (self.cls_cost_weight * torch.ones_like(cost_loc) if (self.cls_cost_weight > 0 and self.nc > 1) else 0)
-        # ---- new classification cost -----------------------------------------
-        # Turn logits → probability *for the GT class only*.
-        #   cls_logits : (A, nc) raw class logits
-        #   obj_logits : (A,) raw objectness logits (if provided)
-        #   gt_labels : (M,)
-        # We build a (M, A) matrix where each row g uses P_joint(anchor, class=gt_g)
-        
-        eps = 1e-8 # Define eps here if not already in scope
+        eps = 1e-8
 
-        # Get raw class logits for the GT class of each GT object, for every anchor
-        # cls_logits is (A, C) raw logits. gt_labels is (M,).
-        # logit_cls_gt will be (M, A)
         num_anchors_total = cls_logits.size(0)
         idx_anchor_dim = torch.arange(num_anchors_total, device=device).unsqueeze(0).repeat(M, 1) # Shape (M, A)
         idx_class_dim = gt_labels.unsqueeze(1).repeat(1, num_anchors_total) # Shape (M, A)
@@ -241,9 +237,10 @@ class SimOTACache:
         if self.use_obj_logit and obj_logits is not None:
             # obj_logits is (A,), unsqueeze to (1,A) for broadcasting with (M,A) logit_cls_gt
             obj_logits_expanded = obj_logits.unsqueeze(0) # Shape (1, A)
-            joint_logits_for_gt_class_anchor_pairs = logit_cls_gt + obj_logits_expanded # (M, A)
-            prob_joint_gt = joint_logits_for_gt_class_anchor_pairs.sigmoid() # (M, A)
-            cost_values_for_cls_term = -torch.log(prob_joint_gt + eps) # BCE-like cost for P_joint with target 1
+            alpha = self.alpha   # you can store alpha in the class each epoch
+            joint_logits_gt = blend_joint_logit(logit_cls_gt, obj_logits_expanded, alpha)
+            prob_joint_gt = joint_logits_gt.sigmoid()       # (M , A)
+            cost_values_for_cls_term = -torch.log(prob_joint_gt + eps)
         else:
             # Fallback if obj_logits are not used or not provided (cost based on P(cls_gt) only)
             prob_cls_gt = logit_cls_gt.sigmoid() # (M, A)
@@ -294,24 +291,6 @@ class SimOTACache:
 
         return fg_final, gt_lbl_out, gt_box_out, iou_out
 
-
-# ───────────────────── COCO Label Mapping Helper ─────────────────────
-def create_coco_contiguous_label_map(coco_api):
-    """
-    Creates a mapping from original COCO category IDs to contiguous 0-indexed labels.
-    This map will include all categories present in the annotation file.
-    The order of contiguous labels is determined by the sorted order of original COCO category IDs.
-    """
-    cat_ids = coco_api.getCatIds()  # Get all category IDs present in the annotation file
-    # It's good practice to sort them to ensure a consistent mapping,
-    # especially if self.nc is based on a specific ordered subset (like the 80 standard COCO classes).
-    sorted_cat_ids = sorted(cat_ids)
-    
-    contiguous_map = {coco_id: i for i, coco_id in enumerate(sorted_cat_ids)}
-
-    print(f"[INFO] Created COCO contiguous label map. {len(contiguous_map)} categories mapped.")
-    return contiguous_map
-
 # ───────────────────── train / val loops ────────────────────────
 def train_epoch(
         model: nn.Module, loader, opt, scaler, assigner: SimOTACache,
@@ -320,18 +299,23 @@ def train_epoch(
         head_reg_max_for_loss: int,
         dfl_project_buffer_for_decode: torch.Tensor,
         max_epochs: int = 500,
-        quality_floor_vfl: float = 0.2,
-        w_cls_loss: float = 2.0,
-        w_obj_loss: float = None, # Weight for the objectness loss
+        quality_floor_vfl: float = 0.01,
+        w_cls_loss: float = 3.0,
+        w_obj_loss: float = 0.5, # Weight for the objectness loss
         w_iou_initial: float = 5.0, # Initial weight for IoU loss
         w_iou_final: float = 2.0,   # Final weight for IoU loss
         iou_weight_change_epoch: int = None, # Epoch to change IoU weight
         use_focal_loss: bool = False,
+        alpha: float = 0.5,
         debug_prints: bool = True,
 ):
     model.train()
     _, tot_loss_accum = time.time(), 0.
     total_samples_contributing_to_loss_epoch = 0
+    # Dynamic IoU loss weight
+    if iou_weight_change_epoch is None:
+        iou_weight_change_epoch = int(max_epochs * 0.4)
+    w_iou = w_iou_initial if epoch < iou_weight_change_epoch else w_iou_final
 
     for i, (imgs, tgts_batch) in enumerate(loader):
         imgs = imgs.to(device)
@@ -397,19 +381,27 @@ def train_epoch(
                 first_box_original_coords = first_tgt_original_boxes[:1].tolist() if first_tgt_original_boxes.numel() else None
                 print(f"[CHECK] Img shape {imgs[b_idx].shape}, sample {b_idx} first original box: {first_box_original_coords}")
 
+            # flatten predictions
+            cls_p_img = torch.cat([
+                lvl[b_idx].permute(1, 2, 0).reshape(-1, head_nc_for_loss)
+                for lvl in cls_preds_levels
+            ], dim=0)                                     # (A, C)
+            obj_p_img = torch.cat([
+                lvl[b_idx].permute(1, 2, 0).reshape(-1)
+                for lvl in obj_preds_levels
+            ], dim=0)                                     # (A,)
+            reg_p_img = torch.cat([
+                lvl[b_idx].permute(1,2,0).reshape(-1, 4*(head_reg_max_for_loss+1))
+                for lvl in reg_preds_levels
+            ], dim=0)
 
-            cls_p_img = torch.cat([lvl[b_idx].permute(1, 2, 0).reshape(-1, head_nc_for_loss) for lvl in cls_preds_levels], dim=0)
-            obj_p_img = torch.cat([lvl[b_idx].permute(1, 2, 0).reshape(-1) for lvl in obj_preds_levels], dim=0) # Shape (A,)
-            reg_p_img = torch.cat([lvl[b_idx].permute(1, 2, 0).reshape(-1, 4 * (head_reg_max_for_loss + 1)) for lvl in reg_preds_levels], dim=0)
-
-            obj_logits_for_assigner = obj_p_img
-
-            fg_mask_img, assigned_gt_labels_img_full, \
-            assigned_gt_boxes_img_full, assigned_iou_img_full = assigner(
+            fg_mask_img, gt_labels, gt_boxes, gt_ious = assigner(
                     fmap_shapes, device, target_dict_for_assigner,
                     cls_logits=cls_p_img, # Raw class logits
-                    obj_logits=obj_logits_for_assigner # Raw objectness logits (or None)
+                    obj_logits=obj_p_img # Raw objectness logits (or None)
             )
+            reg_p_fg_img = reg_p_img[fg_mask_img]
+            box_targets_fg_img = gt_boxes[fg_mask_img]
 
             num_fg_img = fg_mask_img.sum().item()
             loss_norm_factor = float(num_fg_img)
@@ -418,61 +410,9 @@ def train_epoch(
                 #     print(f"[DEBUG] Epoch {epoch}, Batch {i}, Image {b_idx} — No foreground samples.")
                 continue
 
-            final_fg_indices = fg_mask_img.nonzero(as_tuple=False).squeeze(1)
-            gt_labels_final_fg = assigned_gt_labels_img_full[final_fg_indices]
-
-            loss_cls = torch.tensor(0.0, device=device)
-            loss_obj = torch.tensor(0.0, device=device)
-
-            if use_focal_loss:
-                alpha, gamma = 0.25, 2.0
-            
-                cls_targets = torch.zeros_like(cls_p_img)
-                cls_targets[final_fg_indices, gt_labels_final_fg] = 1.0  # one-hot
-            
-                loss_cls = tvops.sigmoid_focal_loss(
-                    cls_p_img, cls_targets, alpha=alpha, gamma=gamma, reduction='sum'
-                ) / loss_norm_factor                          # ← divide by #FG only
-                # -----------------------------------------------------------------
-            
-                # ---------- objectness / quality focal ---------------------------
-                qfl_targets = torch.zeros_like(obj_p_img)          # (A,)
-                qfl_targets[final_fg_indices] = assigned_iou_img_full[final_fg_indices]
-            
-                loss_obj = tvops.sigmoid_focal_loss(
-                    obj_p_img, qfl_targets, alpha=alpha, gamma=gamma, reduction='sum'
-                ) / loss_norm_factor
-            else:  # Varifocal Loss path
-                progress = epoch / max_epochs if max_epochs > 0 else 0.0
-                alpha_dyn = 0.25 + (0.75 - 0.25) * 0.5 * (1 - math.cos(math.pi * progress))
-                current_vfl_instance = VarifocalLoss(alpha=alpha_dyn, gamma=2.0, reduction='sum')
-
-                # 1. Classification Loss (VarifocalLoss)
-                # VFL is applied to raw class logits. Target is IoU for the GT class.
-                cls_logits_img = cls_p_img
-                vfl_targets_img = torch.zeros_like(cls_logits_img)
-                gt_iou_final_fg = assigned_iou_img_full[final_fg_indices]
-                
-                final_vfl_quality = torch.maximum(gt_iou_final_fg, torch.tensor(quality_floor_vfl, device=device))
-                vfl_targets_img[final_fg_indices, gt_labels_final_fg] = final_vfl_quality
-
-                loss_cls_unreduced = current_vfl_instance(cls_logits_img, vfl_targets_img)
-                loss_cls = loss_cls_unreduced / loss_norm_factor
-
-                # 2. Objectness Loss (BCEWithLogitsLoss)
-                obj_logits_fg = obj_p_img[final_fg_indices]
-                obj_targets_fg = gt_iou_final_fg
-                
-                loss_obj_unreduced = F.binary_cross_entropy_with_logits(
-                    obj_logits_fg, obj_targets_fg, reduction='sum'
-                )
-                loss_obj = loss_obj_unreduced / loss_norm_factor
-
+            ##########
             # --- Distribution Focal Loss (DFL) & IoU Loss for BBox Regression ---
             # (These are independent of the classification/objectness choice above and operate on reg_p_img)
-            reg_p_fg_img = reg_p_img[fg_mask_img]
-            box_targets_fg_img = assigned_gt_boxes_img_full[fg_mask_img]
-
             strides_all_anchors_img = torch.cat(
                 [torch.full((H_lvl * W_lvl,), float(s_lvl_val), device=device)
                  for H_lvl, W_lvl, s_lvl_val in fmap_shapes], dim=0
@@ -514,7 +454,7 @@ def train_epoch(
                 box_targets_fg_img[:, 2] - anchor_centers_fg_img[:, 0],
                 box_targets_fg_img[:, 3] - anchor_centers_fg_img[:, 1],
             ], dim=1) / strides_fg_img
-            ltrb_offsets = ltrb_offsets.clamp_(0, head_reg_max_for_loss - 1e-6)
+            ltrb_offsets = ltrb_offsets.clamp_(0, head_reg_max_for_loss)
             dfl_target_dist = build_dfl_targets(ltrb_offsets, head_reg_max_for_loss)
             loss_dfl = dfl_loss(reg_p_fg_img, dfl_target_dist)
 
@@ -527,19 +467,79 @@ def train_epoch(
             ), dim=1)
             loss_iou = tvops.complete_box_iou_loss(pred_boxes_fg_img, box_targets_fg_img, reduction='sum') / num_fg_img
 
-            # Dynamic IoU loss weight
-            if iou_weight_change_epoch is None:
-                iou_weight_change_epoch = int(max_epochs * 0.4)
-            w_iou = w_iou_initial if epoch < iou_weight_change_epoch else w_iou_final
-            if w_obj_loss is None:
-                w_obj_loss = 0.5 if use_focal_loss else 2.0
-            
-            current_sample_total_loss = loss_cls + w_obj_loss * loss_obj + loss_dfl + w_iou * loss_iou
+            #########
 
-            # Store for printing the first sample's loss breakdown
-            if num_samples_with_loss_in_batch == 0 and total_samples_contributing_to_loss_epoch == 0:
-                loss_cls_print, loss_obj_print, loss_dfl_print, loss_iou_print = \
-                    loss_cls.detach(), loss_obj.detach(), loss_dfl.detach(), loss_iou.detach()
+            loss_cls = torch.tensor(0.0, device=device)
+            loss_obj = torch.tensor(0.0, device=device)
+
+            if use_focal_loss:
+                alpha, gamma = 0.25, 2.0
+
+                final_fg_indices = fg_mask_img.nonzero(as_tuple=False).squeeze(1)
+                gt_labels_final_fg = gt_labels[final_fg_indices]
+
+                cls_targets = torch.zeros_like(cls_p_img)
+                cls_targets[final_fg_indices, gt_labels_final_fg] = 1.0  # one-hot
+            
+                loss_cls = tvops.sigmoid_focal_loss(
+                    cls_p_img, cls_targets, alpha=alpha, gamma=gamma, reduction='sum'
+                ) / loss_norm_factor                          # ← divide by #FG only
+                # -----------------------------------------------------------------
+            
+                # ---------- objectness / quality focal ---------------------------
+                qfl_targets = torch.zeros_like(obj_p_img)          # (A,)
+                qfl_targets[final_fg_indices] = gt_ious[final_fg_indices]
+
+                loss_obj = F.binary_cross_entropy_with_logits(
+                    obj_p_img, qfl_targets, reduction='sum'
+                ) / loss_norm_factor
+
+                current_sample_total_loss = loss_cls * w_cls_loss + w_obj_loss * loss_obj + loss_dfl + w_iou * loss_iou
+                # Store for printing the first sample's loss breakdown
+                if num_samples_with_loss_in_batch == 0 and total_samples_contributing_to_loss_epoch == 0:
+                    loss_cls_print, loss_obj_print, loss_dfl_print, loss_iou_print = \
+                        loss_cls.detach(), loss_obj.detach(), loss_dfl.detach(), loss_iou.detach()
+
+            else:  # Varifocal Loss path (final)
+                # — dynamic vfl alpha scheduling —
+                progress = epoch / max_epochs if max_epochs > 0 else 0.0
+                alpha_dyn = 0.25 + (0.75 - 0.25) * 0.5 * (1 - math.cos(math.pi * progress))
+            
+                # sum‐reduction so we can normalize ourselves
+                vfl = VarifocalLoss(alpha=alpha_dyn, gamma=2.0, reduction='sum')
+            
+                # — build “quality” targets: IoU for FG, 0 for BG —
+                quality_floor = torch.tensor(
+                    quality_floor_vfl, device=device, dtype=gt_ious.dtype
+                )
+                quality = torch.zeros_like(gt_ious, dtype=gt_ious.dtype, device=device)
+                quality[fg_mask_img] = torch.maximum(gt_ious[fg_mask_img], quality_floor)
+            
+                # — joint logits for VFL —
+                # (cls + obj) broadcast-adds the objectness scalar to each class logit
+                # joint_logits = cls_p_img + obj_p_img.unsqueeze(1)  # (A, C)
+                joint_logits = blend_joint_logit(cls_p_img, obj_p_img.unsqueeze(1), alpha)
+            
+                # — VFL targets: zero everywhere except FG[class] = quality —
+                vfl_targets = torch.zeros_like(joint_logits, dtype=joint_logits.dtype)
+                pos_idx = fg_mask_img.nonzero(as_tuple=False).squeeze(1)
+                vfl_targets[pos_idx, gt_labels[pos_idx]] = quality[pos_idx]
+            
+                # sum reduction + normalize by #FG
+                loss_vfl_unreduced = vfl(joint_logits, vfl_targets)
+                loss_vfl = loss_vfl_unreduced / num_fg_img
+
+                # — final sample loss —
+                w_vfl = w_cls_loss  # loss_obj not needed here as vfl combines it
+                current_sample_total_loss = (
+                    w_vfl  * loss_vfl
+                  + loss_dfl
+                  + w_iou * loss_iou
+                )
+                # relabel vfl as class loss here for simplicity
+                if num_samples_with_loss_in_batch == 0 and total_samples_contributing_to_loss_epoch == 0:
+                    loss_cls_print, loss_obj_print, loss_dfl_print, loss_iou_print = \
+                        loss_vfl.detach(), loss_obj.detach(), loss_dfl.detach(), loss_iou.detach()
 
             batch_total_loss += current_sample_total_loss
             num_samples_with_loss_in_batch += 1
@@ -548,7 +548,18 @@ def train_epoch(
             averaged_batch_loss = batch_total_loss / num_samples_with_loss_in_batch
             opt.zero_grad(set_to_none=True)
             scaler.scale(averaged_batch_loss).backward()
-            # torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0) # Optional gradient clipping
+            scaler.unscale_(opt)
+            ### Norm sizing debug
+            total_norm = 0.0
+            for p in model.parameters():
+                if p.grad is not None:
+                    param_norm = p.grad.detach().data.norm(2)
+                    total_norm += param_norm.item() ** 2
+            total_norm = total_norm ** 0.5
+            if i % 1000 == 0: # Print every 100 batches
+                print(f"Batch {i}, Total Grad Norm: {total_norm:.4f}")
+            gradient_norm = 12.0  # 1.0 to 10.0 common, max gradient observed in debug was around 6
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=gradient_norm)
             scaler.step(opt); scaler.update()
             tot_loss_accum += averaged_batch_loss.item() * num_samples_with_loss_in_batch
             total_samples_contributing_to_loss_epoch += num_samples_with_loss_in_batch
@@ -817,7 +828,6 @@ def quick_val_iou(
         print(f"Params: score_thresh={score_thresh}, iou_thresh={iou_thresh}, max_detections={max_detections}")
 
     for batch_idx, (imgs_batch, tgts_batch) in enumerate(loader):
-        # Model now outputs raw boxes and scores
         raw_pred_boxes_batch, raw_pred_scores_batch = model(imgs_batch.to(device))
         # raw_pred_boxes_batch: (B, Total_Anchors, 4)
         # raw_pred_scores_batch: (B, Total_Anchors, NC)
@@ -877,7 +887,6 @@ def quick_val_iou(
             total_preds_after_nms_filter_across_images += num_actual_dets_this_img
 
             actual_predicted_boxes = predicted_boxes_for_img_padded[:num_actual_dets_this_img]
-            # actual_predicted_scores = predicted_scores_for_img_padded[:num_actual_dets_this_img]
 
             if debug_prints and batch_idx == 0 and i < 2: # Log for first few images with GT
                 print(f"[Debug Eval Img {num_images_processed-1}] GTs: {len(gt_boxes_list)}. Score Thresh: {score_thresh}.")
@@ -1009,14 +1018,6 @@ class PostprocessorForONNX(nn.Module):
         return boxes_xyxy_level, scores_level
 
     def forward(self, raw_model_outputs_nested_tuple: Tuple[Tuple[torch.Tensor, ...], ...]):
-        # raw_model_outputs_nested_tuple is now expected to be the 4-element tuple,
-        # where the first 3 elements are themselves tuples of 3 tensors each.
-        # ( (cls_l0, cls_l1, cls_l2),
-        #   (obj_l0, obj_l1, obj_l2),
-        #   (reg_l0, reg_l1, reg_l2),
-        #   (str_l0, str_l1, str_l2)  <- strides, might not be needed if using self.strides_buffer
-        # )
-
         if not isinstance(raw_model_outputs_nested_tuple, tuple) or len(raw_model_outputs_nested_tuple) < 3:
             raise ValueError(
                 f"PostprocessorForONNX expected a nested tuple with at least 3 inner tuples, "
@@ -1064,7 +1065,7 @@ class PostprocessorForONNX(nn.Module):
 
 class ONNXExportablePicoDet(nn.Module):
     def __init__(self,
-                 quantized_core_model: nn.Module, # This is int8_model_with_preprocessor
+                 quantized_core_model: nn.Module,
                  head_postprocessor: PostprocessorForONNX):
         super().__init__()
         self.core_model = quantized_core_model
@@ -1257,7 +1258,7 @@ def save_intermediate_onnx(qat_model, cfg, model):
         int8_model_with_preprocessor, # The FX GraphModule from convert_fx
         onnx_postprocessor
     )
-    final_exportable_int8_model.cpu().eval() # Ensure CPU and eval mode for export
+    final_exportable_int8_model.cpu().eval()
 
     # ---------------- ONNX export (model WITH preprocessor AND wrapped postprocessor, without NMS) ----------------
     temp_onnx_path = cfg.out.replace(".onnx", "_temp_no_nms.onnx")
@@ -1271,7 +1272,6 @@ def save_intermediate_onnx(qat_model, cfg, model):
         actual_onnx_input_example,
         temp_onnx_path,
         input_names=['images_uint8'],
-        # These output names now correspond to the (B, TotalAnchors, 4/NC) tensors
         output_names=['raw_boxes', 'raw_scores'],
         dynamic_axes={
             'images_uint8': {0: 'batch', 2: 'h', 3: 'w'},
@@ -1280,7 +1280,7 @@ def save_intermediate_onnx(qat_model, cfg, model):
                                                         # The 3rd dim (num_classes) is static
         },
         opset_version=18,
-        keep_initializers_as_inputs=False, # Important for some runtimes
+        keep_initializers_as_inputs=False,
         do_constant_folding=True,
     )
     print(f'[SAVE] Intermediate ONNX (no NMS, with wrapped postprocessor) → {temp_onnx_path}')
@@ -1290,8 +1290,8 @@ def save_intermediate_onnx(qat_model, cfg, model):
 def main(argv: List[str] | None = None):
     pa = argparse.ArgumentParser()
     pa.add_argument('--coco_root', default='coco')
-    pa.add_argument('--arch', choices=['mnv3', 'mnv4s', 'mnv4m'], default='mnv3')
-    pa.add_argument('--epochs', type=int, default=15) 
+    pa.add_argument('--arch', default='mnv4c', choices=['mnv3', 'mnv4s', 'mnv4', 'mnv4c'])
+    pa.add_argument('--epochs', type=int, default=10) 
     pa.add_argument('--batch', type=int, default=16)
     pa.add_argument('--workers', type=int, default=0)
     pa.add_argument('--device', default=None)
@@ -1299,10 +1299,11 @@ def main(argv: List[str] | None = None):
     pa.add_argument('--no_inplace_head_neck', default=True, action='store_true', help="Disable inplace activations in head/neck")
     cfg = pa.parse_args(argv)
 
-    TRAIN_SUBSET = None
+    TRAIN_SUBSET = 50000
     VAL_SUBSET   = 2000
     debug_prints = True
     BACKBONE_FREEZE_EPOCHS = 2 if cfg.epochs < 12 else 3  # 0 to disable
+    alpha_warmup_epochs = 10
 
     if cfg.device is None:
         cfg.device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -1325,7 +1326,6 @@ def main(argv: List[str] | None = None):
         f"{root}/train2017",
         f"{root}/annotations/instances_train2017.json",
     )
-    # coco_label_map = build_coco_label_map(coco_train_raw.coco)   # 80 contiguous ids
     coco_label_map = CANONICAL_COCO80_MAP
 
     train_ds = CocoDetectionV2(
@@ -1396,7 +1396,7 @@ def main(argv: List[str] | None = None):
         print(f"[INFO] AdamW: {len(param_groups[0]['params'])} params with WD, {len(param_groups[1]['params'])} params without WD.")
         opt = AdamW(
             param_groups,
-            lr=peak_lr_adamw, # This is the target LR that LinearLR will reach
+            lr=peak_lr_adamw,
             betas=(beta1_adamw, beta2_adamw),
             eps=eps_adamw
         )
@@ -1424,7 +1424,6 @@ def main(argv: List[str] | None = None):
         warmup_epochs = 3
         cosine_decay_alpha = 0.0
         opt = SGD(model.parameters(), lr=base_lr, momentum=0.9, weight_decay=1e-4)
-        # sch = CosineAnnealingLR(opt, T_max=cfg.epochs, eta_min=base_lr * 0.01)
         warmup_scheduler = LinearLR(
             opt,
             start_factor=1e-5,
@@ -1442,12 +1441,13 @@ def main(argv: List[str] | None = None):
             milestones=[warmup_epochs]
         )
     scaler = torch.amp.GradScaler(enabled=dev.type == 'cuda')
-    
+
+    use_focal_loss = False
     assigner = SimOTACache(
         nc=model.head.nc,
         ctr=2.5,  # 2.5
         topk=20,  # 10
-        cls_cost_weight=0.5,
+        cls_cost_weight=1.0 if use_focal_loss else 0.5,
         debug_epochs=5 if debug_prints else 0,
     )
 
@@ -1469,17 +1469,21 @@ def main(argv: List[str] | None = None):
             print("[INFO] Backbone unfrozen – full network now training")
 
         model.train()
+        alpha = min(0.9, ep / alpha_warmup_epochs)
+        assigner.alpha = alpha
         l = train_epoch(
             model, tr_loader, opt, scaler, assigner, dev, ep, coco_label_map,
             head_nc_for_loss=original_model_head_nc,
             head_reg_max_for_loss=original_model_head_reg_max,
             dfl_project_buffer_for_decode=original_dfl_project_buffer,
             max_epochs=cfg.epochs, # Pass total epochs for VFL alpha scheduling
-            quality_floor_vfl=0.2,  # Example, tune as needed
+            quality_floor_vfl=0.02,
             debug_prints=debug_prints,
+            alpha=alpha,
+            use_focal_loss=use_focal_loss,
         )
         # ... (validation) ...
-        model.eval() 
+        model.eval()
         m = quick_val_iou(
             model, vl_loader, dev,
             score_thresh=model.head.score_th,
@@ -1499,10 +1503,10 @@ def main(argv: List[str] | None = None):
     model.eval()
     try:
         iou_05 = quick_val_iou(model, vl_loader, dev,
-                               score_thresh=0.05, # Specifically pass 0.05
-                               iou_thresh=model.head.iou_th, # Or your chosen NMS IoU
+                               score_thresh=0.05,
+                               iou_thresh=model.head.iou_th,
                                max_detections=model.head.max_det,
-                               epoch_num=ep, # If in training loop
+                               epoch_num=ep,
                                run_name="score_thresh_0.05",
                                debug_prints=debug_prints,
                                )
@@ -1510,7 +1514,7 @@ def main(argv: List[str] | None = None):
         
         # Run for score_thresh = 0.25
         iou_25 = quick_val_iou(model, vl_loader, dev,
-                               score_thresh=0.25, # Specifically pass 0.25
+                               score_thresh=0.25,
                                iou_thresh=model.head.iou_th,
                                max_detections=model.head.max_det,
                                epoch_num=ep,
@@ -1540,15 +1544,21 @@ def main(argv: List[str] | None = None):
     # but it will be part of the traced graph.
     qat_model = qat_prepare(model, example_input_for_qat_entire_model)
     qat_model = qat_model.to(dev)
+    freeze_qat_stats = False
+    if freeze_qat_stats:
+        for m in qat_model.modules():
+            if isinstance(m, nn.BatchNorm2d):
+                m.eval()          # freeze running stats
+                m.track_running_stats = False
     print("[INFO] QAT model prepared and moved to device.")
 
     # --- QAT Finetuning ---
-    qat_model.train() # Ensure model is in training mode for QAT
+    qat_model.train()
 
     qat_epochs = int(cfg.epochs * 0.2)
     qat_epochs = 3 if qat_epochs < 3 else qat_epochs
 
-    qat_initial_lr = 0.0005
+    qat_initial_lr = 0.00025
     
     # Filter parameters for QAT optimizer
     opt_q_params = filter(lambda p: p.requires_grad, qat_model.parameters())
@@ -1572,9 +1582,11 @@ def main(argv: List[str] | None = None):
             head_reg_max_for_loss=original_model_head_reg_max,
             dfl_project_buffer_for_decode=original_dfl_project_buffer,
             max_epochs=qat_epochs, # For VFL alpha scheduling (relative to QAT duration)
-            quality_floor_vfl=0.2,
+            quality_floor_vfl=0.02,
             iou_weight_change_epoch=2,
             debug_prints=False,
+            alpha=0.98, # should be well enough trained for multiplicative focus
+            use_focal_loss=use_focal_loss,
         )
         scheduler_q.step() # Step the QAT LR scheduler
 
@@ -1611,9 +1623,6 @@ def main(argv: List[str] | None = None):
                 final_exportable_int8_model, int8_model_with_preprocessor, actual_onnx_input_example, temp_onnx_path = save_intermediate_onnx(
                     qat_model, cfg, model
                 )
-                # best_qat_model_state = qat_model.state_dict() # If saving in memory
-                # Or save to disk:
-                # torch.save(qat_model.state_dict(), f"best_qat_model_epoch_{qep+1}.pth")
                 print(f"[QAT] New best QAT validation IoU: {best_qat_iou:.4f}. Model saved.")
 
         except Exception as e:
@@ -1631,7 +1640,6 @@ def main(argv: List[str] | None = None):
         intermediate_model_check = onnx.load(temp_onnx_path)
         print("[DEBUG] Intermediate ONNX model input ValueInfo:")
         for input_vi in intermediate_model_check.graph.input:
-            # ... (same detailed print logic as for outputs) ...
             if hasattr(input_vi.type, 'tensor_type'):
                 tensor_type = input_vi.type.tensor_type
                 elem_type = tensor_type.elem_type
@@ -1662,11 +1670,10 @@ def main(argv: List[str] | None = None):
     
         print("[DEBUG] Running PyTorch forward pass on int8_model_with_preprocessor...")
         try:
-            # Ensure model is on CPU for this test if actual_onnx_input_example is on CPU
-            int8_model_with_preprocessor.cpu().eval() # Ensure CPU and eval
+            int8_model_with_preprocessor.cpu().eval()
             actual_onnx_input_example_cpu = actual_onnx_input_example.cpu()
     
-            py_outputs = int8_model_with_preprocessor(actual_onnx_input_example_cpu) # Call it
+            py_outputs = int8_model_with_preprocessor(actual_onnx_input_example_cpu)
     
             print(f"  [PyTorch Output] Type of py_outputs: {type(py_outputs)}")
             if isinstance(py_outputs, (tuple, list)):
@@ -1688,8 +1695,8 @@ def main(argv: List[str] | None = None):
             traceback.print_exc()
         
         print("[DEBUG] Inspecting output of int8_model_with_preprocessor directly...")
-        int8_model_with_preprocessor.cpu().eval() # Ensure it's on CPU and eval
-        dummy_input_for_inspection = actual_onnx_input_example.cpu() # Or generate a new one
+        int8_model_with_preprocessor.cpu().eval()
+        dummy_input_for_inspection = actual_onnx_input_example.cpu()
         
         try:
             core_model_outputs = int8_model_with_preprocessor(dummy_input_for_inspection)
@@ -1707,7 +1714,6 @@ def main(argv: List[str] | None = None):
                 print(f"  [Core Model Output] Unexpected output type: {type(core_model_outputs)}")
         except Exception as e:
             print(f"  [Core Model Output] Error during direct call: {e}")
-            import traceback
             traceback.print_exc()
     
     
@@ -1722,7 +1728,6 @@ def main(argv: List[str] | None = None):
                 print("    Unexpected output structure from final_exportable_int8_model.")
         except Exception as e:
             print(f"  [PyTorch Final Exportable Output] Error during PyTorch forward: {e}")
-            import traceback
             traceback.print_exc()
 
     # ---------------- Append NMS to the ONNX model ------------------------------
