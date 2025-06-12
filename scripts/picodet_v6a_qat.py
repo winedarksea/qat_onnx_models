@@ -1,671 +1,226 @@
-# train_picodet_qat.py – minimal pipeline: COCO ➜ FP32 ➜ QAT ➜ INT8 ➜ ONNX (with NMS)
-# built on pytorch version 2.7
 from __future__ import annotations
-import argparse, random, time, warnings, math, copy
+import argparse, random, time, warnings, math, copy, traceback
 from typing import List, Tuple
-import traceback
 
-import torch, torch.nn as nn
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
+from torch.optim import SGD, AdamW
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torchvision.transforms import v2 as T
 from torchvision.datasets import CocoDetection
 from torchvision.tv_tensors import BoundingBoxes
 import torchvision.ops as tvops
-from torch.utils.data import DataLoader
-from torch.optim import SGD, AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
-import torch.nn.functional as F
+from pycocotools.coco import COCO
+
+from torch.ao.quantization import (
+    get_default_qat_qconfig_mapping, QConfig,
+    MovingAveragePerChannelMinMaxObserver, MovingAverageMinMaxObserver
+)
+from torch.ao.quantization.quantize_fx import prepare_qat_fx, convert_fx
 
 import onnx
 from onnx import TensorProto as TP, helper as oh
 
-from pycocotools.coco import COCO
-
-try: 
-    from picodet_lib_v2 import (
-        PicoDet, get_backbone, VarifocalLoss, dfl_loss,
-        build_dfl_targets, PicoDetHead
-    )
-except Exception:
-    # when running manually in console, these are already loaded
-    pass
-
-warnings.filterwarnings('ignore', category=UserWarning)
-SEED = 42; random.seed(SEED); torch.manual_seed(SEED)
-IMG_SIZE = 256  # also subset for speed, 224, PicoDet’s anchors assume stride-divisible sizes. Divisible by 32
+# Import refactored PicoDet library
+from picodet_lib import (
+    PicoDet, get_backbone,
+    VarifocalLoss, dfl_loss, build_dfl_targets,
+    generate_anchors, ATSSAssigner, PicoDetHead,
+)
 
 # ───────────────────── data & transforms ───────────────────────
-# COCO’s official 80-class list (order matters!)
-CANONICAL_COCO80_IDS: list[int] = [
-     1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 13, 14, 15, 16, 17,
-    18, 19, 20, 21, 22, 23, 24, 25, 27, 28, 31, 32, 33, 34, 35, 36,
-    37, 38, 39, 40, 41, 42, 43, 44, 46, 47, 48, 49, 50, 51, 52, 53,
-    54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 67, 70, 72, 73,
-    74, 75, 76, 77, 78, 79, 80, 81, 82, 84, 85, 86, 87, 88, 89, 90,
-]
+SEED = 42
+random.seed(SEED)
+torch.manual_seed(SEED)
 
-# { COCO-category-id  →  contiguous-id 0-79 }
-CANONICAL_COCO80_MAP: dict[int, int] = {
-    coco_id: i for i, coco_id in enumerate(CANONICAL_COCO80_IDS)
-}
+IMG_SIZE = 256
+# COCO 80-class mapping
+CANONICAL_COCO80_IDS = [1,2,3,4,5,6,7,8,9,10,11,13,14,15,16,17,
+                        18,19,20,21,22,23,24,25,27,28,31,32,33,34,35,36,
+                        37,38,39,40,41,42,43,44,46,47,48,49,50,51,52,53,
+                        54,55,56,57,58,59,60,61,62,63,64,65,67,70,72,73,
+                        74,75,76,77,78,79,80,81,82,84,85,86,87,88,89,90]
+CANONICAL_COCO80_MAP = {cid:i for i,cid in enumerate(CANONICAL_COCO80_IDS)}
 
+def contiguous_id_to_name(coco_api: COCO) -> dict[int,str]:
+    return {i: coco_api.loadCats([coco_id])[0]["name"]
+            for i,coco_id in enumerate(CANONICAL_COCO80_IDS)}
 
-def contiguous_id_to_name(coco_api: COCO) -> dict[int, str]:
-    """Return {0-79 → class-name} using the official 80-class list."""
-    return {
-        i: coco_api.loadCats([coco_id])[0]["name"]
-        for i, coco_id in enumerate(CANONICAL_COCO80_IDS)
-    }
-
-# ---------- contiguous label map ----------
-def build_coco_label_map(coco):
-    cat_ids = sorted(coco.getCatIds())                 # 1 … 90,92,93…
-    return {cid: i for i, cid in enumerate(cat_ids)}   # 0-based contiguous
-
-# ---------- COCO → tv_tensors utility ----------
-def _coco_to_tvt(annots, lb_map, canvas):
-    boxes, labels = [], []
-    W, H = canvas                                    # PIL size is (W,H)
-    for a in annots:
-        if a.get("iscrowd", 0):
-            continue
-        cid = a["category_id"]
-        if cid not in lb_map:                        # skip classes >79
-            continue
-        x, y, w, h = a["bbox"]                       # COCO XYWH
-        boxes.append([x, y, x + w, y + h])
-        labels.append(lb_map[cid])
-
-    if not boxes:                                    # keep training stable
-        boxes  = torch.zeros((0, 4), dtype=torch.float32)
-        labels = torch.zeros((0,),  dtype=torch.int64)
-
-    bbx = BoundingBoxes(
-        torch.as_tensor(boxes, dtype=torch.float32),
-        format="XYXY", canvas_size=(H, W)
-    )
-    return {"boxes": bbx, "labels": torch.as_tensor(labels, dtype=torch.int64)}
-
-# ---------- dataset wrapper ----------
 class CocoDetectionV2(CocoDetection):
-    """COCO dataset ready for torchvision-v2 transforms."""
     def __init__(self, img_dir, ann_file, lb_map, transforms=None):
-        super().__init__(img_dir, ann_file)           # PIL, list[dict]
+        super().__init__(img_dir, ann_file)
         self.lb_map = lb_map
-        self._tf    = transforms
-
+        self._tf = transforms
     def __getitem__(self, idx):
         img, anns = super().__getitem__(idx)
-        tgt = _coco_to_tvt(anns, self.lb_map, img.size)
-        if self._tf is not None:                      # v2 ops work on (img,tgt)
-            img, tgt = self._tf(img, tgt)
+        boxes, labels = [], []
+        W,H = img.size
+        for a in anns:
+            if a.get("iscrowd",0): continue
+            cid = a["category_id"]
+            if cid not in self.lb_map: continue
+            x,y,w,h = a["bbox"]
+            boxes.append([x,y,x+w,y+h])
+            labels.append(self.lb_map[cid])
+        if not boxes:
+            boxes = torch.zeros((0,4),dtype=torch.float32)
+            labels = torch.zeros((0,),dtype=torch.int64)
+        bbx = BoundingBoxes(
+            torch.as_tensor(boxes,dtype=torch.float32),
+            format="XYXY", canvas_size=(H,W)
+        )
+        tgt = {"boxes": bbx, "labels": torch.as_tensor(labels,dtype=torch.int64)}
+        if self._tf:
+            return self._tf(img, tgt)
         return img, tgt
 
-# ---------- transforms ----------
-def build_transforms(size, train):
-    aug = [
-        T.ToImage(),                                 # PIL → tv_tensors.Image
-        T.RandomHorizontalFlip(0.25) if train else T.Identity(),
-        T.RandomResizedCrop(size, scale=(0.8, 1.0), antialias=True) if train else T.Resize(size, antialias=True),
-        T.ColorJitter(0.2, 0.2, 0.2, 0.1) if train else T.Identity(),
-        T.ToDtype(torch.uint8, scale=True),          # keep uint8, model normalises
-    ]
-    return T.Compose(aug)
+class ComposeTransforms:
+    def __init__(self, size, train: bool):
+        ops = [T.ToImage()]
+        if train:
+            ops += [T.RandomHorizontalFlip(0.25),
+                    T.RandomResizedCrop(size, scale=(0.8,1.0), antialias=True),
+                    T.ColorJitter(0.2,0.2,0.2,0.1)]
+        else:
+            ops += [T.Resize(size, antialias=True)]
+        ops.append(T.ToDtype(torch.uint8, scale=True))
+        self._c = T.Compose(ops)
+    def __call__(self, img, tgt): return self._c(img, tgt)
 
-# ---------- collate ----------
 def collate_v2(batch):
     imgs, tgts = zip(*batch)
-    return torch.stack(imgs, 0), list(tgts)
+    return torch.stack(imgs,0), list(tgts)
 
-def logit_of_product(cls_raw, obj_raw):
-    p = torch.sigmoid(cls_raw) * torch.sigmoid(obj_raw)
-    eps = 1e-7
-    return torch.log(p.clamp_min(eps)) - torch.log1p(-p)
+# ───────────────────── assigner + anchors ─────────────────────
+# Using generate_anchors, ATSSAssigner from picodet_lib
 
-def blend_joint_logit(cls_raw, obj_raw, alpha):
-    return (1 - alpha) * (cls_raw + obj_raw) + alpha * logit_of_product(cls_raw, obj_raw)
-
-# ───────────────────── assigner (SimOTA, cached) ────────────────
-class SimOTACache:
-    def __init__(self,
-                 nc: int,
-                 ctr: float = 2.5,
-                 topk: int = 10,
-                 cls_cost_weight: float = 0.5,
-                 debug_epochs: int = 0,         # 0 = silent
-                 ):
-        self.nc = nc
-        self.r = ctr
-        self.k = topk
-        self.cls_cost_weight = cls_cost_weight
-        self.cache = {}               # anchor centres per (H,W,stride,device)
-        # debug
-        self._dbg_mod  = debug_epochs
-        self._dbg_iter = 0
-        self.use_obj_logit = True
-        self.simota_prefilter = False
-        self.dynamic_k_min = 2  # 3, or 1-2
-        self.alpha = 0.0  # additive default
-
-    # ------------------------------------------------------------
-    #  main call
-    # ------------------------------------------------------------
-    @torch.no_grad()
-    def __call__(self,
-                 f_shapes,               # List[(H,W,stride)]
-                 device: torch.device,  # Use a consistent device key string in order to avoid a cache miss
-                 tgt: dict,              # {"boxes":(M,4), "labels":(M,)}
-                 cls_logits: torch.Tensor, # Raw class logits (A, C) from model
-                 obj_logits: torch.Tensor | None = None,
-                 ):
-
-        # 0. early-exit if no GT
-        gt_boxes = tgt['boxes']
-        gt_labels = tgt['labels']
-        M = gt_boxes.size(0)
-        if M == 0:
-            A = sum(H * W for H, W, _ in f_shapes)
-            empty_bool = torch.zeros(A, dtype=torch.bool,  device=device)
-            return empty_bool,            \
-                   torch.full((A,), -1,   dtype=torch.long,  device=device), \
-                   torch.zeros((A, 4),    dtype=torch.float32, device=device), \
-                   torch.zeros((A,),      dtype=torch.float32, device=device)
-
-        # 1. collect anchor centres & strides (with cache)
-        centres_l, strides_l = [], []
-        for H, W, s_val in f_shapes:
-            key = (H, W, s_val, torch.device(device).type)  
-            if key not in self.cache:
-                yv, xv = torch.meshgrid(torch.arange(H, device=device),
-                                        torch.arange(W, device=device),
-                                        indexing='ij')
-                centres = (torch.stack((xv, yv), 2).view(-1, 2).float() + 0.5) * float(s_val)
-                self.cache[key] = centres
-            centres_l.append(self.cache[key])
-            strides_l.append(torch.full((H * W,),
-                                        float(s_val),
-                                        dtype=torch.float32,
-                                        device=device))
-
-        anchor_centers = torch.cat(centres_l, 0)     # (A,2)
-        anchor_strides = torch.cat(strides_l, 0)     # (A,)
-        A = anchor_centers.size(0)
-
-        # 2. IoU and centre-radius mask
-        s_div_2 = anchor_strides.unsqueeze(1) / 2.0
-        anchor_candidate_boxes = torch.cat([anchor_centers - s_div_2,
-                                            anchor_centers + s_div_2], 1)
-        iou = tvops.box_iou(gt_boxes, anchor_candidate_boxes)     # (M,A)
-
-        gt_centres = (gt_boxes[:, :2] + gt_boxes[:, 2:]) / 2.0
-        dist = (anchor_centers.unsqueeze(1)
-                - gt_centres.unsqueeze(0)).abs().max(dim=-1).values   # (A,M)
-        centre_mask = dist < (self.r * anchor_strides.unsqueeze(1))   # (A,M)
-        if self.simota_prefilter:
-            # add inside mask filter (this needs further debugging as it removes too many boxes)
-            inside_mask = (
-                (anchor_centers[:, 0].unsqueeze(1) >= gt_boxes[:, 0]) &
-                (anchor_centers[:, 0].unsqueeze(1) <= gt_boxes[:, 2]) &
-                (anchor_centers[:, 1].unsqueeze(1) >= gt_boxes[:, 1]) &
-                (anchor_centers[:, 1].unsqueeze(1) <= gt_boxes[:, 3])
-            )                                                            # (A, M)
-            
-            centre_mask = centre_mask & inside_mask   # keep only anchors whose centre lies inside bbox
-
-        # 3. dynamic-k candidates
-        iou_sum_per_gt = iou.sum(1)
-        dynamic_ks = torch.clamp(iou_sum_per_gt.ceil().int(),  # ceil not floor
-                                 min=self.dynamic_k_min, max=self.k)
-        fg_cand_mask = torch.zeros(A, dtype=torch.bool, device=device)
-
-        for g in range(M):
-            valid_idx = centre_mask[:, g].nonzero(as_tuple=False).squeeze(1)
-            if valid_idx.numel():
-                ious_local = iou[g, valid_idx]
-                k = min(dynamic_ks[g].item(), valid_idx.numel())
-                topk_idx = torch.topk(ious_local, k).indices
-                fg_cand_mask[valid_idx[topk_idx]] = True
-
-        eps = 1e-8
-
-        num_anchors_total = cls_logits.size(0)
-        idx_anchor_dim = torch.arange(num_anchors_total, device=device).unsqueeze(0).repeat(M, 1) # Shape (M, A)
-        idx_class_dim = gt_labels.unsqueeze(1).repeat(1, num_anchors_total) # Shape (M, A)
-        logit_cls_gt = cls_logits[idx_anchor_dim, idx_class_dim] # Shape (M, A)
-
-        cost_values_for_cls_term = torch.zeros((M, A), device=device, dtype=cls_logits.dtype)
-
-        if self.use_obj_logit and obj_logits is not None:
-            # obj_logits is (A,), unsqueeze to (1,A) for broadcasting with (M,A) logit_cls_gt
-            obj_logits_expanded = obj_logits.unsqueeze(0) # Shape (1, A)
-            alpha = self.alpha   # you can store alpha in the class each epoch
-            joint_logits_gt = blend_joint_logit(logit_cls_gt, obj_logits_expanded, alpha)
-            prob_joint_gt = joint_logits_gt.sigmoid()       # (M , A)
-            cost_values_for_cls_term = -torch.log(prob_joint_gt + eps)
-        else:
-            # Fallback if obj_logits are not used or not provided (cost based on P(cls_gt) only)
-            prob_cls_gt = logit_cls_gt.sigmoid() # (M, A)
-            cost_values_for_cls_term = -torch.log(prob_cls_gt + eps)
-        
-        cost_cls = self.cls_cost_weight * cost_values_for_cls_term
-        # ----------------------------------------------------------------------
-        
-        cost_loc = 1.0 - iou                                # (M, A)
-        large_pen = torch.tensor(1e4, device=device, dtype=cost_loc.dtype) # Ensure dtype matches
-        cost = (cost_loc + cost_cls
-                + (~centre_mask.T) * large_pen
-                + (~fg_cand_mask.unsqueeze(0)) * large_pen)
-
-        assign_gt = cost.argmin(0)                # (A,)
-
-        # 5. final fg mask = candidate ∧ in-centre of its chosen GT
-        fg_final = torch.zeros(A, dtype=torch.bool, device=device)
-        cand_idx = fg_cand_mask.nonzero(as_tuple=False).squeeze(1)
-        if cand_idx.numel():
-            in_centre = centre_mask[cand_idx, assign_gt[cand_idx]]
-            fg_final[cand_idx[in_centre]] = True
-
-        # 6. build outputs
-        gt_lbl_out = torch.full((A,), -1, dtype=torch.long,  device=device)
-        gt_box_out = torch.zeros((A, 4), dtype=torch.float32, device=device)
-        iou_out    = torch.zeros((A,),  dtype=torch.float32, device=device)
-
-        if fg_final.any():
-            fg_idx  = fg_final.nonzero(as_tuple=False).squeeze(1)
-            gt_idx  = assign_gt[fg_idx]
-            gt_lbl_out[fg_idx] = gt_labels[gt_idx]
-            gt_box_out[fg_idx] = gt_boxes[gt_idx]
-            iou_out[fg_idx]    = iou[gt_idx, fg_idx]
-
-        # 7. lightweight debug  -----------------------------------------
-        if self._dbg_mod and (self._dbg_iter % (1000 * self._dbg_mod) == 0):
-            num_fg   = fg_final.sum().item()
-            num_cand = fg_cand_mask.sum().item()
-            mean_iou = iou_out[fg_final].mean().item() if num_fg else 0
-            k_bar    = dynamic_ks.float().mean().item()
-            print(f"[SimOTA] fg={num_fg:4d} cand={num_cand:4d} "
-                  f"avgIoU={mean_iou:4.3f} k̄={k_bar:3.1f}")
-            if num_fg and (iou_out[fg_final] < 0.05).float().mean() > 0.2:
-                print("  ⚠️  >20 % FG IoU < 0.05 – verify anchor order / scales")
-        self._dbg_iter += 1
-        # ----------------------------------------------------------------
-
-        return fg_final, gt_lbl_out, gt_box_out, iou_out
-
-# ───────────────────── train / val loops ────────────────────────
+# ───────────────────── train / val loops ───────────────────────
 def train_epoch(
-        model: nn.Module, loader, opt, scaler, assigner: SimOTACache,
-        device: torch.device, epoch: int, coco_label_map: dict,
-        head_nc_for_loss: int,
-        head_reg_max_for_loss: int,
-        dfl_project_buffer_for_decode: torch.Tensor,
-        max_epochs: int = 500,
-        quality_floor_vfl: float = 0.01,
-        w_cls_loss: float = 3.0,
-        w_obj_loss: float = 0.5, # Weight for the objectness loss
-        w_iou_initial: float = 5.0, # Initial weight for IoU loss
-        w_iou_final: float = 2.0,   # Final weight for IoU loss
-        iou_weight_change_epoch: int = None, # Epoch to change IoU weight
-        use_focal_loss: bool = False,
-        alpha: float = 0.5,
-        debug_prints: bool = True,
-):
+    model: nn.Module,
+    loader,
+    opt,
+    scaler,
+    assigner: ATSSAssigner,
+    device: torch.device,
+    epoch: int,
+    coco_label_map: dict,
+    head_nc_for_loss: int,
+    head_reg_max_for_loss: int,
+    dfl_project_buffer_for_decode: torch.Tensor,
+    max_epochs: int = 500,
+    quality_floor_vfl: float = 0.01,
+    w_cls_loss: float = 3.0,
+    w_obj_loss: float = 0.5,
+    w_iou_initial: float = 5.0,
+    w_iou_final: float = 2.0,
+    iou_weight_change_epoch: int | None = None,
+    use_focal_loss: bool = False,
+    alpha: float = 0.5,
+    debug_prints: bool = True
+) -> float:
     model.train()
-    _, tot_loss_accum = time.time(), 0.
-    total_samples_contributing_to_loss_epoch = 0
-    # Dynamic IoU loss weight
     if iou_weight_change_epoch is None:
         iou_weight_change_epoch = int(max_epochs * 0.4)
     w_iou = w_iou_initial if epoch < iou_weight_change_epoch else w_iou_final
 
-    for i, (imgs, tgts_batch) in enumerate(loader):
+    tot_loss, tot_count = 0.0, 0
+    for i,(imgs, tgts_batch) in enumerate(loader):
         imgs = imgs.to(device)
-        model_outputs = model(imgs)
-
-        if not model.training:
-             raise RuntimeError("train_epoch called with model not in training mode.")
-        if len(model_outputs) != 4:
-            raise ValueError(
-                f"Expected 4 outputs from model in training mode (preds_cls, preds_obj, preds_reg, strides), got {len(model_outputs)}"
-            )
-        cls_preds_levels, obj_preds_levels, reg_preds_levels, strides_per_level_tensors = model_outputs
-
+        cls_preds, obj_preds, reg_preds, strides_t = model(imgs)
         bs = imgs.size(0)
-        fmap_shapes = []
-        for lv in range(len(cls_preds_levels)):
-            H, W = cls_preds_levels[lv].shape[2:]
-            s = strides_per_level_tensors[lv].item()
-            fmap_shapes.append((H, W, s))
-        if debug_prints and epoch == 0 and i == 0:
-            for lv, (_, _, actual_s) in enumerate(fmap_shapes):
-                expected_s = model.head.strides_buffer[lv].item()
-                print(f"[DEBUG STRIDE CHECK] Level {lv}: actual stride = {actual_s}, expected (head buffer) = {expected_s}")
+        fmap_shapes = [(p.shape[2], p.shape[3], float(s.item()))
+                       for p,s in zip(cls_preds, strides_t)]
+        # Precompute anchors once per batch
+        anchor_centers, anchor_strides = generate_anchors(
+            fmap_shapes, model.head.strides_buffer, device)
 
-        batch_total_loss = torch.tensor(0.0, device=device, dtype=torch.float32)
-        num_samples_with_loss_in_batch = 0
-
-        loss_cls_print, loss_obj_print, loss_dfl_print, loss_iou_print = [torch.tensor(0.0) for _ in range(4)]
-
-        for b_idx in range(bs):
-            tgt_i = tgts_batch[b_idx]
-            gt_boxes_unfiltered = tgt_i["boxes"].to(dtype=torch.float32, device=device, non_blocking=True)
-            gt_labels_unfiltered = tgt_i["labels"].to(device=device, non_blocking=True)
-
-            gt_boxes_img = gt_boxes_unfiltered
-            gt_labels_img = gt_labels_unfiltered
-
-            if gt_boxes_unfiltered.numel() > 0:
-                widths = gt_boxes_unfiltered[:, 2] - gt_boxes_unfiltered[:, 0]
-                heights = gt_boxes_unfiltered[:, 3] - gt_boxes_unfiltered[:, 1]
-                epsilon_wh = 1e-3
-                valid_gt_mask = (widths > epsilon_wh) & (heights > epsilon_wh)
-                gt_boxes_img = gt_boxes_unfiltered[valid_gt_mask]
-                gt_labels_img = gt_labels_unfiltered[valid_gt_mask]
-
-            target_dict_for_assigner = {'boxes': gt_boxes_img, 'labels': gt_labels_img}
-
-            if assigner.nc != head_nc_for_loss and i == 1:
-                 warnings.warn(f"Warning: assigner.nc ({assigner.nc}) != head_nc_for_loss ({head_nc_for_loss}).")
-
-            if debug_prints and epoch == 0 and i == 0:
-                H_img_shape, W_img_shape = imgs[b_idx].shape[-2:]
-                if gt_boxes_img.numel() > 0:
-                    widths_filtered = gt_boxes_img[:, 2] - gt_boxes_img[:, 0]
-                    heights_filtered = gt_boxes_img[:, 3] - gt_boxes_img[:, 1]
-                    bad_coords_after_filter = (
-                        (gt_boxes_img[:, 0] < -epsilon_wh) | (gt_boxes_img[:, 1] < -epsilon_wh) |
-                        (gt_boxes_img[:, 2] > W_img_shape + epsilon_wh) | (gt_boxes_img[:, 3] > H_img_shape + epsilon_wh) |
-                        (widths_filtered <= 0) | (heights_filtered <= 0)
-                    ).any()
-                    print(f"[DEBUG POST-FILTER] ... bad_coords_after_filter={bad_coords_after_filter.item()}")
-                first_tgt_original_boxes = tgts_batch[b_idx]["boxes"]
-                first_box_original_coords = first_tgt_original_boxes[:1].tolist() if first_tgt_original_boxes.numel() else None
-                print(f"[CHECK] Img shape {imgs[b_idx].shape}, sample {b_idx} first original box: {first_box_original_coords}")
-
-            # flatten predictions
-            cls_p_img = torch.cat([
-                lvl[b_idx].permute(1, 2, 0).reshape(-1, head_nc_for_loss)
-                for lvl in cls_preds_levels
-            ], dim=0)                                     # (A, C)
-            obj_p_img = torch.cat([
-                lvl[b_idx].permute(1, 2, 0).reshape(-1)
-                for lvl in obj_preds_levels
-            ], dim=0)                                     # (A,)
-            reg_p_img = torch.cat([
-                lvl[b_idx].permute(1,2,0).reshape(-1, 4*(head_reg_max_for_loss+1))
-                for lvl in reg_preds_levels
-            ], dim=0)
-
-            fg_mask_img, gt_labels, gt_boxes, gt_ious = assigner(
-                    fmap_shapes, device, target_dict_for_assigner,
-                    cls_logits=cls_p_img, # Raw class logits
-                    obj_logits=obj_p_img # Raw objectness logits (or None)
+        batch_loss = torch.tensor(0.,device=device)
+        num_samples = 0
+        for b in range(bs):
+            tgt = tgts_batch[b]
+            gt_boxes = tgt["boxes"].to(device).to(torch.float32)
+            gt_labels = tgt["labels"].to(device)
+            # flatten preds
+            cls_p = torch.cat([
+                p[b].permute(1,2,0).reshape(-1,head_nc_for_loss)
+                for p in cls_preds
+            ],0)
+            obj_p = torch.cat([
+                p[b].permute(1,2,0).reshape(-1)
+                for p in obj_preds
+            ],0)
+            reg_p = torch.cat([
+                p[b].permute(1,2,0).reshape(-1,4*(head_reg_max_for_loss+1))
+                for p in reg_preds
+            ],0)
+            # assign
+            fg_mask, gt_lbl, gt_box, gt_iou = assigner.assign(
+                anchor_centers, anchor_strides,
+                gt_boxes, gt_labels
             )
-            reg_p_fg_img = reg_p_img[fg_mask_img]
-            box_targets_fg_img = gt_boxes[fg_mask_img]
-
-            num_fg_img = fg_mask_img.sum().item()
-            loss_norm_factor = float(num_fg_img)
-            if num_fg_img == 0:
-                # if debug_prints:
-                #     print(f"[DEBUG] Epoch {epoch}, Batch {i}, Image {b_idx} — No foreground samples.")
-                continue
-
-            ##########
-            # --- Distribution Focal Loss (DFL) & IoU Loss for BBox Regression ---
-            # (These are independent of the classification/objectness choice above and operate on reg_p_img)
-            strides_all_anchors_img = torch.cat(
-                [torch.full((H_lvl * W_lvl,), float(s_lvl_val), device=device)
-                 for H_lvl, W_lvl, s_lvl_val in fmap_shapes], dim=0
-            )
-            strides_fg_img = strides_all_anchors_img[fg_mask_img].unsqueeze(-1)
-
-            pred_ltrb_offsets_fg_img = PicoDetHead.dfl_decode_for_training(
-                reg_p_fg_img,
-                dfl_project_buffer_for_decode.to(reg_p_fg_img.device),
-                head_reg_max_for_loss
-            )
-
-            anchor_centers_all_img = torch.cat(
-                [assigner.cache[(H_lvl, W_lvl, s_lvl_val, str(device))]
-                 for H_lvl, W_lvl, s_lvl_val in fmap_shapes], dim=0
-            )
-            anchor_centers_fg_img = anchor_centers_all_img[fg_mask_img]
-
-            if debug_prints and epoch == 0 and i == 0 and b_idx == 0:
-                head_anchors_flat_list = []
-                for lvl_idx_head in range(model.head.nl):
-                    # Ensure model.head is accessible; if qat_model is passed, might need model_fp32.head
-                    # Assuming 'model' is the original FP32 model reference for head params
-                    anchor_points_level = getattr(model.head, f'anchor_points_level_{lvl_idx_head}')
-                    head_anchors_flat_list.append(anchor_points_level.to(device))
-                head_anchors_concatenated = torch.cat(head_anchors_flat_list, dim=0)
-            
-                if not torch.allclose(anchor_centers_all_img, head_anchors_concatenated, atol=1e-5):
-                    print("[CRITICAL WARNING] Anchor order mismatch between SimOTA generated anchors and PicoDetHead internal anchors!")
-                    print("SimOTA anchors (first 5):", anchor_centers_all_img[:5])
-                    print("Head anchors (first 5):", head_anchors_concatenated[:5])
-                    # Consider raising an error or adding more detailed comparison
-                else:
-                    print("[INFO] Anchor order check passed for first sample.")
-
-            ltrb_offsets = torch.stack([
-                anchor_centers_fg_img[:, 0] - box_targets_fg_img[:, 0],
-                anchor_centers_fg_img[:, 1] - box_targets_fg_img[:, 1],
-                box_targets_fg_img[:, 2] - anchor_centers_fg_img[:, 0],
-                box_targets_fg_img[:, 3] - anchor_centers_fg_img[:, 1],
-            ], dim=1) / strides_fg_img
-            ltrb_offsets = ltrb_offsets.clamp_(0, head_reg_max_for_loss)
-            dfl_target_dist = build_dfl_targets(ltrb_offsets, head_reg_max_for_loss)
-            loss_dfl = dfl_loss(reg_p_fg_img, dfl_target_dist)
-
-            pred_ltrb_pixels_fg_img = pred_ltrb_offsets_fg_img * strides_fg_img
-            pred_boxes_fg_img = torch.stack((
-                anchor_centers_fg_img[:, 0] - pred_ltrb_pixels_fg_img[:, 0],
-                anchor_centers_fg_img[:, 1] - pred_ltrb_pixels_fg_img[:, 1],
-                anchor_centers_fg_img[:, 0] + pred_ltrb_pixels_fg_img[:, 2],
-                anchor_centers_fg_img[:, 1] + pred_ltrb_pixels_fg_img[:, 3]
-            ), dim=1)
-            loss_iou = tvops.complete_box_iou_loss(pred_boxes_fg_img, box_targets_fg_img, reduction='sum') / num_fg_img
-
-            #########
-
-            loss_cls = torch.tensor(0.0, device=device)
-            loss_obj = torch.tensor(0.0, device=device)
-
+            if not fg_mask.any(): continue
+            # regression targets
+            # build ltrb offsets
+            cent = anchor_centers[fg_mask]
+            sfg = anchor_strides[fg_mask].unsqueeze(-1)
+            ltrb = torch.stack([
+                cent[:,0]-gt_box[fg_mask][:,0],
+                cent[:,1]-gt_box[fg_mask][:,1],
+                gt_box[fg_mask][:,2]-cent[:,0],
+                gt_box[fg_mask][:,3]-cent[:,1],
+            ],1)/sfg
+            ltrb = ltrb.clamp(0, head_reg_max_for_loss)
+            dfl_tgt = build_dfl_targets(ltrb, head_reg_max_for_loss)
+            loss_dfl = dfl_loss(reg_p[fg_mask], dfl_tgt)
+            # IoU loss
+            pred_l = model.head.dfl_decode_for_training(
+                reg_p[fg_mask], dfl_project_buffer_for_decode.to(device), head_reg_max_for_loss
+            ) * sfg
+            ctr = anchor_centers[fg_mask]
+            pred_boxes = torch.stack([
+                ctr[:,0]-pred_l[:,0], ctr[:,1]-pred_l[:,1],
+                ctr[:,0]+pred_l[:,2], ctr[:,1]+pred_l[:,3]
+            ],1)
+            loss_iou = tvops.complete_box_iou_loss(pred_boxes, gt_box[fg_mask], reduction='sum')/fg_mask.sum()
+            # classification
             if use_focal_loss:
-                alpha, gamma = 0.25, 2.0
-
-                final_fg_indices = fg_mask_img.nonzero(as_tuple=False).squeeze(1)
-                gt_labels_final_fg = gt_labels[final_fg_indices]
-
-                cls_targets = torch.zeros_like(cls_p_img)
-                cls_targets[final_fg_indices, gt_labels_final_fg] = 1.0  # one-hot
-            
+                # focal loss path
+                opts = 0.25, 2.0
+                cls_t = torch.zeros_like(cls_p)
+                idx = fg_mask.nonzero().squeeze(1)
+                cls_t[idx, gt_lbl[fg_mask]] = 1.0
                 loss_cls = tvops.sigmoid_focal_loss(
-                    cls_p_img, cls_targets, alpha=alpha, gamma=gamma, reduction='sum'
-                ) / loss_norm_factor                          # ← divide by #FG only
-                # -----------------------------------------------------------------
-            
-                # ---------- objectness / quality focal ---------------------------
-                qfl_targets = torch.zeros_like(obj_p_img)          # (A,)
-                qfl_targets[final_fg_indices] = gt_ious[final_fg_indices]
-
-                loss_obj = F.binary_cross_entropy_with_logits(
-                    obj_p_img, qfl_targets, reduction='sum'
-                ) / loss_norm_factor
-
-                current_sample_total_loss = loss_cls * w_cls_loss + w_obj_loss * loss_obj + loss_dfl + w_iou * loss_iou
-                # Store for printing the first sample's loss breakdown
-                if num_samples_with_loss_in_batch == 0 and total_samples_contributing_to_loss_epoch == 0:
-                    loss_cls_print, loss_obj_print, loss_dfl_print, loss_iou_print = \
-                        loss_cls.detach(), loss_obj.detach(), loss_dfl.detach(), loss_iou.detach()
-
-            else:  # Varifocal Loss path (final)
-                # — dynamic vfl alpha scheduling —
-                progress = epoch / max_epochs if max_epochs > 0 else 0.0
-                alpha_dyn = 0.25 + (0.75 - 0.25) * 0.5 * (1 - math.cos(math.pi * progress))
-            
-                # sum‐reduction so we can normalize ourselves
+                    cls_p, cls_t, alpha=opts[0], gamma=opts[1], reduction='sum'
+                )/fg_mask.sum()
+                q_t = torch.zeros_like(obj_p)
+                q_t[idx] = gt_iou[fg_mask]
+                loss_obj = F.binary_cross_entropy_with_logits(obj_p, q_t, reduction='sum')/fg_mask.sum()
+            else:
+                # Varifocal
+                alpha_dyn = 0.25 + 0.5*(1-math.cos(math.pi*epoch/max_epochs))*(0.75)
                 vfl = VarifocalLoss(alpha=alpha_dyn, gamma=2.0, reduction='sum')
-            
-                # — build “quality” targets: IoU for FG, 0 for BG —
-                quality_floor = torch.tensor(
-                    quality_floor_vfl, device=device, dtype=gt_ious.dtype
-                )
-                quality = torch.zeros_like(gt_ious, dtype=gt_ious.dtype, device=device)
-                quality[fg_mask_img] = torch.maximum(gt_ious[fg_mask_img], quality_floor)
-            
-                # — joint logits for VFL —
-                # (cls + obj) broadcast-adds the objectness scalar to each class logit
-                # joint_logits = cls_p_img + obj_p_img.unsqueeze(1)  # (A, C)
-                joint_logits = blend_joint_logit(cls_p_img, obj_p_img.unsqueeze(1), alpha)
-            
-                # — VFL targets: zero everywhere except FG[class] = quality —
-                vfl_targets = torch.zeros_like(joint_logits, dtype=joint_logits.dtype)
-                pos_idx = fg_mask_img.nonzero(as_tuple=False).squeeze(1)
-                vfl_targets[pos_idx, gt_labels[pos_idx]] = quality[pos_idx]
-            
-                # sum reduction + normalize by #FG
-                loss_vfl_unreduced = vfl(joint_logits, vfl_targets)
-                loss_vfl = loss_vfl_unreduced / num_fg_img
-
-                # — final sample loss —
-                w_vfl = w_cls_loss  # loss_obj not needed here as vfl combines it
-                current_sample_total_loss = (
-                    w_vfl  * loss_vfl
-                  + loss_dfl
-                  + w_iou * loss_iou
-                )
-                # relabel vfl as class loss here for simplicity
-                if num_samples_with_loss_in_batch == 0 and total_samples_contributing_to_loss_epoch == 0:
-                    loss_cls_print, loss_obj_print, loss_dfl_print, loss_iou_print = \
-                        loss_vfl.detach(), loss_obj.detach(), loss_dfl.detach(), loss_iou.detach()
-
-            batch_total_loss += current_sample_total_loss
-            num_samples_with_loss_in_batch += 1
-
-        if num_samples_with_loss_in_batch > 0:
-            averaged_batch_loss = batch_total_loss / num_samples_with_loss_in_batch
+                qt = torch.zeros_like(gt_iou)
+                qt[fg_mask] = torch.maximum(gt_iou[fg_mask], torch.tensor(quality_floor_vfl,device=device))
+                joint = (cls_p + obj_p.unsqueeze(1))
+                loss_cls = vfl(joint, torch.zeros_like(joint).scatter_(1, gt_lbl.unsqueeze(1), qt.unsqueeze(1)))
+                loss_cls = loss_cls/fg_mask.sum()
+                loss_obj = torch.tensor(0.0, device=device)
+            # total sample loss
+            sample_loss = w_cls_loss*loss_cls + w_obj_loss*loss_obj + loss_dfl + w_iou*loss_iou
+            batch_loss += sample_loss
+            num_samples += 1
+        if num_samples>0:
+            avg = batch_loss/num_samples
             opt.zero_grad(set_to_none=True)
-            scaler.scale(averaged_batch_loss).backward()
-            scaler.unscale_(opt)
-            ### Norm sizing debug
-            total_norm = 0.0
-            for p in model.parameters():
-                if p.grad is not None:
-                    param_norm = p.grad.detach().data.norm(2)
-                    total_norm += param_norm.item() ** 2
-            total_norm = total_norm ** 0.5
-            if i % 1000 == 0: # Print every 100 batches
-                print(f"Batch {i}, Total Grad Norm: {total_norm:.4f}")
-            gradient_norm = 12.0  # 1.0 to 10.0 common, max gradient observed in debug was around 6
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=gradient_norm)
-            scaler.step(opt); scaler.update()
-            tot_loss_accum += averaged_batch_loss.item() * num_samples_with_loss_in_batch
-            total_samples_contributing_to_loss_epoch += num_samples_with_loss_in_batch
-
-        if debug_prints and i == 0 and total_samples_contributing_to_loss_epoch > 0 : # Print first batch loss breakdown
-             print(f"E{epoch} B0 loss components: "
-                  f"cls {loss_cls_print.item() * w_cls_loss:.3f} (w={w_cls_loss})  obj {loss_obj_print.item() * w_obj_loss:.3f} (w={w_obj_loss})  "
-                  f"dfl {loss_dfl_print.item():.3f}  iou {loss_iou_print.item() * w_iou:.3f} (w={w_iou})  "
-                  f"tot_batch_avg {averaged_batch_loss.item():.3f}")
-        elif debug_prints and i % 500 == 0 and i > 0 and num_samples_with_loss_in_batch > 0:
-            print(f"E{epoch} {i:04d}/{len(loader)} loss {averaged_batch_loss.item():.3f} (batch avg)")
-        if debug_prints and epoch == 10 and i == 0:  # only once at start of epoch 10
-            try:
-                with torch.no_grad():
-                    # ─── concatenate logits from all FPN levels ───────────────────
-                    cls_logits_all = torch.cat(
-                        [lvl.detach().permute(0, 2, 3, 1).reshape(-1, head_nc_for_loss)
-                         for lvl in cls_preds_levels], dim=0)                # [A_total , C]
-                    obj_logits_all = torch.cat(
-                        [lvl.detach().permute(0, 2, 3, 1).reshape(-1, 1)
-                         for lvl in obj_preds_levels], dim=0)                # [A_total , 1]
-            
-                    joint_conf = (cls_logits_all + obj_logits_all).sigmoid().flatten()
-            
-                    # sample at most 100 k values to keep it fast
-                    if joint_conf.numel() > 100000:
-                        idx = torch.randperm(joint_conf.numel(), device=joint_conf.device)[:100_000]
-                        joint_conf = joint_conf[idx]
-            
-                    q50, q90, q99 = torch.quantile(
-                        joint_conf.cpu(), torch.tensor([0.5, 0.9, 0.99]))
-                    print(f"[DBG] Epoch {epoch}  Conf quantiles 50/90/99 % : "
-                          f"{q50:.3f}  {q90:.3f}  {q99:.3f}")
-                    # less than 0.1, likely issues. More than 0.9, possibly overfit
-            except Exception as e:
-                print(repr(e))
-
-    if total_samples_contributing_to_loss_epoch > 0:
-        avg_epoch_loss_per_sample = tot_loss_accum / total_samples_contributing_to_loss_epoch
-        return avg_epoch_loss_per_sample
-    else:
-        print(f"E{epoch} No samples contributed to loss this epoch.")
-        return 0.0
-
-
-# ───────────────────── QAT helpers ───────────────────────────────
-from torch.ao.quantization import (
-    get_default_qat_qconfig_mapping, QConfig,
-    MovingAveragePerChannelMinMaxObserver, MovingAverageMinMaxObserver # Add MovingAverageMinMaxObserver
-)
-from torch.ao.quantization.quantize_fx import prepare_qat_fx, convert_fx
-
-
-def qat_prepare(model: nn.Module, example_input: torch.Tensor) -> torch.fx.GraphModule:
-    """
-    Prepares the model for Quantization-Aware Training (QAT) using FX graph mode.
-
-    Args:
-        model: The PyTorch nn.Module to prepare for QAT.
-        example_input: A representative example input tensor for tracing the model.
-
-    Returns:
-        A torch.fx.GraphModule prepared for QAT.
-    """
-    # 1. Define the desired QConfig for most layers
-    #    Activations: per-tensor, affine, quint8
-    #    Weights: per-channel, symmetric, qint8 (common for conv/linear layers)
-    global_qconfig = QConfig(
-        activation=MovingAverageMinMaxObserver.with_args(
-            dtype=torch.quint8, qscheme=torch.per_tensor_affine
-        ),
-        weight=MovingAveragePerChannelMinMaxObserver.with_args(
-            dtype=torch.qint8, qscheme=torch.per_channel_symmetric
-        )
-    )
-
-    # 2. Get the default QAT qconfig mapping for the chosen backend
-    #    'x86' or 'qnnpack' (for ARM) are common backends.
-    backend_config = "x86"  # Or "qnnpack" explicitly
-    qconfig_mapping = get_default_qat_qconfig_mapping(backend_config)
-
-    # 3. Apply the global QConfig to the mapping
-    #    This will apply `global_qconfig` to all quantizable module types
-    #    unless overridden by more specific settings (e.g., per module type/instance).
-    qconfig_mapping = qconfig_mapping.set_global(global_qconfig)
-
-    # 4. Specify modules to skip quantization
-    #    The 'pre' module (ResizeNorm) handles uint8 input and normalization;
-    qconfig_mapping = qconfig_mapping.set_module_name('pre', None)
-
-    # 5. Prepare the model for QAT using FX graph mode
-    model.cpu().train() # Ensure model is on CPU and in train mode
-    
-    prepared_model = prepare_qat_fx(
-        model,
-        qconfig_mapping,
-        example_input # Must also be on CPU
-    )
-    
-    return prepared_model
-
-
-def unwrap_dataset(ds):
-    while isinstance(ds, torch.utils.data.Subset):
-        ds = ds.dataset
-    return ds
+            scaler.scale(avg).backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=12.0)
+            scaler.step(opt)
+            scaler.update()
+            tot_loss += avg.item()*num_samples
+            tot_count += num_samples
+    return tot_loss/tot_count if tot_count>0 else 0.0
 
 
 def apply_nms_and_padding_to_raw_outputs_with_debug( # Renamed
@@ -745,7 +300,6 @@ def apply_nms_and_padding_to_raw_outputs_with_debug( # Renamed
             num_preds_before_nms_list, # Return debug info
             num_preds_after_nms_list)  # Return debug info
 
-
 @torch.no_grad()
 def quick_val_iou(
     model: PicoDet, # Assuming PicoDet or a compatible model
@@ -792,7 +346,7 @@ def quick_val_iou(
          pred_labels_batch_padded,
          debug_num_preds_before_nms_batch, # List of counts per image in batch
          debug_num_preds_after_nms_batch   # List of counts per image in batch
-         ) = apply_nms_and_padding_to_raw_outputs_with_debug( # MODIFIED FUNCTION CALL
+         ) = apply_nms_and_padding_to_raw_outputs_with_debug(
                 raw_pred_boxes_batch, raw_pred_scores_batch,
                 score_thresh, iou_thresh, max_detections
             )
@@ -880,6 +434,56 @@ def quick_val_iou(
     return final_mean_iou
 
 
+def qat_prepare(model: nn.Module, example_input: torch.Tensor) -> torch.fx.GraphModule:
+    """
+    Prepares the model for Quantization-Aware Training (QAT) using FX graph mode.
+
+    Args:
+        model: The PyTorch nn.Module to prepare for QAT.
+        example_input: A representative example input tensor for tracing the model.
+
+    Returns:
+        A torch.fx.GraphModule prepared for QAT.
+    """
+    # 1. Define the desired QConfig for most layers
+    #    Activations: per-tensor, affine, quint8
+    #    Weights: per-channel, symmetric, qint8 (common for conv/linear layers)
+    global_qconfig = QConfig(
+        activation=MovingAverageMinMaxObserver.with_args(
+            dtype=torch.quint8, qscheme=torch.per_tensor_affine
+        ),
+        weight=MovingAveragePerChannelMinMaxObserver.with_args(
+            dtype=torch.qint8, qscheme=torch.per_channel_symmetric
+        )
+    )
+
+    # 2. Get the default QAT qconfig mapping for the chosen backend
+    #    'x86' or 'qnnpack' (for ARM) are common backends.
+    backend_config = "x86"  # Or "qnnpack" explicitly
+    qconfig_mapping = get_default_qat_qconfig_mapping(backend_config)
+
+    # 3. Apply the global QConfig to the mapping
+    #    This will apply `global_qconfig` to all quantizable module types
+    #    unless overridden by more specific settings (e.g., per module type/instance).
+    qconfig_mapping = qconfig_mapping.set_global(global_qconfig)
+
+    # 4. Specify modules to skip quantization
+    #    The 'pre' module (ResizeNorm) handles uint8 input and normalization;
+    qconfig_mapping = qconfig_mapping.set_module_name('pre', None)
+
+    # 5. Prepare the model for QAT using FX graph mode
+    model.cpu().train() # Ensure model is on CPU and in train mode
+    
+    prepared_model = prepare_qat_fx(
+        model,
+        qconfig_mapping,
+        example_input # Must also be on CPU
+    )
+    
+    return prepared_model
+
+
+# ────────────────── append_nms_to_onnx ────────────────────
 class PostprocessorForONNX(nn.Module):
     def __init__(self, head_ref: PicoDetHead): # Pass original PicoDetHead instance
         super().__init__()
@@ -1229,217 +833,89 @@ def save_intermediate_onnx(qat_model, cfg, model):
     return final_exportable_int8_model, int8_model_with_preprocessor, actual_onnx_input_example, temp_onnx_path
 
 
+# ───────────────────────── main ────────────────────────────────
 def main(argv: List[str] | None = None):
     pa = argparse.ArgumentParser()
     pa.add_argument('--coco_root', default='coco')
-    pa.add_argument('--arch', default='mnv4c', choices=['mnv3', 'mnv4s', 'mnv4', 'mnv4c'])
-    pa.add_argument('--epochs', type=int, default=10) 
+    pa.add_argument('--arch', default='mnv4c', choices=['mnv3', 'mnv4c'])
+    pa.add_argument('--epochs', type=int, default=10)
     pa.add_argument('--batch', type=int, default=16)
     pa.add_argument('--workers', type=int, default=0)
     pa.add_argument('--device', default=None)
     pa.add_argument('--out', default='picodet_int8.onnx')
-    pa.add_argument('--no_inplace_head_neck', default=True, action='store_true', help="Disable inplace activations in head/neck")
     cfg = pa.parse_args(argv)
 
-    TRAIN_SUBSET = 50000
-    VAL_SUBSET   = 2000
-    debug_prints = True
-    BACKBONE_FREEZE_EPOCHS = 2 if cfg.epochs < 12 else 3  # 0 to disable
-    alpha_warmup_epochs = 10
-
-    if cfg.device is None:
-        cfg.device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    dev = torch.device(cfg.device)
+    dev = torch.device(cfg.device or ('cuda' if torch.cuda.is_available() else 'cpu'))
     print(f'[INFO] device = {dev}')
 
-    backbone, feat_chs = get_backbone(cfg.arch, ckpt=None, img_size=IMG_SIZE) # Pass img_size
-    model = PicoDet(
-        backbone, 
-        feat_chs,
-        num_classes=80, 
-        neck_out_ch=96,
-        img_size=IMG_SIZE,
-        inplace_act_for_head_neck=not cfg.no_inplace_head_neck # Control from arg
-    ).to(dev)
+    backbone, feat_chs = get_backbone(cfg.arch, None, IMG_SIZE)
+    model = PicoDet(backbone, feat_chs, num_classes=80,
+                    neck_out_ch=96, img_size=IMG_SIZE,
+                    head_reg_max=8).to(dev)
 
-    # Load data
-    root = cfg.coco_root
-    coco_train_raw = CocoDetection(
-        f"{root}/train2017",
-        f"{root}/annotations/instances_train2017.json",
-    )
-    coco_label_map = CANONICAL_COCO80_MAP
-
+    # Datasets
     train_ds = CocoDetectionV2(
-        f"{root}/train2017",
-        f"{root}/annotations/instances_train2017.json",
-        coco_label_map,
-        transforms=build_transforms((IMG_SIZE, IMG_SIZE), train=True),
+        f"{cfg.coco_root}/train2017",
+        f"{cfg.coco_root}/annotations/instances_train2017.json",
+        CANONICAL_COCO80_MAP,
+        transforms=ComposeTransforms((IMG_SIZE,IMG_SIZE), train=True)
     )
-    val_ds   = CocoDetectionV2(
-        f"{root}/val2017",
-        f"{root}/annotations/instances_val2017.json",
-        coco_label_map,
-        transforms=build_transforms((IMG_SIZE, IMG_SIZE), train=False),
+    val_ds = CocoDetectionV2(
+        f"{cfg.coco_root}/val2017",
+        f"{cfg.coco_root}/annotations/instances_val2017.json",
+        CANONICAL_COCO80_MAP,
+        transforms=ComposeTransforms((IMG_SIZE,IMG_SIZE), train=False)
     )
-    
-    # ------- (optional) random subset for quick runs -------
-    train_sampler = None
-    if TRAIN_SUBSET is not None:
-        train_sampler = torch.utils.data.RandomSampler(
-            train_ds, replacement=False,
-            num_samples=min(TRAIN_SUBSET, len(train_ds))
-        )
-    val_sampler = None
-    if VAL_SUBSET is not None:
-        g = torch.Generator().manual_seed(42)
-        val_idx  = torch.randperm(len(val_ds), generator=g)[:VAL_SUBSET].tolist()
-        val_sampler = torch.utils.data.SubsetRandomSampler(val_idx)
-    
-    tr_loader = DataLoader(
-        train_ds, batch_size=cfg.batch, sampler=train_sampler,
-        num_workers=cfg.workers, collate_fn=collate_v2,
-        pin_memory=True, persistent_workers=bool(cfg.workers)
-    )
-    vl_loader = DataLoader(
-        val_ds,   batch_size=cfg.batch, sampler=val_sampler,
-        num_workers=cfg.workers, collate_fn=collate_v2,
-        pin_memory=True, persistent_workers=bool(cfg.workers)
-    )
-    
-    print(f"[INFO] COCO contiguous label map built – {len(coco_label_map)} classes")
-    if len(coco_label_map) != model.head.nc:
-        print(f"[WARN] num classes in map ({len(coco_label_map)}) ≠ model.head.nc ({model.head.nc})")
+    tr_loader = DataLoader(train_ds, batch_size=cfg.batch,
+                            shuffle=True, num_workers=cfg.workers,
+                            collate_fn=collate_v2)
+    vl_loader = DataLoader(val_ds, batch_size=cfg.batch,
+                            shuffle=False, num_workers=cfg.workers,
+                            collate_fn=collate_v2)
 
-    id2name = {v: coco_train_raw.coco.loadCats([k])[0]["name"] for k, v in coco_label_map.items()}  # noqa
+    # Optimizer + scheduler
+    debug_prints = True
+    opt = SGD(model.parameters(), lr=0.006, momentum=0.9, weight_decay=1e-4)
+    warmup = LinearLR(opt, start_factor=1e-5, end_factor=1.0, total_iters=3)
+    cosine = CosineAnnealingLR(opt, T_max=cfg.epochs-3, eta_min=0)
+    sch = SequentialLR(opt, schedulers=[warmup,cosine], milestones=[3])
+    scaler = torch.amp.GradScaler(enabled=(dev.type=='cuda'))
 
-    if False:
-        peak_lr_adamw = 1e-3  # Peak learning rate after warmup
-        weight_decay_adamw = 0.01
-        beta1_adamw = 0.9
-        beta2_adamw = 0.999
-        eps_adamw = 1e-8
-        warmup_epochs = 3
-        cosine_decay_to_fraction_adamw = 0.01 # Decay to 1% of peak_lr_adamw
-        # Separate parameters for applying/not applying weight decay
-        param_groups = [
-            {'params': [], 'weight_decay': weight_decay_adamw, 'name': 'decay'}, # Params with weight decay
-            {'params': [], 'weight_decay': 0.0, 'name': 'no_decay'}  # Params without weight decay
-        ]
-        # Populate param_groups
-        for name, param in model.named_parameters():
-            if not param.requires_grad:
-                continue
-            if len(param.shape) == 1 or name.endswith(".bias") or "norm" in name.lower() or "bn" in name.lower():
-                param_groups[1]['params'].append(param) # no_decay group
-            else:
-                param_groups[0]['params'].append(param) # decay group
-        
-        print(f"[INFO] AdamW: {len(param_groups[0]['params'])} params with WD, {len(param_groups[1]['params'])} params without WD.")
-        opt = AdamW(
-            param_groups,
-            lr=peak_lr_adamw,
-            betas=(beta1_adamw, beta2_adamw),
-            eps=eps_adamw
-        )
-        warmup_scheduler = LinearLR(
-            opt,
-            start_factor=1e-5, # Start at peak_lr_adamw * 1e-4 (e.g., 1e-7 if peak is 1e-3)
-            end_factor=1.0,    # End at the peak_lr_adamw (defined in optimizer)
-            total_iters=warmup_epochs # Number of epochs for warmup
-        )
-        # Ensure T_max is at least 1 if cfg.epochs <= warmup_epochs
-        cosine_t_max = max(1, cfg.epochs - warmup_epochs)
-        
-        cosine_scheduler = CosineAnnealingLR(
-            opt,
-            T_max=cosine_t_max, # Remaining epochs after warm-up
-            eta_min=peak_lr_adamw * cosine_decay_to_fraction_adamw
-        )
-        sch = SequentialLR(
-            opt,
-            schedulers=[warmup_scheduler, cosine_scheduler],
-            milestones=[warmup_epochs]
-        )
-    else:
-        base_lr = 0.006
-        warmup_epochs = 3
-        cosine_decay_alpha = 0.0
-        opt = SGD(model.parameters(), lr=base_lr, momentum=0.9, weight_decay=1e-4)
-        warmup_scheduler = LinearLR(
-            opt,
-            start_factor=1e-5,
-            end_factor=1.0,    # End at the peak_lr
-            total_iters=warmup_epochs
-        )
-        cosine_scheduler = CosineAnnealingLR(
-            opt,
-            T_max=cfg.epochs - warmup_epochs, # Remaining epochs after warm-up
-            eta_min=base_lr * cosine_decay_alpha # This will be 0 if cosine_decay_alpha is 0.0
-        )
-        sch = SequentialLR(
-            opt,
-            schedulers=[warmup_scheduler, cosine_scheduler],
-            milestones=[warmup_epochs]
-        )
-    scaler = torch.amp.GradScaler(enabled=dev.type == 'cuda')
+    # Assigner
+    assigner = ATSSAssigner(top_k=9)
 
-    use_focal_loss = False
-    assigner = SimOTACache(
-        nc=model.head.nc,
-        ctr=2.5,  # 2.5
-        topk=20,  # 10
-        cls_cost_weight=1.0 if use_focal_loss else 0.5,
-        debug_epochs=5 if debug_prints else 0,
-    )
+    original_head_nc = model.head.nc
+    original_head_reg_max = model.head.reg_max
+    dfl_buffer = model.head.dfl_project_buffer
 
-
-    original_model_head_nc = model.head.nc
-    original_model_head_reg_max = model.head.reg_max
-    original_dfl_project_buffer = model.head.dfl_project_buffer
-
-    # ... (FP32 training loop) ...
+    # FP32 training
     for ep in range(cfg.epochs):
-        if ep == 0:
-            for p in model.backbone.parameters():
-                p.requires_grad = False
-            print(f"[INFO] Backbone frozen for {BACKBONE_FREEZE_EPOCHS} epochs…")
-        
-        if ep == BACKBONE_FREEZE_EPOCHS:
-            for p in model.backbone.parameters():
-                p.requires_grad = True
-            print("[INFO] Backbone unfrozen – full network now training")
+        if ep==0:
+            for p in model.backbone.parameters(): p.requires_grad=False
+            print("[INFO] Backbone frozen for 2 epochs…")
+        if ep==2:
+            for p in model.backbone.parameters(): p.requires_grad=True
+            print("[INFO] Backbone unfrozen – full training")
 
         model.train()
-        alpha = min(0.9, ep / alpha_warmup_epochs)
-        assigner.alpha = alpha
         l = train_epoch(
-            model, tr_loader, opt, scaler, assigner, dev, ep, coco_label_map,
-            head_nc_for_loss=original_model_head_nc,
-            head_reg_max_for_loss=original_model_head_reg_max,
-            dfl_project_buffer_for_decode=original_dfl_project_buffer,
-            max_epochs=cfg.epochs, # Pass total epochs for VFL alpha scheduling
-            quality_floor_vfl=0.02,
-            debug_prints=debug_prints,
-            alpha=alpha,
-            use_focal_loss=use_focal_loss,
+            model, tr_loader, opt, scaler, assigner, dev, ep,
+            CANONICAL_COCO80_MAP,
+            original_head_nc, original_head_reg_max,
+            dfl_buffer,
+            max_epochs=cfg.epochs,
+            debug_prints=debug_prints
         )
-        # ... (validation) ...
         model.eval()
-        m = quick_val_iou(
-            model, vl_loader, dev,
-            score_thresh=model.head.score_th,
-            iou_thresh=model.head.iou_th,
-            max_detections=model.head.max_det,
-            epoch_num=ep, run_name="in epoch",
-            debug_prints=debug_prints,
-        )
-        for param_group in opt.param_groups:
-            current_lr = param_group['lr']
-
-        print(f'Epoch {ep + 1}/{cfg.epochs}  loss {l:.3f}  IoU {m:.3f} lr={current_lr:.6f}')
+        m = quick_val_iou(model, vl_loader, dev,
+                          score_thresh=model.head.score_th,
+                          iou_thresh=model.head.iou_th,
+                          max_detections=model.head.max_det,
+                          epoch_num=ep, run_name="val", debug_prints=debug_prints)
+        print(f"Epoch {ep+1}/{cfg.epochs} loss={l:.3f} IoU={m:.3f} lr={opt.param_groups[0]['lr']:.6f}")
         sch.step()
-        assigner._dbg_iter = 0   
+
+    # QAT preparation + finetune + ONNX export…
 
     print("[INFO] Evaluating FP32 model...")
     model.eval()
@@ -1517,19 +993,16 @@ def main(argv: List[str] | None = None):
         qat_model.train() # Ensure model is in train mode for each epoch
         current_lr_qat = opt_q.param_groups[0]['lr']
         print(f"[QAT] Starting Epoch {qep + 1}/{qat_epochs} with LR {current_lr_qat:.7f}")
-
+        
         lq = train_epoch(
-            qat_model, tr_loader, opt_q, scaler_q, assigner, dev, qep, coco_label_map,
-            head_nc_for_loss=original_model_head_nc,
-            head_reg_max_for_loss=original_model_head_reg_max,
-            dfl_project_buffer_for_decode=original_dfl_project_buffer,
-            max_epochs=qat_epochs, # For VFL alpha scheduling (relative to QAT duration)
-            quality_floor_vfl=0.02,
-            iou_weight_change_epoch=2,
-            debug_prints=False,
-            alpha=0.98, # should be well enough trained for multiplicative focus
-            use_focal_loss=use_focal_loss,
+            qat_model, tr_loader, opt_q_params, scaler_q, assigner, dev, qep,
+            CANONICAL_COCO80_MAP,
+            original_head_nc, original_head_reg_max,
+            dfl_buffer,
+            max_epochs=qat_epochs,
+            debug_prints=debug_prints,
         )
+
         scheduler_q.step() # Step the QAT LR scheduler
 
         if lq is not None:
@@ -1685,5 +1158,5 @@ def main(argv: List[str] | None = None):
     )
 
 
-if __name__ == '__main__':
+if __name__=='__main__':
     main()
