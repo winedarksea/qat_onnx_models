@@ -1,4 +1,4 @@
-# picodet_lib.py – Refactored for unified anchors + ATSS
+# picodet_lib.py Refactored for unified anchors + ATSS
 from __future__ import annotations
 import math, warnings, sys, os
 from typing import List, Tuple
@@ -7,9 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.ops as tvops
-from torchvision.models import mobilenet_v3_small, MobileNet_V3_Small_Weights
-from torchvision.models.feature_extraction import create_feature_extractor
-import timm
+
 
 try:
     folder_to_add = r"/home/colin/qat_onnx_models/scripts"
@@ -19,7 +17,6 @@ except ImportError:
     print("Warning: customMobilenetNetv4.py not found. 'mnv4_custom' backbone will not be available.")
     MobileNetV4ConvSmallPico = None
 
-# ───────────────────────────── layers ──────────────────────────────
 class GhostConv(nn.Module):
     def __init__(
             self,
@@ -115,7 +112,6 @@ class CSPPAN(nn.Module):
         p5 = p5 + F.max_pool2d(p4, 2)
         return self.out[0](p3), self.out[1](p4), self.out[2](p5)
 
-# ─────────────────────── losses (VFL · DFL · IoU) ──────────────────
 class VarifocalLoss(nn.Module):
     def __init__(self, alpha: float = 0.75, gamma: float = 2., reduction: str = 'mean'):
         super().__init__(); self.alpha, self.gamma, self.reduction = alpha, gamma, reduction
@@ -142,7 +138,6 @@ def dfl_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     tgt  = target.view(N*4, M1)
     return F.kl_div(F.log_softmax(pred,1), tgt, reduction='batchmean')
 
-# ─────────────────── anchor utilities + ATSS ─────────────────────
 def generate_anchors(
     fmap_shapes: List[Tuple[int,int,float]],
     strides_buffer: torch.Tensor,
@@ -211,33 +206,28 @@ class ATSSAssigner:
         iou_out[fg]    = iou_max[fg]
         return fg, gt_lbl_out, gt_box_out, iou_out
 
-# ───────────────────── PicoDetHead (refactored) ───────────────────
 class PicoDetHead(nn.Module):
-    def __init__(self,
-                 num_classes: int = 80,
-                 reg_max: int = 8,
-                 num_feats: int = 96,
-                 num_levels: int = 3,
-                 img_size: int = 224,
-                 score_thresh: float = 0.05,
-                 nms_iou: float = 0.6):
+    def __init__(
+        self,
+        num_classes: int = 80,
+        reg_max: int = 8,
+        num_feats: int = 96,
+        num_levels: int = 3,
+        img_size: int = 224,
+        score_thresh: float = 0.05,
+        nms_iou: float = 0.6,
+    ):
         super().__init__()
         self.nc = num_classes
         self.reg_max = reg_max
         self.nl = num_levels
         self.score_th = score_thresh
         self.iou_th = nms_iou
-        # strides buffer
         strides = torch.tensor([8,16,32][:num_levels], dtype=torch.float32)
         self.register_buffer('strides_buffer', strides, persistent=False)
-        # dfl proj buffer
         proj = torch.arange(reg_max+1, dtype=torch.float32)
         self.register_buffer('dfl_project_buffer', proj, persistent=False)
-        # head convs
         self.cls_conv = nn.Sequential(
-            GhostConv(num_feats, num_feats, k=3),
-            GhostConv(num_feats, num_feats)
-        ) if False else nn.Sequential(
             GhostConv(num_feats, num_feats, k=3),
             *[GhostConv(num_feats, num_feats) for _ in range(2)]
         )
@@ -261,19 +251,29 @@ class PicoDetHead(nn.Module):
         for m in self.obj_pred: nn.init.constant_(m.bias, 0.0)
     def _dfl_to_ltrb_inference(self, x):
         b,n,_ = x.shape
-        x = x.view(b,n,4,self.reg_max+1)
-        x = x.softmax(3)
+        y = x.view(b,n,4,self.reg_max+1).softmax(3)
         proj = self.dfl_project_buffer.view(1,1,1,-1)
-        return (x*proj).sum(3)
+        return (y*proj).sum(3)
+    @staticmethod
+    def dfl_decode_for_training(
+        x_reg_logits: torch.Tensor,
+        dfl_project_buffer: torch.Tensor,
+        reg_max_val: int
+    ) -> torch.Tensor:
+        if x_reg_logits.ndim != 2:
+            raise ValueError(f"Expected 2D logits, got {x_reg_logits.ndim}D")
+        n = x_reg_logits.shape[0]
+        x = x_reg_logits.view(n, 4, reg_max_val+1)
+        x_soft = x.softmax(2)
+        proj = dfl_project_buffer.view(1,1,-1)
+        return (x_soft * proj).sum(2)
     def _decode_predictions_for_level(self, cls_l, obj_l, reg_l, i):
         B,_,H,W = cls_l.shape
         stride = self.strides_buffer[i]
         cls_p = cls_l.permute(0,2,3,1).reshape(B,-1,self.nc)
         obj_p = obj_l.permute(0,2,3,1).reshape(B,-1,1)
         reg_p = reg_l.permute(0,2,3,1).reshape(B,-1,4*(self.reg_max+1))
-        # decode boxes
         ltrb = self._dfl_to_ltrb_inference(reg_p) * stride
-        # grid
         yv,xv = torch.meshgrid(
             torch.arange(H, device=cls_l.device),
             torch.arange(W, device=cls_l.device), indexing='ij'
@@ -286,14 +286,14 @@ class PicoDetHead(nn.Module):
         boxes = torch.stack((x1,y1,x2,y2),-1)
         scores = (cls_p+obj_p).sigmoid()
         return boxes, scores
-    def forward(self, feats: Tuple[torch.Tensor,...]):
+    def forward(self, feats):
         cls_raw,obj_raw,reg_raw = [],[],[]
         for i,f in enumerate(feats):
-            cfeat = self.cls_conv(f)
-            rfeat = self.reg_conv(f)
-            cls_raw.append(self.cls_pred[i](cfeat))
-            obj_raw.append(self.obj_pred[i](cfeat))
-            reg_raw.append(self.reg_pred[i](rfeat))
+            c = self.cls_conv(f)
+            r = self.reg_conv(f)
+            cls_raw.append(self.cls_pred[i](c))
+            obj_raw.append(self.obj_pred[i](c))
+            reg_raw.append(self.reg_pred[i](r))
         if self.training:
             return tuple(cls_raw), tuple(obj_raw), tuple(reg_raw), tuple(self.strides_buffer)
         else:
@@ -303,9 +303,8 @@ class PicoDetHead(nn.Module):
                     cls_raw[i], obj_raw[i], reg_raw[i], i
                 )
                 boxes.append(b); scores.append(s)
-            return torch.cat(boxes,1), torch.cat(scores,1)
+            return torch.concat(boxes,1), torch.concat(scores,1)
 
-# ───────────────────────── PicoDet ────────────────────────────────
 class PicoDet(nn.Module):
     def __init__(
         self,
@@ -333,7 +332,6 @@ class PicoDet(nn.Module):
         p3,p4,p5 = self.neck(c3,c4,c5)
         return self.head((p3,p4,p5))
 
-# ───────────────────── Resize + Backbone utils ────────────────────
 class ResizeNorm(nn.Module):
     def __init__(self, size: Tuple[int,int], mean=(0.485,0.456,0.406), std=(0.229,0.224,0.225)):
         super().__init__()
@@ -344,38 +342,6 @@ class ResizeNorm(nn.Module):
         x = x.float()/255.0
         x = F.interpolate(x, self.size, mode='bilinear', align_corners=False)
         return (x - self.m)/self.s
-
-class TVExtractorWrapper(nn.Module):
-    def __init__(self, base: nn.Module, return_nodes: dict):
-        super().__init__()
-        self.extractor = create_feature_extractor(base, return_nodes)
-        self.output_keys = list(return_nodes.values())
-    def forward(self, x: torch.Tensor):
-        f = self.extractor(x)
-        return tuple(f[k] for k in self.output_keys)
-
-def pick_nodes_by_stride(model: nn.Module, img_size: int=256, desired=(8,16,32)) -> dict:
-    tmp = {}
-    device = next(model.parameters()).device if list(model.parameters()) else torch.device('cpu')
-    hooks = [m.register_forward_hook(
-        lambda mod,inp,out,n=name: tmp.setdefault(n, out.detach().cpu()))
-        for name,m in model.named_modules()]
-    model.eval()
-    try:
-        model(torch.randn(1,3,img_size,img_size,device=device))
-    finally:
-        for h in hooks: h.remove()
-    model.train()
-    H_in = img_size
-    stride_to_name = {}
-    for name,feat in tmp.items():
-        if not isinstance(feat, torch.Tensor) or feat.ndim<4: continue
-        stride = H_in//feat.shape[-2]
-        if stride in desired and stride not in stride_to_name:
-            if '.' in name: stride_to_name[stride] = name
-    if len(stride_to_name)!=len(desired):
-        warnings.warn(f"Could not find all strides. Found {stride_to_name}")
-    return {v:f'C{i+3}' for i,(k,v) in enumerate(sorted(stride_to_name.items()))}
 
 @torch.no_grad()
 def _get_dynamic_feat_chs(model: nn.Module, img_size: int, device: torch.device) -> Tuple[int,int,int]:
@@ -390,16 +356,8 @@ def _get_dynamic_feat_chs(model: nn.Module, img_size: int, device: torch.device)
     return tuple(f.shape[1] for f in feats)
 
 def get_backbone(arch: str, ckpt: str|None, img_size: int=224):
-    pretrained = ckpt is None
     dev = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    if arch=='mnv3':
-        w = MobileNet_V3_Small_Weights.IMAGENET1K_V1 if pretrained else None
-        base = mobilenet_v3_small(weights=w)
-        base.to(dev)
-        nodes = pick_nodes_by_stride(base, img_size)
-        net = TVExtractorWrapper(base, nodes)
-        feat_chs = _get_dynamic_feat_chs(net, img_size, dev)
-    elif arch == "mnv4c":
+    if arch == "mnv4c":
         if MobileNetV4ConvSmallPico is None: raise ImportError("Cannot create 'mnv4_custom' backbone.")
         print("[INFO] Creating custom MobileNetV4-Small backbone for PicoDet.")
         feature_indices = (MobileNetV4ConvSmallPico._DEFAULT_FEATURE_INDICES['p3_s8'], MobileNetV4ConvSmallPico._DEFAULT_FEATURE_INDICES['p4_s16'], MobileNetV4ConvSmallPico._DEFAULT_FEATURE_INDICES['p5_s32'])
@@ -419,7 +377,7 @@ def get_backbone(arch: str, ckpt: str|None, img_size: int=224):
     net.train()
     return net, feat_chs
 
-# ───────────────────────── exports ────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ exports â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 __all__ = [
     'GhostConv','DWConv','CSPBlock','CSPPAN',
     'VarifocalLoss','build_dfl_targets','dfl_loss',

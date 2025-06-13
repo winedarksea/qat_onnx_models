@@ -23,12 +23,12 @@ from torch.ao.quantization.quantize_fx import prepare_qat_fx, convert_fx
 import onnx
 from onnx import TensorProto as TP, helper as oh
 
-# Import refactored PicoDet library
-from picodet_lib import (
-    PicoDet, get_backbone,
-    VarifocalLoss, dfl_loss, build_dfl_targets,
-    generate_anchors, ATSSAssigner, PicoDetHead,
-)
+if False:
+    from picodet_lib import (
+        PicoDet, get_backbone,
+        VarifocalLoss, dfl_loss, build_dfl_targets,
+        generate_anchors, ATSSAssigner, PicoDetHead,
+    )
 
 # ───────────────────── data & transforms ───────────────────────
 SEED = 42
@@ -52,11 +52,11 @@ class CocoDetectionV2(CocoDetection):
     def __init__(self, img_dir, ann_file, lb_map, transforms=None):
         super().__init__(img_dir, ann_file)
         self.lb_map = lb_map
-        self._tf = transforms
+        self._tf    = transforms
     def __getitem__(self, idx):
         img, anns = super().__getitem__(idx)
         boxes, labels = [], []
-        W,H = img.size
+        W, H = img.size
         for a in anns:
             if a.get("iscrowd",0): continue
             cid = a["category_id"]
@@ -65,13 +65,11 @@ class CocoDetectionV2(CocoDetection):
             boxes.append([x,y,x+w,y+h])
             labels.append(self.lb_map[cid])
         if not boxes:
-            boxes = torch.zeros((0,4),dtype=torch.float32)
-            labels = torch.zeros((0,),dtype=torch.int64)
-        bbx = BoundingBoxes(
-            torch.as_tensor(boxes,dtype=torch.float32),
-            format="XYXY", canvas_size=(H,W)
-        )
-        tgt = {"boxes": bbx, "labels": torch.as_tensor(labels,dtype=torch.int64)}
+            bbx = BoundingBoxes(torch.zeros((0,4)), format="XYXY", canvas_size=(H,W))
+            tgt = {"boxes": bbx, "labels": torch.zeros((0,),dtype=torch.int64)}
+        else:
+            bbx = BoundingBoxes(torch.as_tensor(boxes), format="XYXY", canvas_size=(H,W))
+            tgt = {"boxes": bbx, "labels": torch.as_tensor(labels)}
         if self._tf:
             return self._tf(img, tgt)
         return img, tgt
@@ -93,9 +91,6 @@ def collate_v2(batch):
     imgs, tgts = zip(*batch)
     return torch.stack(imgs,0), list(tgts)
 
-# ───────────────────── assigner + anchors ─────────────────────
-# Using generate_anchors, ATSSAssigner from picodet_lib
-
 # ───────────────────── train / val loops ───────────────────────
 def train_epoch(
     model: nn.Module,
@@ -105,122 +100,113 @@ def train_epoch(
     assigner: ATSSAssigner,
     device: torch.device,
     epoch: int,
-    coco_label_map: dict,
-    head_nc_for_loss: int,
-    head_reg_max_for_loss: int,
-    dfl_project_buffer_for_decode: torch.Tensor,
+    head_nc: int,
+    head_reg_max: int,
+    dfl_buf: torch.Tensor,
     max_epochs: int = 500,
     quality_floor_vfl: float = 0.01,
-    w_cls_loss: float = 3.0,
-    w_obj_loss: float = 0.5,
+    w_cls: float = 4.0,
     w_iou_initial: float = 5.0,
     w_iou_final: float = 2.0,
-    iou_weight_change_epoch: int | None = None,
-    use_focal_loss: bool = False,
-    alpha: float = 0.5,
-    debug_prints: bool = True
+    debug: bool = True
 ) -> float:
     model.train()
-    if iou_weight_change_epoch is None:
-        iou_weight_change_epoch = int(max_epochs * 0.4)
-    w_iou = w_iou_initial if epoch < iou_weight_change_epoch else w_iou_final
+    iou_chg_ep = int(max_epochs * 0.4)
+    w_iou = w_iou_initial if epoch < iou_chg_ep else w_iou_final
+    total_loss, total_count = 0.0, 0
 
-    tot_loss, tot_count = 0.0, 0
-    for i,(imgs, tgts_batch) in enumerate(loader):
+    for imgs, tgts in loader:
         imgs = imgs.to(device)
-        cls_preds, obj_preds, reg_preds, strides_t = model(imgs)
-        bs = imgs.size(0)
-        fmap_shapes = [(p.shape[2], p.shape[3], float(s.item()))
-                       for p,s in zip(cls_preds, strides_t)]
-        # Precompute anchors once per batch
-        anchor_centers, anchor_strides = generate_anchors(
+        cls_preds, obj_preds, reg_preds, strides = model(imgs)
+        # Build feature-map shapes
+        fmap_shapes = [(p.shape[2], p.shape[3], float(s))
+                       for p, s in zip(cls_preds, strides)]
+        anchors_centers, anchor_strides = generate_anchors(
             fmap_shapes, model.head.strides_buffer, device)
 
-        batch_loss = torch.tensor(0.,device=device)
-        num_samples = 0
-        for b in range(bs):
-            tgt = tgts_batch[b]
+        batch_loss, batch_count = 0.0, 0
+        for b_idx in range(imgs.size(0)):
+            tgt = tgts[b_idx]
             gt_boxes = tgt["boxes"].to(device).to(torch.float32)
             gt_labels = tgt["labels"].to(device)
-            # flatten preds
-            cls_p = torch.cat([
-                p[b].permute(1,2,0).reshape(-1,head_nc_for_loss)
-                for p in cls_preds
-            ],0)
-            obj_p = torch.cat([
-                p[b].permute(1,2,0).reshape(-1)
-                for p in obj_preds
-            ],0)
-            reg_p = torch.cat([
-                p[b].permute(1,2,0).reshape(-1,4*(head_reg_max_for_loss+1))
-                for p in reg_preds
-            ],0)
-            # assign
+
+            # Flatten predictions
+            cls_p = torch.cat([p[b_idx].permute(1,2,0).reshape(-1, head_nc)
+                                for p in cls_preds],0)
+            obj_p = torch.cat([p[b_idx].permute(1,2,0).reshape(-1)
+                                for p in obj_preds],0)
+            reg_p = torch.cat([p[b_idx].permute(1,2,0).reshape(-1,4*(head_reg_max+1))
+                                for p in reg_preds],0)
+
+            # Assignment
             fg_mask, gt_lbl, gt_box, gt_iou = assigner.assign(
-                anchor_centers, anchor_strides,
-                gt_boxes, gt_labels
-            )
+                anchors_centers, anchor_strides, gt_boxes, gt_labels)
             if not fg_mask.any(): continue
-            # regression targets
-            # build ltrb offsets
-            cent = anchor_centers[fg_mask]
+
+            # Build regression targets
+            ctrs = anchors_centers[fg_mask]
             sfg = anchor_strides[fg_mask].unsqueeze(-1)
             ltrb = torch.stack([
-                cent[:,0]-gt_box[fg_mask][:,0],
-                cent[:,1]-gt_box[fg_mask][:,1],
-                gt_box[fg_mask][:,2]-cent[:,0],
-                gt_box[fg_mask][:,3]-cent[:,1],
-            ],1)/sfg
-            ltrb = ltrb.clamp(0, head_reg_max_for_loss)
-            dfl_tgt = build_dfl_targets(ltrb, head_reg_max_for_loss)
+                ctrs[:,0]-gt_box[fg_mask][:,0],
+                ctrs[:,1]-gt_box[fg_mask][:,1],
+                gt_box[fg_mask][:,2]-ctrs[:,0],
+                gt_box[fg_mask][:,3]-ctrs[:,1],
+            ],1) / sfg
+            ltrb = ltrb.clamp(0, head_reg_max)
+            dfl_tgt = build_dfl_targets(ltrb, head_reg_max)
             loss_dfl = dfl_loss(reg_p[fg_mask], dfl_tgt)
+
             # IoU loss
-            pred_l = model.head.dfl_decode_for_training(
-                reg_p[fg_mask], dfl_project_buffer_for_decode.to(device), head_reg_max_for_loss
-            ) * sfg
-            ctr = anchor_centers[fg_mask]
+            pred_offset = PicoDetHead.dfl_decode_for_training(
+                reg_p[fg_mask], dfl_buf.to(device), head_reg_max)
+            pred_offset = pred_offset * sfg
             pred_boxes = torch.stack([
-                ctr[:,0]-pred_l[:,0], ctr[:,1]-pred_l[:,1],
-                ctr[:,0]+pred_l[:,2], ctr[:,1]+pred_l[:,3]
+                ctrs[:,0]-pred_offset[:,0],
+                ctrs[:,1]-pred_offset[:,1],
+                ctrs[:,0]+pred_offset[:,2],
+                ctrs[:,1]+pred_offset[:,3],
             ],1)
-            loss_iou = tvops.complete_box_iou_loss(pred_boxes, gt_box[fg_mask], reduction='sum')/fg_mask.sum()
-            # classification
-            if use_focal_loss:
-                # focal loss path
-                opts = 0.25, 2.0
-                cls_t = torch.zeros_like(cls_p)
-                idx = fg_mask.nonzero().squeeze(1)
-                cls_t[idx, gt_lbl[fg_mask]] = 1.0
-                loss_cls = tvops.sigmoid_focal_loss(
-                    cls_p, cls_t, alpha=opts[0], gamma=opts[1], reduction='sum'
-                )/fg_mask.sum()
-                q_t = torch.zeros_like(obj_p)
-                q_t[idx] = gt_iou[fg_mask]
-                loss_obj = F.binary_cross_entropy_with_logits(obj_p, q_t, reduction='sum')/fg_mask.sum()
-            else:
-                # Varifocal
-                alpha_dyn = 0.25 + 0.5*(1-math.cos(math.pi*epoch/max_epochs))*(0.75)
-                vfl = VarifocalLoss(alpha=alpha_dyn, gamma=2.0, reduction='sum')
-                qt = torch.zeros_like(gt_iou)
-                qt[fg_mask] = torch.maximum(gt_iou[fg_mask], torch.tensor(quality_floor_vfl,device=device))
-                joint = (cls_p + obj_p.unsqueeze(1))
-                loss_cls = vfl(joint, torch.zeros_like(joint).scatter_(1, gt_lbl.unsqueeze(1), qt.unsqueeze(1)))
-                loss_cls = loss_cls/fg_mask.sum()
-                loss_obj = torch.tensor(0.0, device=device)
-            # total sample loss
-            sample_loss = w_cls_loss*loss_cls + w_obj_loss*loss_obj + loss_dfl + w_iou*loss_iou
-            batch_loss += sample_loss
-            num_samples += 1
-        if num_samples>0:
-            avg = batch_loss/num_samples
+            loss_iou = tvops.complete_box_iou_loss(
+                pred_boxes, gt_box[fg_mask], reduction='sum') / fg_mask.sum()
+
+            # Classification (VFL)
+            joint = cls_p + obj_p.unsqueeze(1)
+            # Quality targets
+            qt = torch.zeros_like(gt_iou)
+            qt[fg_mask] = torch.maximum(gt_iou[fg_mask], torch.tensor(quality_floor_vfl, device=device))
+            # Build VFL targets only for positives
+            vfl_tgt = torch.zeros_like(joint)
+            pos_idx = fg_mask.nonzero(as_tuple=True)[0]
+            vfl_tgt[pos_idx, gt_lbl[pos_idx]] = qt[pos_idx]
+            alpha_dyn = 0.25 + (0.75-0.25)*0.5*(1-math.cos(math.pi*epoch/max_epochs))
+            vfl = VarifocalLoss(alpha=alpha_dyn, gamma=2.0, reduction='mean')
+            loss_cls = vfl(joint, vfl_tgt)
+
+            # Total loss
+            loss = w_cls * loss_cls + loss_dfl + w_iou * loss_iou
+            batch_loss += loss
+            batch_count += 1
+
+            if debug and (total_count % 2000 == 0):
+                print(f"[DEBUG] Epoch {epoch:2d}  Batch {b_idx}  "
+                      f"Img {b_idx+1}/{imgs.size(0)}  "
+                      f"FGs {fg_mask.sum().item():3d}  "
+                      f"loss_cls={loss_cls.item():.4f}  "
+                      f"loss_dfl={loss_dfl.item():.4f}  "
+                      f"loss_iou={loss_iou.item():.4f}  "
+                      f"total={loss.item():.4f}")
+
+        if batch_count > 0:
+            avg_loss = batch_loss / batch_count
             opt.zero_grad(set_to_none=True)
-            scaler.scale(avg).backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=12.0)
+            scaler.scale(avg_loss).backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 8.0)
             scaler.step(opt)
             scaler.update()
-            tot_loss += avg.item()*num_samples
-            tot_count += num_samples
-    return tot_loss/tot_count if tot_count>0 else 0.0
+            total_loss += avg_loss.item() * batch_count
+            total_count += batch_count
+
+    return total_loss / total_count if total_count else 0.0
 
 
 def apply_nms_and_padding_to_raw_outputs_with_debug( # Renamed
@@ -887,6 +873,7 @@ def main(argv: List[str] | None = None):
     original_head_nc = model.head.nc
     original_head_reg_max = model.head.reg_max
     dfl_buffer = model.head.dfl_project_buffer
+    max_detections = 100
 
     # FP32 training
     for ep in range(cfg.epochs):
@@ -900,17 +887,18 @@ def main(argv: List[str] | None = None):
         model.train()
         l = train_epoch(
             model, tr_loader, opt, scaler, assigner, dev, ep,
-            CANONICAL_COCO80_MAP,
-            original_head_nc, original_head_reg_max,
+            # CANONICAL_COCO80_MAP,
+            original_head_nc,
+            original_head_reg_max,
             dfl_buffer,
             max_epochs=cfg.epochs,
-            debug_prints=debug_prints
+            debug=debug_prints
         )
         model.eval()
         m = quick_val_iou(model, vl_loader, dev,
                           score_thresh=model.head.score_th,
                           iou_thresh=model.head.iou_th,
-                          max_detections=model.head.max_det,
+                          max_detections=max_detections,
                           epoch_num=ep, run_name="val", debug_prints=debug_prints)
         print(f"Epoch {ep+1}/{cfg.epochs} loss={l:.3f} IoU={m:.3f} lr={opt.param_groups[0]['lr']:.6f}")
         sch.step()
@@ -923,7 +911,7 @@ def main(argv: List[str] | None = None):
         iou_05 = quick_val_iou(model, vl_loader, dev,
                                score_thresh=0.05,
                                iou_thresh=model.head.iou_th,
-                               max_detections=model.head.max_det,
+                               max_detections=max_detections,
                                epoch_num=ep,
                                run_name="score_thresh_0.05",
                                debug_prints=debug_prints,
@@ -934,7 +922,7 @@ def main(argv: List[str] | None = None):
         iou_25 = quick_val_iou(model, vl_loader, dev,
                                score_thresh=0.25,
                                iou_thresh=model.head.iou_th,
-                               max_detections=model.head.max_det,
+                               max_detections=max_detections,
                                epoch_num=ep,
                                run_name="score_thresh_0.25",
                                debug_prints=debug_prints,
@@ -996,11 +984,11 @@ def main(argv: List[str] | None = None):
         
         lq = train_epoch(
             qat_model, tr_loader, opt_q_params, scaler_q, assigner, dev, qep,
-            CANONICAL_COCO80_MAP,
+            # CANONICAL_COCO80_MAP,
             original_head_nc, original_head_reg_max,
             dfl_buffer,
             max_epochs=qat_epochs,
-            debug_prints=debug_prints,
+            debug=debug_prints,
         )
 
         scheduler_q.step() # Step the QAT LR scheduler
@@ -1026,7 +1014,7 @@ def main(argv: List[str] | None = None):
                                    eval_compatible_qat_model, vl_loader, dev,
                                    score_thresh=0.05, # Consistent validation score_thresh
                                    iou_thresh=model.head.iou_th,
-                                   max_detections=model.head.max_det,
+                                   max_detections=max_detections,
                                    epoch_num=qep, # Pass QAT epoch number
                                    run_name=f"QAT_ep{qep+1}_score0.05",
                                    debug_prints=debug_prints,
@@ -1154,7 +1142,7 @@ def main(argv: List[str] | None = None):
         out_path=out_dest,
         score_thresh=float(model.head.score_th), # 0.05
         iou_thresh=float(model.head.iou_th),  # 0.6
-        max_det=int(model.head.max_det),  # 100
+        max_det=int(max_detections),  # 100
     )
 
 

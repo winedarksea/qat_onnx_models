@@ -1,13 +1,10 @@
 # picodet_lib.py
-# PyTorch 2.7 / opset‑18
+# PyTorch 2.7 / opset 18
 from __future__ import annotations
 import math, warnings, sys, os
 from typing import List, Tuple
 
 import torch, torch.nn as nn, torch.nn.functional as F
-from torchvision.models import mobilenet_v3_small, MobileNet_V3_Small_Weights
-from torchvision.models.feature_extraction import create_feature_extractor
-import timm
 
 try:
     folder_to_add = r"/home/colin/qat_onnx_models/scripts"
@@ -17,7 +14,6 @@ except ImportError:
     print("Warning: customMobilenetNetv4.py not found. 'mnv4_custom' backbone will not be available.")
     MobileNetV4ConvSmallPico = None
 
-# ───────────────────────────── layers ──────────────────────────────
 class GhostConv(nn.Module):
     def __init__(
             self,
@@ -81,7 +77,6 @@ class CSPBlock(nn.Module):
     def forward(self, x):
         return self.cv3(torch.cat((self.m(self.cv1(x)), self.cv2(x)), 1))
 
-# ───────────────────────────── neck ────────────────────────────────
 class CSPPAN(nn.Module):
     def __init__(self, in_chs=(40, 112, 160), out_ch=96, inplace_act: bool = False):
         super().__init__()
@@ -101,7 +96,6 @@ class CSPPAN(nn.Module):
         p5 = p5 + F.max_pool2d(p4, 2)
         return (self.out[0](p3), self.out[1](p4), self.out[2](p5))
 
-# ─────────────────────── losses (VFL · DFL · IoU) ──────────────────
 class VarifocalLoss(nn.Module):
     def __init__(self, alpha: float = 0.75, gamma: float = 2., reduction: str = 'mean'):
         super().__init__()
@@ -132,7 +126,6 @@ def dfl_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     target = target.view(n * 4, m1)
     return F.kl_div(F.log_softmax(pred, dim=1), target, reduction='batchmean')
 
-# ─────────────────── Anchor & Head Architecture ────────────────────
 class AnchorManager(nn.Module):
     """Generates and provides anchor points and strides for all FPN levels."""
     def __init__(self, img_size: int, num_levels: int, strides: Tuple[int, ...]):
@@ -339,44 +332,6 @@ class ResizeNorm(nn.Module):
         x_resized = F.interpolate(x_float_scaled, self.size, mode='bilinear', align_corners=False, antialias=False)
         return (x_resized - self.m) / self.s
 
-# ───────────────────────── backbone util ──────────────────────────
-class TVExtractorWrapper(nn.Module):
-    def __init__(self, base_model: nn.Module, return_nodes_dict: dict):
-        super().__init__()
-        self.extractor = create_feature_extractor(base_model, return_nodes_dict)
-        self.output_keys = list(return_nodes_dict.values())
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, ...]:
-        feature_dict = self.extractor(x)
-        return tuple(feature_dict[key] for key in self.output_keys)
-
-def pick_nodes_by_stride(model: nn.Module, img_size: int = 256, desired: Tuple[int, ...] = (8, 16, 32)) -> dict:
-    tmp = {}
-    device = next(model.parameters()).device if len(list(model.parameters())) > 0 else torch.device('cpu')
-    hooks = [m.register_forward_hook(lambda mod, inp, out, n=name: tmp.setdefault(n, out.detach().clone().cpu())) for name, m in model.named_modules()]
-    model.eval()
-    try:
-        model(torch.randn(1, 3, img_size, img_size, device=device))
-    finally:
-        for h in hooks: h.remove()
-    model.train()
-    stride_to_name = {}
-    sorted_items = sorted(tmp.items(), key=lambda x: len(x[0]))
-    for name, feat_tensor in sorted_items:
-        if not isinstance(feat_tensor, torch.Tensor) or feat_tensor.ndim < 4: continue
-        if img_size % feat_tensor.shape[-2] == 0:
-            stride = img_size // feat_tensor.shape[-2]
-            if stride in desired and stride not in stride_to_name and '.' in name:
-                stride_to_name[stride] = name
-    if len(stride_to_name) != len(desired):
-        warnings.warn(f"pick_nodes_by_stride: Could not find all desired strides {desired}. Found: {stride_to_name}.")
-    final_return_nodes = {}
-    map_idx_to_c_label = {s_val: f"C{i+3}" for i, s_val in enumerate(sorted(list(desired)))}
-    for s_val in desired:
-        if s_val in stride_to_name:
-            final_return_nodes[stride_to_name[s_val]] = map_idx_to_c_label[s_val]
-        else:
-            warnings.warn(f"Desired stride {s_val} not found by pick_nodes_by_stride.")
-    return final_return_nodes
 
 @torch.no_grad()
 def _get_dynamic_feat_chs(model: nn.Module, img_size: int, device: torch.device) -> Tuple[int, ...]:
@@ -391,23 +346,8 @@ def _get_dynamic_feat_chs(model: nn.Module, img_size: int, device: torch.device)
     return tuple(f.shape[1] for f in features)
 
 def get_backbone(arch: str, ckpt: str | None, img_size: int = 224):
-    pretrained = ckpt is None
     temp_device_for_init = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    if arch == "mnv3":
-        weights = MobileNet_V3_Small_Weights.IMAGENET1K_V1 if pretrained else None
-        base = mobilenet_v3_small(weights=weights)
-        base.to(temp_device_for_init)
-        desired_strides_tuple = (8, 16, 32)
-        return_nodes = pick_nodes_by_stride(base, img_size=img_size, desired=desired_strides_tuple)
-        base.cpu()
-        if len(return_nodes) != len(desired_strides_tuple):
-            warnings.warn("Falling back to hardcoded defaults for mnv3.")
-            return_nodes = {'features.3': 'C3', 'features.6': 'C4', 'features.12': 'C5'}
-        print(f"[INFO] Using return_nodes for {arch}: {return_nodes}")
-        net = TVExtractorWrapper(base, return_nodes)
-        feat_chs = _get_dynamic_feat_chs(net, img_size, temp_device_for_init)
-    elif arch == "mnv4c":
-        if MobileNetV4ConvSmallPico is None: raise ImportError("Cannot create 'mnv4_custom' backbone.")
+    if arch == "mnv4c":
         print("[INFO] Creating custom MobileNetV4-Small backbone for PicoDet.")
         feature_indices = (MobileNetV4ConvSmallPico._DEFAULT_FEATURE_INDICES['p3_s8'], MobileNetV4ConvSmallPico._DEFAULT_FEATURE_INDICES['p4_s16'], MobileNetV4ConvSmallPico._DEFAULT_FEATURE_INDICES['p5_s32'])
         net = MobileNetV4ConvSmallPico(width_multiplier=1.2, features_only=True, out_features_indices=feature_indices)

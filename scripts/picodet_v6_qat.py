@@ -1,5 +1,12 @@
 # train_picodet_qat.py – minimal pipeline: COCO ➜ FP32 ➜ QAT ➜ INT8 ➜ ONNX (with NMS)
 # built on pytorch version 2.7
+"""
+Things to try adding:
+1. Alternative Optimizer (AdamW)
+2. Alternative Loss Function (Focal Loss / Quality Focal Loss)
+3. Alpha Blending for Joint Logits
+4. More Complex ONNX NMS Post-processing
+"""
 from __future__ import annotations
 import argparse, random, time, warnings
 from typing import List, Tuple
@@ -21,13 +28,14 @@ from torch.ao.quantization.quantize_fx import prepare_qat_fx, convert_fx
 import onnx
 from onnx import TensorProto as TP, helper as oh
 
-try: 
-    from picodet_lib import (
-        PicoDet, get_backbone, VarifocalLoss, dfl_loss,
-        build_dfl_targets
-    )
-except Exception:
-    pass
+if False:
+    try: 
+        from picodet_lib import (
+            PicoDet, get_backbone, VarifocalLoss, dfl_loss,
+            build_dfl_targets
+        )
+    except Exception:
+        pass
 
 warnings.filterwarnings('ignore', category=UserWarning)
 SEED = 42; random.seed(SEED); torch.manual_seed(SEED)
@@ -135,7 +143,7 @@ class SimOTAAssigner:
         # 2. Anchor center must be close to GT center (center sampling radius).
         gt_centers = (gt_boxes[:, :2] + gt_boxes[:, 2:]) / 2.0
         dist = (anchor_points.unsqueeze(1) - gt_centers.unsqueeze(0)).abs().max(dim=-1).values
-        is_in_radius_matrix = dist < (self.r * anchor_strides.T) # (A, M)
+        is_in_radius_matrix = dist < (self.r * anchor_strides)
 
         # A candidate anchor must satisfy both conditions.
         candidate_mask = is_in_gt_matrix & is_in_radius_matrix # (A, M)
@@ -388,56 +396,65 @@ def apply_nms(
 def quick_val_iou(model: PicoDet, loader, device, epoch_num: int = -1, debug_prints: bool = True):
     model.eval()
     total_iou_sum, num_gt_total = 0., 0
-    num_preds_before, num_preds_after = 0, 0
-    num_images_with_gt = 0
+    total_preds_before_nms, total_preds_after_nms = 0, 0
+    num_images_processed = 0
 
     if debug_prints:
         print(f"\n--- quick_val_iou Start (Epoch: {epoch_num}) ---")
         print(f"Params: score_thresh={model.score_th}, iou_thresh={model.iou_th}, max_detections={model.max_det}")
 
     for imgs_batch, tgts_batch in loader:
-        # Model in eval mode returns decoded (boxes, scores)
+        num_images_processed += imgs_batch.size(0)
+        
+        # 1. Get raw model outputs
         raw_pred_boxes, raw_pred_scores = model(imgs_batch.to(device))
         
-        # raw_pred_scores is (B, A, C). Apply NMS.
-        _, _, _, before_nms, after_nms = apply_nms(
+        # 2. Apply NMS to get final, filtered predictions for the entire batch
+        (final_boxes_batch,  # (B, max_det, 4)
+         final_scores_batch, # (B, max_det)
+         _, # final_labels_batch is not needed for this metric
+         num_before_nms_list,
+         num_after_nms_list
+        ) = apply_nms(
             raw_pred_boxes, raw_pred_scores, model.score_th, model.iou_th, model.max_det
         )
-        
-        # For this simplified metric, we only need the raw boxes and scores for comparison.
-        # So we re-run the NMS inside the loop for clarity, though it could be optimized.
-        
+
+        total_preds_before_nms += sum(num_before_nms_list)
+        total_preds_after_nms += sum(num_after_nms_list)
+
+        # 3. Iterate through images to compare final predictions with GT
         for i in range(imgs_batch.size(0)):
             gt_boxes = tgts_batch[i]["boxes"].to(device)
-            if gt_boxes.numel() == 0: continue
+            if gt_boxes.numel() == 0:
+                continue
 
-            num_images_with_gt += 1
             num_gt_total += gt_boxes.shape[0]
-
-            # Re-find max score per anchor for this image
-            scores_per_anchor, _ = torch.max(raw_pred_scores[i], dim=1)
-            keep_mask = scores_per_anchor >= model.score_th
             
-            boxes_pre_nms = raw_pred_boxes[i][keep_mask]
+            # Get the actual number of detections for this image (before padding)
+            num_dets_this_img = num_after_nms_list[i]
+            if num_dets_this_img == 0:
+                continue # No detections for this image, contributes 0 to IoU sum
+
+            # Slice to get the real, unpadded predictions
+            predicted_boxes_this_img = final_boxes_batch[i, :num_dets_this_img, :]
             
-            num_preds_before += boxes_pre_nms.shape[0]
-            if boxes_pre_nms.numel() == 0: continue
-
-            # For this metric, we don't need batched_nms, just IoU matrix
-            iou_matrix = tvops.box_iou(boxes_pre_nms, gt_boxes)
-            num_preds_after += boxes_pre_nms.shape[0] # Not really after NMS here, but after score thresh
-
+            # Calculate IoU matrix between final predictions and GT
+            iou_matrix = tvops.box_iou(predicted_boxes_this_img, gt_boxes)
+            
             if iou_matrix.numel() > 0:
+                # For each GT box, find the prediction with the highest IoU
                 max_iou_per_gt, _ = iou_matrix.max(dim=0)
                 total_iou_sum += max_iou_per_gt.sum().item()
 
-    avg_preds_before = num_preds_before / len(loader.dataset) if len(loader.dataset) > 0 else 0
+    avg_preds_before = total_preds_before_nms / num_images_processed if num_images_processed > 0 else 0
+    avg_preds_after = total_preds_after_nms / num_images_processed if num_images_processed > 0 else 0
     final_mean_iou = total_iou_sum / num_gt_total if num_gt_total > 0 else 0
     
     if debug_prints:
         print("--- quick_val_iou End ---")
-        print(f"Images with GT: {num_images_with_gt}, Total GT boxes: {num_gt_total}")
+        print(f"Images processed: {num_images_processed}, Total GT boxes: {num_gt_total}")
         print(f"Avg preds/img (passed score_thresh): {avg_preds_before:.2f}")
+        print(f"Avg preds/img (after NMS): {avg_preds_after:.2f}")
         print(f"Final Mean IoU (sum_max_iou_per_gt / total_gt_boxes): {final_mean_iou:.4f}")
     
     return final_mean_iou
@@ -516,10 +533,37 @@ def append_nms_to_onnx(in_path: str, out_path: str, score_thresh: float, iou_thr
     onnx.save(m, out_path)
     print(f"[SAVE] Final ONNX with NMS → {out_path}")
 
+class QATFineTuneModel(nn.Module):
+    def __init__(self, core_qat, head_fp32, anchor_manager, strides):
+        super().__init__()
+        self.core_model = core_qat
+        self.head = head_fp32
+        self.anchor_manager = anchor_manager
+        self.strides = strides
+    
+    def forward(self, x):
+        # 1) run the quantized neck
+        p3, p4, p5 = self.core_model(x)
+        
+        if self.training:
+            # training: return raw logits  strides for train_epoch
+            cls_logits, obj_logits, reg_logits = self.head((p3, p4, p5))
+            return cls_logits, obj_logits, reg_logits, self.strides
+        else:
+            # inference: decode boxes & scores
+            anchor_points, strides_flat = self.anchor_manager()
+            boxes, scores = self.head(
+                (p3, p4, p5),
+                anchor_points=anchor_points,
+                strides=strides_flat
+            )
+            return boxes, scores
+
+
 def main(argv: List[str] | None = None):
     pa = argparse.ArgumentParser()
     pa.add_argument('--coco_root', default='coco')
-    pa.add_argument('--arch', default='mnv4c', choices=['mnv3', 'mnv4c'])
+    pa.add_argument('--arch', default='mnv4c', choices=['mnv4c'])
     pa.add_argument('--epochs', type=int, default=12) 
     pa.add_argument('--batch', type=int, default=16)
     pa.add_argument('--workers', type=int, default=0)
@@ -529,7 +573,7 @@ def main(argv: List[str] | None = None):
 
     TRAIN_SUBSET, VAL_SUBSET = 50000, 5000
     debug_prints = True
-    BACKBONE_FREEZE_EPOCHS = 2
+    BACKBONE_FREEZE_EPOCHS = 4
 
     dev = torch.device(cfg.device or ('cuda' if torch.cuda.is_available() else 'cpu'))
     print(f'[INFO] device = {dev}')
@@ -543,14 +587,22 @@ def main(argv: List[str] | None = None):
     val_ds = CocoDetectionV2(f"{root}/val2017", f"{root}/annotations/instances_val2017.json", coco_label_map, build_transforms((IMG_SIZE, IMG_SIZE), False))
     
     train_sampler = torch.utils.data.RandomSampler(train_ds, replacement=False, num_samples=min(TRAIN_SUBSET, len(train_ds))) if TRAIN_SUBSET else None
-    val_sampler = torch.utils.data.SubsetRandomSampler(torch.randperm(len(val_ds))[:VAL_SUBSET]) if VAL_SUBSET else None
-    
     tr_loader = DataLoader(train_ds, batch_size=cfg.batch, sampler=train_sampler, num_workers=cfg.workers, collate_fn=collate_v2, pin_memory=True, persistent_workers=bool(cfg.workers))
-    vl_loader = DataLoader(val_ds, batch_size=cfg.batch*2, sampler=val_sampler, num_workers=cfg.workers, collate_fn=collate_v2, pin_memory=True)
-    
-    base_lr, warmup_epochs = 0.008, 3
+
+    if VAL_SUBSET:
+        val_idx = torch.randperm(len(val_ds))[:VAL_SUBSET].tolist()
+        val_sampler = torch.utils.data.SubsetRandomSampler(val_idx)
+    else:
+        val_sampler = None
+    vl_loader = DataLoader(
+        val_ds,   batch_size=cfg.batch*2, sampler=val_sampler,
+        num_workers=cfg.workers, collate_fn=collate_v2,
+        pin_memory=True
+    )
+
+    base_lr, warmup_epochs = 0.005, 5
     opt = SGD(model.parameters(), lr=base_lr, momentum=0.9, weight_decay=1e-4)
-    warmup_sch = LinearLR(opt, start_factor=1e-5, end_factor=1.0, total_iters=warmup_epochs)
+    warmup_sch = LinearLR(opt, start_factor=0.01, end_factor=1.0, total_iters=warmup_epochs)
     cosine_sch = CosineAnnealingLR(opt, T_max=cfg.epochs - warmup_epochs, eta_min=base_lr * 0.01)
     sch = SequentialLR(opt, schedulers=[warmup_sch, cosine_sch], milestones=[warmup_epochs])
     scaler = torch.amp.GradScaler(enabled=dev.type == 'cuda')
@@ -577,7 +629,6 @@ def main(argv: List[str] | None = None):
     model.cpu()
     model.train()
     
-    # Create a version of the model that only outputs neck features for tracing
     class CoreModel(nn.Module):
         def __init__(self, pre, backbone, neck):
             super().__init__()
@@ -589,38 +640,49 @@ def main(argv: List[str] | None = None):
             c3, c4, c5 = self.backbone(x)
             return self.neck(c3, c4, c5)
 
+    # 2. Create an instance of this core structure from the trained FP32 model
     core_model_to_quantize = CoreModel(model.pre, model.backbone, model.neck)
     
+    # 3. Prepare the core model for QAT
     example_input = torch.randint(0, 256, (1, 3, IMG_SIZE, IMG_SIZE), dtype=torch.uint8)
     quantized_core_model = qat_prepare(core_model_to_quantize, example_input)
-    
-    # Re-assemble the full model for QAT fine-tuning, but this time it's not traceable as one block.
-    # We fine-tune the quantized core model and use the FP32 head.
-    model.pre = quantized_core_model.pre
-    model.backbone = quantized_core_model.backbone
-    model.neck = quantized_core_model.neck
-    model.to(dev)
 
+    # Create the model for the QAT training loop
+    qat_finetune_model = QATFineTuneModel(quantized_core_model, model.head, model.anchor_manager, model.strides).to(dev)
+
+    # Now, use `qat_finetune_model` for the QAT loop
     qat_epochs = max(3, int(cfg.epochs * 0.2))
-    opt_q = SGD(model.parameters(), lr=base_lr/20, momentum=0.9, weight_decay=1e-5)
+    # Note: Only pass the parameters of the new model to the optimizer
+    opt_q = SGD(filter(lambda p: p.requires_grad, qat_finetune_model.parameters()), lr=base_lr/20, momentum=0.9, weight_decay=1e-5)
     scaler_q = torch.amp.GradScaler(enabled=(dev.type == 'cuda'))
 
     print(f"[INFO] Starting QAT finetuning for {qat_epochs} epochs...")
     for qep in range(qat_epochs):
-        lq = train_epoch(model, tr_loader, opt_q, scaler_q, assigner, dev, qep, qat_epochs, debug_prints=False)
-        mq = quick_val_iou(model, vl_loader, dev, epoch_num=qep)
+        # Pass the new QAT model to the training loop
+        lq = train_epoch(qat_finetune_model, tr_loader, opt_q, scaler_q, assigner, dev, qep, qat_epochs, debug_prints=False)
+
+        # For validation, we need to adapt the model to the quick_val_iou signature
+        try:
+            qat_finetune_model.eval()
+            mq = quick_val_iou(qat_finetune_model, vl_loader, dev, epoch_num=qep)
+        except Exception as e:
+            print(f"quick val error {repr(e)}")
+        qat_finetune_model.train() # Set back to train mode
+
         print(f'[QAT] Epoch {qep + 1}/{qat_epochs} Train Loss {lq:.3f}  Val IoU {mq:.3f}')
 
     print("[INFO] QAT finetuning completed. Converting and exporting to ONNX...")
-    model.cpu().eval()
+    qat_finetune_model.cpu().eval()
     
     # Convert the final QAT-tuned core model to INT8
-    final_quantized_core_model = convert_fx(quantized_core_model)
-
-    # Create the postprocessor using the original FP32 model reference for parameters
+    # The core model is an attribute of our fine-tuning model
+    final_quantized_core_model = convert_fx(qat_finetune_model.core_model)
+    
+    # For export, we use the original FP32 model as a reference for the postprocessor
+    # as it holds the correctly configured head and anchor manager.
     onnx_postprocessor = PostprocessorForONNX(model)
 
-    # Wrap for export
+    # Wrap the *final converted INT8 core* and the postprocessor for export
     final_exportable_model = ONNXExportablePicoDet(final_quantized_core_model, onnx_postprocessor)
     final_exportable_model.eval()
 
