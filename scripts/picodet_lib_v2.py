@@ -83,10 +83,6 @@ class CSPBlock(nn.Module):
         self.cv2 = GhostConv(c, c // 2, 1, inplace_act=inplace_act)
         self.m = nn.Sequential(*[GhostConv(c // 2, c // 2, k=m_k, inplace_act=inplace_act) for _ in range(n)])
         self.cv3 = GhostConv(c, c, 1, inplace_act=inplace_act)
-        for m in self.cv3.modules():
-            # this may improve stability
-            if isinstance(m, nn.BatchNorm2d):
-                nn.init.zeros_(m.weight)
 
     def forward(self, x):
         return self.cv3(torch.cat((self.m(self.cv1(x)), self.cv2(x)), 1))
@@ -229,7 +225,7 @@ class PicoDetHead(nn.Module):
         This prevents the network from being over-confidently negative and
         makes it possible for early positive boxes to cross a 0.05 threshold.
         """
-        MULTIPLY_LOGITS = True
+        MULTIPLY_LOGITS = False
         # classification branches
         cls_prior = 0.02 if MULTIPLY_LOGITS else 0.01
         cls_bias  = -math.log((1. - cls_prior) / cls_prior)      # –4.595, use -2.19 for multiplicative sigmoid
@@ -307,8 +303,8 @@ class PicoDetHead(nn.Module):
         y2 = anchor_centers[:,1].unsqueeze(0) + ltrb[...,3]
         boxes = torch.stack([x1,y1,x2,y2], dim=-1)
 
-        # scores = (cls_logit_perm + obj_logit_perm).sigmoid()
-        scores = cls_logit_perm.sigmoid() * obj_logit_perm.sigmoid()
+        scores = (cls_logit_perm + obj_logit_perm).sigmoid()
+        # scores = cls_logit_perm.sigmoid() * obj_logit_perm.sigmoid()
         # alpha = min(1.0, epoch / warmup_epochs)
         # scores = ((1 - alpha) * (cls_logit_perm + obj_logit_perm).sigmoid() + alpha * (cls_logit_perm.sigmoid() * obj_logit_perm.sigmoid()))
         return boxes, scores

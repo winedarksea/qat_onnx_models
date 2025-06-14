@@ -20,14 +20,15 @@ from onnx import TensorProto as TP, helper as oh
 
 from pycocotools.coco import COCO
 
-try: 
-    from picodet_lib_v2 import (
-        PicoDet, get_backbone, VarifocalLoss, dfl_loss,
-        build_dfl_targets, PicoDetHead
-    )
-except Exception:
-    # when running manually in console, these are already loaded
-    pass
+if False:
+    try: 
+        from picodet_lib_v2 import (
+            PicoDet, get_backbone, VarifocalLoss, dfl_loss,
+            build_dfl_targets, PicoDetHead
+        )
+    except Exception:
+        # when running manually in console, these are already loaded
+        pass
 
 warnings.filterwarnings('ignore', category=UserWarning)
 SEED = 42; random.seed(SEED); torch.manual_seed(SEED)
@@ -55,11 +56,6 @@ def contiguous_id_to_name(coco_api: COCO) -> dict[int, str]:
         i: coco_api.loadCats([coco_id])[0]["name"]
         for i, coco_id in enumerate(CANONICAL_COCO80_IDS)
     }
-
-# ---------- contiguous label map ----------
-def build_coco_label_map(coco):
-    cat_ids = sorted(coco.getCatIds())                 # 1 … 90,92,93…
-    return {cid: i for i, cid in enumerate(cat_ids)}   # 0-based contiguous
 
 # ---------- COCO → tv_tensors utility ----------
 def _coco_to_tvt(annots, lb_map, canvas):
@@ -306,7 +302,7 @@ def train_epoch(
         w_iou_final: float = 2.0,   # Final weight for IoU loss
         iou_weight_change_epoch: int = None, # Epoch to change IoU weight
         use_focal_loss: bool = False,
-        alpha: float = 0.5,
+        alpha: float = 0.0,
         debug_prints: bool = True,
 ):
     model.train()
@@ -473,7 +469,7 @@ def train_epoch(
             loss_obj = torch.tensor(0.0, device=device)
 
             if use_focal_loss:
-                alpha, gamma = 0.25, 2.0
+                alpha_focal, gamma = 0.25, 2.0
 
                 final_fg_indices = fg_mask_img.nonzero(as_tuple=False).squeeze(1)
                 gt_labels_final_fg = gt_labels[final_fg_indices]
@@ -482,7 +478,7 @@ def train_epoch(
                 cls_targets[final_fg_indices, gt_labels_final_fg] = 1.0  # one-hot
             
                 loss_cls = tvops.sigmoid_focal_loss(
-                    cls_p_img, cls_targets, alpha=alpha, gamma=gamma, reduction='sum'
+                    cls_p_img, cls_targets, alpha=alpha_focal, gamma=gamma, reduction='sum'
                 ) / loss_norm_factor                          # ← divide by #FG only
                 # -----------------------------------------------------------------
             
@@ -1233,19 +1229,18 @@ def main(argv: List[str] | None = None):
     pa = argparse.ArgumentParser()
     pa.add_argument('--coco_root', default='coco')
     pa.add_argument('--arch', default='mnv4c', choices=['mnv3', 'mnv4s', 'mnv4', 'mnv4c'])
-    pa.add_argument('--epochs', type=int, default=10) 
+    pa.add_argument('--epochs', type=int, default=20) 
     pa.add_argument('--batch', type=int, default=16)
     pa.add_argument('--workers', type=int, default=0)
     pa.add_argument('--device', default=None)
-    pa.add_argument('--out', default='picodet_int8.onnx')
+    pa.add_argument('--out', default='picodet_v5_int8.onnx')
     pa.add_argument('--no_inplace_head_neck', default=True, action='store_true', help="Disable inplace activations in head/neck")
     cfg = pa.parse_args(argv)
 
-    TRAIN_SUBSET = 50000
-    VAL_SUBSET   = 2000
+    TRAIN_SUBSET = None
+    VAL_SUBSET   = None
     debug_prints = True
     BACKBONE_FREEZE_EPOCHS = 2 if cfg.epochs < 12 else 3  # 0 to disable
-    alpha_warmup_epochs = 10
 
     if cfg.device is None:
         cfg.device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -1313,54 +1308,60 @@ def main(argv: List[str] | None = None):
 
     id2name = {v: coco_train_raw.coco.loadCats([k])[0]["name"] for k, v in coco_label_map.items()}  # noqa
 
-    if False:
-        peak_lr_adamw = 1e-3  # Peak learning rate after warmup
-        weight_decay_adamw = 0.01
-        beta1_adamw = 0.9
-        beta2_adamw = 0.999
-        eps_adamw = 1e-8
-        warmup_epochs = 3
+    if True:
+        peak_lr_adamw = 5e-4  # Slightly more conservative peak LR (common starting point)
+        weight_decay_adamw = 0.01 # Standard AdamW weight decay
+        beta1_adamw = 0.9      # Standard AdamW beta1
+        beta2_adamw = 0.999    # Standard AdamW beta2
+        eps_adamw = 1e-8       # Standard AdamW epsilon
+
+        warmup_epochs_adamw = max(1, cfg.epochs // 10) if cfg.epochs >=5 else 1 # e.g., 1 epoch for 10 total epochs.
         cosine_decay_to_fraction_adamw = 0.01 # Decay to 1% of peak_lr_adamw
-        # Separate parameters for applying/not applying weight decay
+
+        # Parameter groups for differential weight decay
         param_groups = [
-            {'params': [], 'weight_decay': weight_decay_adamw, 'name': 'decay'}, # Params with weight decay
-            {'params': [], 'weight_decay': 0.0, 'name': 'no_decay'}  # Params without weight decay
+            {'params': [], 'weight_decay': weight_decay_adamw, 'name': 'decay'},
+            {'params': [], 'weight_decay': 0.0, 'name': 'no_decay'}
         ]
-        # Populate param_groups
         for name, param in model.named_parameters():
             if not param.requires_grad:
                 continue
+            # Norm layers, biases, and sometimes embedding layers don't use weight decay
             if len(param.shape) == 1 or name.endswith(".bias") or "norm" in name.lower() or "bn" in name.lower():
-                param_groups[1]['params'].append(param) # no_decay group
+                param_groups[1]['params'].append(param)
             else:
-                param_groups[0]['params'].append(param) # decay group
+                param_groups[0]['params'].append(param)
         
         print(f"[INFO] AdamW: {len(param_groups[0]['params'])} params with WD, {len(param_groups[1]['params'])} params without WD.")
+        
         opt = AdamW(
             param_groups,
-            lr=peak_lr_adamw,
+            lr=peak_lr_adamw, # Optimizer's lr is the peak LR
             betas=(beta1_adamw, beta2_adamw),
             eps=eps_adamw
         )
+
+        # --- Schedulers (Epoch-based for simpler integration) ---
         warmup_scheduler = LinearLR(
             opt,
-            start_factor=1e-5, # Start at peak_lr_adamw * 1e-4 (e.g., 1e-7 if peak is 1e-3)
-            end_factor=1.0,    # End at the peak_lr_adamw (defined in optimizer)
-            total_iters=warmup_epochs # Number of epochs for warmup
+            start_factor=0.01, # Start at 1% of peak_lr_adamw
+            end_factor=1.0,    # End at 100% of peak_lr_adamw
+            total_iters=warmup_epochs_adamw # Number of *epochs* for warmup
         )
-        # Ensure T_max is at least 1 if cfg.epochs <= warmup_epochs
-        cosine_t_max = max(1, cfg.epochs - warmup_epochs)
-        
+        cosine_t_max_epochs = max(1, cfg.epochs - warmup_epochs_adamw)
         cosine_scheduler = CosineAnnealingLR(
             opt,
-            T_max=cosine_t_max, # Remaining epochs after warm-up
-            eta_min=peak_lr_adamw * cosine_decay_to_fraction_adamw
+            T_max=cosine_t_max_epochs, # Number of *epochs* for the cosine decay phase
+            eta_min=peak_lr_adamw * cosine_decay_to_fraction_adamw # Absolute minimum LR
         )
         sch = SequentialLR(
             opt,
             schedulers=[warmup_scheduler, cosine_scheduler],
-            milestones=[warmup_epochs]
+            milestones=[warmup_epochs_adamw]
         )
+        
+        print(f"[INFO] Using AdamW with peak_lr={peak_lr_adamw:.1e}, warmup_epochs={warmup_epochs_adamw}.")
+        print(f"       Cosine T_max_epochs={cosine_t_max_epochs}, eta_min={peak_lr_adamw * cosine_decay_to_fraction_adamw:.1e}")
     else:
         base_lr = 0.006
         warmup_epochs = 3
@@ -1411,7 +1412,7 @@ def main(argv: List[str] | None = None):
             print("[INFO] Backbone unfrozen – full network now training")
 
         model.train()
-        alpha = min(0.9, ep / alpha_warmup_epochs)
+        alpha = 0.0  # min(0.9, ep / alpha_warmup_epochs)
         assigner.alpha = alpha
         l = train_epoch(
             model, tr_loader, opt, scaler, assigner, dev, ep, coco_label_map,
@@ -1527,7 +1528,7 @@ def main(argv: List[str] | None = None):
             quality_floor_vfl=0.02,
             iou_weight_change_epoch=2,
             debug_prints=False,
-            alpha=0.98, # should be well enough trained for multiplicative focus
+            alpha=0.0,
             use_focal_loss=use_focal_loss,
         )
         scheduler_q.step() # Step the QAT LR scheduler

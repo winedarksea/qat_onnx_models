@@ -38,7 +38,7 @@ class GhostConv(nn.Module):
 
         self.primary = nn.Sequential(
             nn.Conv2d(c_in, init_ch, k, s, k // 2, bias=False),
-            nn.BatchNorm2d(init_ch), nn.ReLU6(inplace=inplace_act)
+            nn.BatchNorm2d(init_ch), nn.ReLU6(inplace=inplace_act)  # nn.Hardswish(inplace=inplace_act)
         )
         if self.cheap_ch > 0:
             self.cheap = nn.Sequential(
@@ -403,7 +403,7 @@ def build_transforms(size, train):
     aug = [
         T.ToImage(),
         T.RandomHorizontalFlip(0.5) if train else T.Identity(),
-        T.RandomResizedCrop(size, scale=(0.7, 1.0), antialias=True) if train else T.Resize(size, antialias=True),
+        T.RandomResizedCrop(size, scale=(0.7, 1.0), antialias=True) if train else T.Resize((size, size), antialias=True),
         T.ColorJitter(0.2, 0.2, 0.2, 0.1) if train else T.Identity(),
         T.ToDtype(torch.uint8, scale=True),
     ]
@@ -468,6 +468,38 @@ class TaskAlignedAssigner:
             assigned_scores[fg_mask] = ious[fg_mask, pos_gt_inds]
 
         return fg_mask, assigned_labels, assigned_scores
+
+# ─── utils/ema.py ──────────────────────────────────────────────────────────────
+class ModelEMA:
+    """
+    Keeps a moving average of model parameters.
+    Call `update(model)` once after every optimiser step.
+    Use `ema_model = ema.ema` for evaluation / export.
+    """
+    def __init__(self, model: torch.nn.Module, decay: float = 0.9999, device=None):
+        # Make a deep copy of the model for accumulating averages
+        self.ema = copy.deepcopy(model).eval()
+        for p in self.ema.parameters():
+            p.requires_grad_(False)
+
+        self.decay = decay
+        if device is not None:
+            self.ema.to(device, non_blocking=True)
+
+    @torch.no_grad()
+    def update(self, model: torch.nn.Module):
+        d = self.decay
+        msd = model.state_dict()
+        for k, v in self.ema.state_dict().items():
+            if not v.dtype.is_floating_point:   # keep buffers (e.g. running_mean) as-is
+                v.copy_(msd[k])
+            else:
+                v.mul_(d).add_(msd[k].detach(), alpha=1.0 - d)
+
+    def copy_to(self, model: torch.nn.Module):
+        """Load EMA weights into a model instance (for export or final eval)."""
+        model.load_state_dict(self.ema.state_dict(), strict=False)
+
 
 # ───────────────────── Updated Training Loop ────────────────────────
 def train_epoch(
@@ -574,7 +606,7 @@ def train_epoch(
 
         w_iou = 2.0
         w_vfl = 1.0 
-        w_dfl = 0.5
+        w_dfl = 0.25
         loss = w_vfl * loss_vfl + w_dfl * loss_dfl + w_iou * loss_iou
         if not torch.isfinite(loss):
             print(f"[WARN] non-finite loss ({loss.item()}) – using fallback")
@@ -697,13 +729,14 @@ def main(argv: List[str] | None = None):
     pa = argparse.ArgumentParser()
     pa.add_argument('--coco_root', default='coco')
     pa.add_argument('--arch', default='mnv4c', choices=['mnv4c'])
-    pa.add_argument('--epochs', type=int, default=25) 
-    pa.add_argument('--qat_epochs', type=int, default=5) 
+    pa.add_argument('--epochs', type=int, default=10) 
+    pa.add_argument('--qat_epochs', type=int, default=3) 
     pa.add_argument('--batch', type=int, default=32)
     pa.add_argument('--workers', type=int, default=0)
     pa.add_argument('--device', default=None)
     pa.add_argument('--out', default='picodet_int8_refactored.onnx')
     cfg = pa.parse_args(argv)
+    BACKBONE_FREEZE_EPOCHS = 2
 
     dev = torch.device(cfg.device or ('cuda' if torch.cuda.is_available() else 'cpu'))
     print(f'[INFO] Device: {dev}')
@@ -724,11 +757,21 @@ def main(argv: List[str] | None = None):
     scaler = torch.amp.GradScaler(enabled=(dev.type == 'cuda'))
     
     assigner = TaskAlignedAssigner(top_k=13)
+    ema = ModelEMA(model, decay=0.999)
     
     print(f"[INFO] Starting FP32 training for {cfg.epochs} epochs...")
     for ep in range(cfg.epochs):
+        if ep < BACKBONE_FREEZE_EPOCHS:
+            if ep == 0:
+                for p in model.backbone.parameters(): p.requires_grad = False
+                print(f"[INFO] Backbone frozen for {BACKBONE_FREEZE_EPOCHS} epochs…")
+        elif ep == BACKBONE_FREEZE_EPOCHS:
+            for p in model.backbone.parameters(): p.requires_grad = True
+            print("[INFO] Backbone unfrozen – full network now training")
+
         train_loss = train_epoch(model, tr_loader, opt, scaler, assigner, dev, ep, cfg.epochs)
-        val_iou = quick_val_iou(model, vl_loader, dev, epoch_num=ep)
+        ema.update(model)  
+        val_iou = quick_val_iou(ema.ema, vl_loader, dev, epoch_num=ep)
         print(f"Epoch {ep+1}/{cfg.epochs} | Train Loss: {train_loss:.4f} | Val IoU: {val_iou:.4f} | LR: {opt.param_groups[0]['lr']:.6f}\n")
         sch.step()
 
@@ -740,13 +783,17 @@ def main(argv: List[str] | None = None):
     scaler_q = torch.amp.GradScaler(enabled=(dev.type == 'cuda'))
     
     print(f"[INFO] Starting QAT finetuning for {cfg.qat_epochs} epochs...")
+    ema_q = ModelEMA(qat_model, decay=0.99)
     for qep in range(cfg.qat_epochs):
         train_loss_q = train_epoch(qat_model, tr_loader, opt_q, scaler_q, assigner, dev, qep, cfg.qat_epochs)
         val_iou_q = quick_val_iou(qat_model, vl_loader, dev, epoch_num=qep)
         print(f"QAT Epoch {qep+1}/{cfg.qat_epochs} | Train Loss: {train_loss_q:.4f} | Val IoU: {val_iou_q:.4f}\n")
     
     print("\n[INFO] Exporting to ONNX...")
-    final_exportable_model = ONNXExportableModel(qat_model)
+    # final_exportable_model = ONNXExportableModel(qat_model)
+    export_model = copy.deepcopy(qat_model).cpu()
+    ema_q.copy_to(export_model)          # use the averaged weights
+    final_exportable_model = ONNXExportableModel(export_model)
     
     temp_onnx_path = cfg.out.replace(".onnx", "_temp.onnx")
     torch.onnx.export(
