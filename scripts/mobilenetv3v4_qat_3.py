@@ -349,17 +349,42 @@ def evaluate(model, loader, dev):
         lab = lab.to(dev); corr += (model(img).argmax(1) == lab).sum().item(); tot += lab.size(0)
     return corr / tot
 
+def save_backbone(model,  output_base_name, dev):
+    # save raw training for loading into object detector on same backbone
+    print("[INFO] Extracting FP32 backbone state_dict...")
+    fp32_backbone_state_dict = {}
+    cpu_copy = copy.deepcopy(model).cpu()
+
+    key_prefix = "2.classifier." if arch in ["mnv3", "mnv2"] else "2.head." if arch in ["mnv4s", "mnv4m"] else None
+    backbone_prefix = "2."
+    if key_prefix:
+        full_sd = cpu_copy.state_dict()
+        for k, v in full_sd.items():
+            if k.startswith(backbone_prefix) and not k.startswith(key_prefix):
+                fp32_backbone_state_dict[k[len(backbone_prefix):]] = v
+    else:
+        backbone_module = cpu_copy[2]
+        fp32_backbone_state_dict = backbone_module.state_dict()
+
+    if fp32_backbone_state_dict:
+        bpath = f"{output_base_name}_fp32_backbone.pt"
+        Path(bpath).parent.mkdir(parents=True, exist_ok=True)
+        torch.save(fp32_backbone_state_dict, bpath)
+        print(f"[SAVE] FP32 PyTorch backbone state_dict → {bpath}")
+    # model.to(dev) (if not doing deepcopy)
+
+
 # --- Main script execution ---
 data_dir: str = "filtered_imagenet2_native" # Example, replace with your actual path
-epochs: int = 750
+epochs: int = 550
 qat_epochs: int = 10
 batch: int = 64
 lr: float = 0.025
 qat_lr_factor: float = 0.05
-width_mult: float = 1.0
+width_mult: float = 0.8
 device_arg = None
 compile_model: bool = False
-arch: str = "mnv4s" # Change to "mnv2", "mnv3", "mnv3l", "mnv4s", "mnv4m" as needed
+arch: str = "mnv4c" # Change to "mnv2", "mnv3", "mnv3l", "mnv4s", "mnv4m", "mnv4c" as needed
 pretrained: bool = True # Using pretrained weights for FP32 start
 drop_rate: float = 0.2
 
@@ -439,7 +464,7 @@ else:
     total_training_epochs = epochs if epochs > 10 else 10
     warmup_epochs = 5
     cosine_decay_alpha = 0.0 # This usually maps to eta_min_ratio or eta_min directly
-    
+
     # 1. New Optimizer: AdamW
     opt = optim.AdamW(
         model.parameters(),
@@ -488,28 +513,18 @@ for ep in range(epochs):
     a = evaluate(model, vl, dev)
     sched.step()
     print(f"FP32 Epoch {ep+1}/{epochs}  loss {l:.4f}  val@1 {a*100:.2f}%  lr {opt.param_groups[0]['lr']:.5f}")
+    if ep % 50 == 0:
+        try:
+            save_backbone(model,  output_base_name, dev)
+        except Exception as e:
+            print("failed to export fp32 backbone: " + repr(e))
 
 # save raw training for loading into object detector on same backbone
-print("[INFO] Extracting FP32 backbone state_dict...")
 try:
-    fp32_backbone_state_dict = {}
-    model.cpu()
-    full_sd = model.state_dict()
-
-    key_prefix = "2.classifier." if arch in ["mnv3", "mnv2"] else "2.head." if arch in ["mnv4s", "mnv4m"] else None
-    backbone_prefix = "2."
-
-    if key_prefix:
-        for k, v in full_sd.items():
-            if k.startswith(backbone_prefix) and not k.startswith(key_prefix):
-                fp32_backbone_state_dict[k[len(backbone_prefix):]] = v
-        if fp32_backbone_state_dict:
-            bpath = f"{pt_path}_fp32_backbone.pt"
-            Path(bpath).parent.mkdir(parents=True, exist_ok=True)
-            torch.save(fp32_backbone_state_dict, bpath)
-            print(f"[SAVE] FP32 PyTorch backbone state_dict → {bpath}")
+    save_backbone(model,  output_base_name, dev)
 except Exception as e:
     print("failed to export fp32 backbone: " + repr(e))
+
 
 try:
     path = output_base_name + "fp32_onnx.onnx"
