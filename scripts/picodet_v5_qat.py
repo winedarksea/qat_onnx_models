@@ -554,7 +554,7 @@ def train_epoch(
             total_norm = total_norm ** 0.5
             if i % 1000 == 0: # Print every 100 batches
                 print(f"Batch {i}, Total Grad Norm: {total_norm:.4f}")
-            gradient_norm = 12.0  # 1.0 to 10.0 common, max gradient observed in debug was around 6
+            gradient_norm = 6.0  # 1.0 to 10.0 common, max gradient observed in debug was around 6
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=gradient_norm)
             scaler.step(opt); scaler.update()
             tot_loss_accum += averaged_batch_loss.item() * num_samples_with_loss_in_batch
@@ -1229,7 +1229,7 @@ def main(argv: List[str] | None = None):
     pa = argparse.ArgumentParser()
     pa.add_argument('--coco_root', default='coco')
     pa.add_argument('--arch', default='mnv4c', choices=['mnv3', 'mnv4s', 'mnv4', 'mnv4c'])
-    pa.add_argument('--epochs', type=int, default=20) 
+    pa.add_argument('--epochs', type=int, default=100) 
     pa.add_argument('--batch', type=int, default=16)
     pa.add_argument('--workers', type=int, default=0)
     pa.add_argument('--device', default=None)
@@ -1389,7 +1389,7 @@ def main(argv: List[str] | None = None):
     assigner = SimOTACache(
         nc=model.head.nc,
         ctr=2.5,  # 2.5
-        topk=20,  # 10
+        topk=10,  # 10
         cls_cost_weight=1.0 if use_focal_loss else 0.5,
         debug_epochs=5 if debug_prints else 0,
     )
@@ -1487,12 +1487,6 @@ def main(argv: List[str] | None = None):
     # but it will be part of the traced graph.
     qat_model = qat_prepare(model, example_input_for_qat_entire_model)
     qat_model = qat_model.to(dev)
-    freeze_qat_stats = False
-    if freeze_qat_stats:
-        for m in qat_model.modules():
-            if isinstance(m, nn.BatchNorm2d):
-                m.eval()          # freeze running stats
-                m.track_running_stats = False
     print("[INFO] QAT model prepared and moved to device.")
 
     # --- QAT Finetuning ---
@@ -1501,7 +1495,7 @@ def main(argv: List[str] | None = None):
     qat_epochs = int(cfg.epochs * 0.2)
     qat_epochs = 3 if qat_epochs < 3 else qat_epochs
 
-    qat_initial_lr = 0.00025
+    qat_initial_lr = 0.0001
     
     # Filter parameters for QAT optimizer
     opt_q_params = filter(lambda p: p.requires_grad, qat_model.parameters())

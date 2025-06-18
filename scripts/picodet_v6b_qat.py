@@ -129,10 +129,30 @@ def build_dfl_targets(offsets: torch.Tensor, reg_max: int) -> torch.Tensor:
     return one_hot_l + one_hot_r
 
 def dfl_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    n, _, m1 = target.shape
-    pred = pred.view(n * 4, m1)
-    target = target.view(n * 4, m1)
-    return F.kl_div(F.log_softmax(pred, dim=1), target, reduction='batchmean')
+    """
+    Distribution-Focal Loss (KL-Div form) with strong numerical guards.
+
+    pred   : [B, 4*(R+1)]  – raw logits from the head
+    target : [B, 4, R+1]   – one-hot / soft labels, rows should sum to 1
+    """
+    B, _, bins = target.shape                # bins == R+1
+    pred   = pred.view(-1, bins)             # (B*4, bins)
+    target = target.view(-1, bins)
+
+    # -- 1. make sure target rows are a valid distribution -------------
+    target = torch.clamp(target, min=0)      # no negatives
+    row_sum = target.sum(dim=1, keepdim=True)
+    target = torch.where(row_sum > 0,
+                         target / row_sum,   # normalise
+                         torch.zeros_like(target))
+
+    # -- 2. stable log-softmax ----------------------------------------
+    eps   = 1e-8
+    log_q = F.log_softmax(pred + eps, dim=1)     # avoid log(0)
+
+    # -- 3. KL(P‖Q) ----------------------------------------------------
+    loss = F.kl_div(log_q, target, reduction='batchmean')
+    return loss
 
 # ───────────────────── New Centralized Anchor Manager ────────────────
 class AnchorManager(nn.Module):
@@ -241,14 +261,14 @@ class PicoDetHead(nn.Module):
 
             return decoded_boxes, decoded_scores
 
-# ───────────────────── Refactored Main Model ────────────────
+# ───────────────────── Main Model ────────────────
 class PicoDet(nn.Module):
     def __init__(self, backbone: nn.Module, feat_chs: Tuple[int, int, int],
                  num_classes: int = 80,
                  neck_out_ch: int = 96,
                  img_size: int = 224,
                  head_reg_max: int = 8,
-                 head_score_thresh: float = 0.05,
+                 head_score_thresh: float = 0.04,
                  head_nms_iou: float = 0.6,
                  head_max_det: int = 100,
                  inplace_act: bool = False):
@@ -276,11 +296,10 @@ class PicoDet(nn.Module):
         x = self.pre(x)
         c3, c4, c5 = self.backbone(x)
         p3, p4, p5 = self.neck(c3, c4, c5)
-        
+
         if self.training:
-            # Head returns raw logits per level for loss calculation
             cls_logits, obj_logits, reg_logits = self.head((p3, p4, p5))
-            return cls_logits, obj_logits, reg_logits, self.strides
+            return cls_logits, obj_logits, reg_logits
         else:
             # For inference, get anchors and pass them to the head for decoding
             anchor_points, strides_flat = self.anchor_manager()
@@ -380,6 +399,9 @@ def _coco_to_tvt(annots, lb_map, canvas):
         cid = a["category_id"]
         if cid not in lb_map: continue
         x, y, w, h = a["bbox"]
+        # A guard to skip annotations with no area.
+        if w <= 0 or h <= 0:
+            continue
         boxes.append([x, y, x + w, y + h])
         labels.append(lb_map[cid])
     if not boxes:
@@ -436,8 +458,11 @@ class TaskAlignedAssigner:
         
         gt_class_indices = gt_labels.reshape(1, M).repeat(A, 1)
         pred_cls_probs = pred_scores.sigmoid().gather(1, gt_class_indices) # (A, M)
-        
-        alignment_metric = (pred_cls_probs.pow(self.alpha)) * (ious.pow(self.beta))
+
+        raw_metric = (pred_cls_probs.pow(self.alpha)) * (ious.pow(self.beta))
+        # normalise so that each GT's best candidate is 1.0
+        max_per_gt = raw_metric.max(dim=0, keepdim=True).values.clamp_(min=1e-6)
+        alignment_metric = raw_metric / max_per_gt
 
         # 2. Select top-k candidates for each GT based on the alignment metric
         _, top_k_indices = torch.topk(alignment_metric, self.top_k, dim=0) # (M, top_k) -> Transposed op
@@ -516,7 +541,7 @@ def train_epoch(
     for i, (imgs, tgts_batch) in enumerate(loader):
         imgs = imgs.to(device)
         
-        cls_preds_levels, obj_preds_levels, reg_preds_levels, _ = model(imgs)
+        cls_preds_levels, obj_preds_levels, reg_preds_levels = model(imgs)
         
         bs, nc = imgs.size(0), model.head.nc
         reg_max = model.head.reg_max
@@ -729,8 +754,8 @@ def main(argv: List[str] | None = None):
     pa = argparse.ArgumentParser()
     pa.add_argument('--coco_root', default='coco')
     pa.add_argument('--arch', default='mnv4c', choices=['mnv4c'])
-    pa.add_argument('--epochs', type=int, default=10) 
-    pa.add_argument('--qat_epochs', type=int, default=3) 
+    pa.add_argument('--epochs', type=int, default=2) 
+    pa.add_argument('--qat_epochs', type=int, default=1) 
     pa.add_argument('--batch', type=int, default=32)
     pa.add_argument('--workers', type=int, default=0)
     pa.add_argument('--device', default=None)
@@ -743,6 +768,7 @@ def main(argv: List[str] | None = None):
 
     backbone, feat_chs = get_backbone(cfg.arch, img_size=IMG_SIZE)
     model = PicoDet(backbone, feat_chs, num_classes=80, neck_out_ch=96, img_size=IMG_SIZE).to(dev)
+    model.score_th = 0.02  # inital threshold
 
     train_ds = CocoDetectionV2(f"{cfg.coco_root}/train2017", f"{cfg.coco_root}/annotations/instances_train2017.json", CANONICAL_COCO80_MAP, build_transforms(IMG_SIZE, True))
     val_ds = CocoDetectionV2(f"{cfg.coco_root}/val2017", f"{cfg.coco_root}/annotations/instances_val2017.json", CANONICAL_COCO80_MAP, build_transforms(IMG_SIZE, False))
@@ -751,9 +777,10 @@ def main(argv: List[str] | None = None):
 
     lr = 0.005
     opt = SGD(model.parameters(), lr=lr, momentum=0.9, weight_decay=4e-5)
-    warmup = LinearLR(opt, start_factor=0.1, end_factor=1.0, total_iters=5)
-    cosine = CosineAnnealingLR(opt, T_max=cfg.epochs - 5, eta_min=0)
-    sch = SequentialLR(opt, schedulers=[warmup, cosine], milestones=[5])
+    warmup_iters = len(tr_loader) * 2
+    warmup = LinearLR(opt, start_factor=0.1, end_factor=1.0, total_iters=warmup_iters)
+    cosine = CosineAnnealingLR(opt, T_max=cfg.epochs - 1, eta_min=lr * 0.1) # Anneal over remaining epochs
+    sch = SequentialLR(opt, schedulers=[warmup, cosine], milestones=[warmup_iters])
     scaler = torch.amp.GradScaler(enabled=(dev.type == 'cuda'))
     
     assigner = TaskAlignedAssigner(top_k=13)
@@ -776,9 +803,20 @@ def main(argv: List[str] | None = None):
         sch.step()
 
     print("\n[INFO] Preparing model for QAT...")
-    qat_model = qat_prepare(model, torch.randint(0, 256, (1, 3, IMG_SIZE, IMG_SIZE), dtype=torch.uint8))
-    qat_model.to(dev)
+    model.train()
 
+    qat_model = qat_prepare(model, torch.randint(0, 256, (1, 3, IMG_SIZE, IMG_SIZE), dtype=torch.uint8))
+
+    # Manually re-attach the necessary attributes from the original model to the new qat_model.
+    # This makes them accessible to train_epoch() and quick_val_iou().
+    qat_model.anchor_manager = model.anchor_manager
+    qat_model.head = model.head
+    qat_model.score_th = model.score_th
+    qat_model.iou_th = model.iou_th
+    qat_model.max_det = model.max_det
+    
+    qat_model.to(dev)
+    
     opt_q = SGD(qat_model.parameters(), lr=1e-4, momentum=0.9, weight_decay=4e-5)
     scaler_q = torch.amp.GradScaler(enabled=(dev.type == 'cuda'))
     
@@ -786,8 +824,14 @@ def main(argv: List[str] | None = None):
     ema_q = ModelEMA(qat_model, decay=0.99)
     for qep in range(cfg.qat_epochs):
         train_loss_q = train_epoch(qat_model, tr_loader, opt_q, scaler_q, assigner, dev, qep, cfg.qat_epochs)
-        val_iou_q = quick_val_iou(qat_model, vl_loader, dev, epoch_num=qep)
+        ema_q.update(qat_model) 
+        
+        # FIX: Validate using the smoothed EMA weights for consistency with the FP32 loop.
+        val_iou_q = quick_val_iou(ema_q.ema, vl_loader, dev, epoch_num=qep)
+    
         print(f"QAT Epoch {qep+1}/{cfg.qat_epochs} | Train Loss: {train_loss_q:.4f} | Val IoU: {val_iou_q:.4f}\n")
+
+    model.score_th = 0.05  # export threshold
     
     print("\n[INFO] Exporting to ONNX...")
     # final_exportable_model = ONNXExportableModel(qat_model)
