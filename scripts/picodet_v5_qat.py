@@ -950,8 +950,8 @@ class PostprocessorForONNX(nn.Module):
         boxes_xyxy_level = torch.stack([x1, y1, x2, y2], dim=-1) # Shape (B, num_anchors_level, 4)
 
         # For ONNX, sigmoid should be torch.sigmoid
-        scores_level = torch.sigmoid(cls_logit_perm) * torch.sigmoid(obj_logit_perm)
-        # scores_level = torch.sigmoid(cls_logit_perm + obj_logit_perm)
+        # scores_level = torch.sigmoid(cls_logit_perm) * torch.sigmoid(obj_logit_perm)
+        scores_level = torch.sigmoid(cls_logit_perm + obj_logit_perm)
 
         return boxes_xyxy_level, scores_level
 

@@ -18,7 +18,7 @@ if False:
         print("Warning: customMobilenetNetv4.py not found. 'mnv4_custom' backbone will not be available.")
         MobileNetV4ConvSmallPico = None
 
-# ───────────────────────────── layers (Unchanged) ──────────────────────────────
+# ───────────────────────────── layers ──────────────────────────────
 class GhostConv(nn.Module):
     def __init__(
             self,
@@ -83,7 +83,7 @@ class CSPBlock(nn.Module):
     def forward(self, x):
         return self.cv3(torch.cat((self.m(self.cv1(x)), self.cv2(x)), 1))
 
-# ───────────────────────────── neck (Unchanged) ────────────────────────────────
+# ───────────────────────────── neck ────────────────────────────────
 class CSPPAN(nn.Module):
     def __init__(self, in_chs=(40, 112, 160), out_ch=96, inplace_act: bool = False):
         super().__init__()
@@ -103,7 +103,7 @@ class CSPPAN(nn.Module):
         p5 = p5 + F.max_pool2d(p4, 2)
         return (self.out[0](p3), self.out[1](p4), self.out[2](p5))
 
-# ─────────────────────── losses (Unchanged) ──────────────────
+# ─────────────────────── losses ──────────────────
 class VarifocalLoss(nn.Module):
     def __init__(self, alpha: float = 0.75, gamma: float = 2., reduction: str = 'mean'):
         super().__init__()
@@ -128,31 +128,61 @@ def build_dfl_targets(offsets: torch.Tensor, reg_max: int) -> torch.Tensor:
     one_hot_r = F.one_hot(r, reg_max + 1).float() * w_r.unsqueeze(-1)
     return one_hot_l + one_hot_r
 
-def dfl_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+def dfl_loss(
+    pred: torch.Tensor,                # (B, 4*(R+1))  logits
+    target: torch.Tensor,              # (B, 4, R+1)   soft / one-hot
+    reduction: str = 'mean',           # 'none' | 'sum' | 'mean'
+    eps: float = 1e-8,
+) -> torch.Tensor:
     """
-    Distribution-Focal Loss (KL-Div form) with strong numerical guards.
+    Robust KL-divergence implementation used by YOLOv8/PP-YOLOE style DFL.
 
-    pred   : [B, 4*(R+1)]  – raw logits from the head
-    target : [B, 4, R+1]   – one-hot / soft labels, rows should sum to 1
+    • Any row in `target` whose total mass is 0 is *ignored* – it contributes
+      neither loss nor gradient.  This removes the common NaN source when
+      anchors have no positive assignment.
+    • The function never returns NaN; when no row is valid the return value is
+      `0.` (attached to the computation graph).
+
+    Args
+    ----
+    pred : raw logits shaped (N, 4*(R+1)) **or** already flattened
+    target : soft labels shaped (N, 4, R+1)
+    reduction : 'none' | 'sum' | 'mean'
+    eps : small constant for numerical stability
     """
-    B, _, bins = target.shape                # bins == R+1
-    pred   = pred.view(-1, bins)             # (B*4, bins)
-    target = target.view(-1, bins)
+    # ---- reshape to (N*4, bins) --------------------------------------
+    bins = target.size(-1)
+    q = pred.view(-1, bins)            # logits
+    p = target.view(-1, bins)          # probs / un-normalised mass
 
-    # -- 1. make sure target rows are a valid distribution -------------
-    target = torch.clamp(target, min=0)      # no negatives
-    row_sum = target.sum(dim=1, keepdim=True)
-    target = torch.where(row_sum > 0,
-                         target / row_sum,   # normalise
-                         torch.zeros_like(target))
+    # ---- make p a proper probability distribution where valid --------
+    p = torch.clamp(p, min=0)
+    row_sum = p.sum(dim=1, keepdim=True)          # (N*,1)
+    valid   = row_sum.squeeze(1) > eps            # Bool mask
 
-    # -- 2. stable log-softmax ----------------------------------------
-    eps   = 1e-8
-    log_q = F.log_softmax(pred + eps, dim=1)     # avoid log(0)
+    # Early exit (keeps graph):
+    if not valid.any():
+        return (q.sum() * 0) if reduction != 'none' else q.new_zeros(q.size(0))
 
-    # -- 3. KL(P‖Q) ----------------------------------------------------
-    loss = F.kl_div(log_q, target, reduction='batchmean')
-    return loss
+    p_norm = torch.where(valid.unsqueeze(1), p / row_sum.clamp(min=eps), p)
+
+    # ---- KL(P‖Q)  =  Σ_i p_i (log p_i − log q_i) ---------------------
+    log_q = F.log_softmax(q + eps, dim=1)         # numeric safety
+
+    kl = F.kl_div(log_q[valid], p_norm[valid], reduction='none').sum(dim=1)
+
+    # ---- reduction ---------------------------------------------------
+    if reduction == 'none':
+        # return per-row loss with zeros for invalid rows
+        out = q.new_zeros(q.size(0))
+        out[valid] = kl
+        return out
+
+    if reduction == 'sum':
+        return kl.sum()
+
+    # default: mean over *valid* rows
+    return kl.mean()
 
 # ───────────────────── New Centralized Anchor Manager ────────────────
 class AnchorManager(nn.Module):
@@ -305,7 +335,7 @@ class PicoDet(nn.Module):
             anchor_points, strides_flat = self.anchor_manager()
             return self.head((p3, p4, p5), anchor_points=anchor_points, strides=strides_flat)
 
-# ───────────────────── Utilities (Mostly Unchanged) ────────────────
+# ───────────────────── Utilities ────────────────
 class ResizeNorm(nn.Module):
     def __init__(self, size: Tuple[int, int], mean: Tuple[float, ...] = (0.485, 0.456, 0.406),
                  std: Tuple[float, ...] = (0.229, 0.224, 0.225)):
@@ -386,7 +416,7 @@ warnings.filterwarnings('ignore', category=UserWarning)
 SEED = 42; random.seed(SEED); torch.manual_seed(SEED)
 IMG_SIZE = 256
 
-# --- Data & Transforms (Unchanged) ---
+# --- Data & Transforms ---
 # ... (Keep the CocoDetectionV2, build_transforms, collate_v2 functions) ...
 CANONICAL_COCO80_IDS: list[int] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 27, 28, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 67, 70, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 84, 85, 86, 87, 88, 89, 90]
 CANONICAL_COCO80_MAP: dict[int, int] = {coco_id: i for i, coco_id in enumerate(CANONICAL_COCO80_IDS)}
@@ -425,7 +455,7 @@ def build_transforms(size, train):
     aug = [
         T.ToImage(),
         T.RandomHorizontalFlip(0.5) if train else T.Identity(),
-        T.RandomResizedCrop(size, scale=(0.7, 1.0), antialias=True) if train else T.Resize((size, size), antialias=True),
+        T.RandomResizedCrop(size, scale=(0.7, 1.0), antialias=True) if train else T.Resize((size, size), antialias=False),
         T.ColorJitter(0.2, 0.2, 0.2, 0.1) if train else T.Identity(),
         T.ToDtype(torch.uint8, scale=True),
     ]
@@ -516,10 +546,15 @@ class ModelEMA:
         d = self.decay
         msd = model.state_dict()
         for k, v in self.ema.state_dict().items():
-            if not v.dtype.is_floating_point:   # keep buffers (e.g. running_mean) as-is
-                v.copy_(msd[k])
+            t = msd[k]
+            # new / replaced observers may have size 0 (or simply different)  
+            if v.numel() == 0 or t.numel() == 0 or v.shape != t.shape:
+                v.copy_(t)         # naïve copy keeps states consistent
+                continue
+            if not v.dtype.is_floating_point:
+                v.copy_(t)
             else:
-                v.mul_(d).add_(msd[k].detach(), alpha=1.0 - d)
+                v.mul_(d).add_(t.detach(), alpha=1.0 - d)
 
     def copy_to(self, model: torch.nn.Module):
         """Load EMA weights into a model instance (for export or final eval)."""
@@ -627,7 +662,14 @@ def train_epoch(
             anchor_points_fg + pred_ltrb_offsets[:,2:] * anchor_strides_fg
         ], 1)
         eps = 1e-9
-        loss_iou = tvops.complete_box_iou_loss(pred_boxes_fg, assigned_boxes_fg, reduction='sum') / (num_fg + eps)
+        keep = (((pred_boxes_fg[:, 2:] - pred_boxes_fg[:, :2]).prod(1) > 0) &
+                ((assigned_boxes_fg[:, 2:] - assigned_boxes_fg[:, :2]).prod(1) > 0))
+        loss_iou = 0.0
+        if keep.any():
+            loss_iou = (tvops.complete_box_iou_loss(
+                pred_boxes_fg[keep],
+                assigned_boxes_fg[keep],
+                reduction='sum') / (keep.sum() + eps))
 
         w_iou = 2.0
         w_vfl = 1.0 
@@ -645,13 +687,18 @@ def train_epoch(
         scaler.update()
 
         total_loss += loss.item()
-        
+
         if debug_prints and i > 0 and i % 500 == 0:
-            print(f"E{epoch} B{i}/{len(loader)} | Loss: {loss.item():.4f} (VFL:{loss_vfl.item():.4f}, DFL:{loss_dfl.item():.4f}, CIoU:{loss_iou.item():.4f}) | Num_FG: {num_fg.item()}")
+            liou = loss_iou if isinstance(loss_iou, float) else loss_iou.item()
+            print(
+                f"E{epoch} B{i}/{len(loader)} | Loss: {loss.item():.4f} "
+                f"(VFL:{loss_vfl.item():.4f}, DFL:{loss_dfl.item():.4f}, "
+                f"CIoU:{liou:.4f}) | Num_FG: {num_fg.item()}"
+            )
 
     return total_loss / (i + 1) if i > 0 else total_loss
 
-# --- Validation, QAT, and ONNX Export (Unchanged) ---
+# --- Validation, QAT, and ONNX Export ---
 # ... (Keep quick_val_iou, qat_prepare, ONNXExportableModel, append_nms_to_onnx) ...
 @torch.no_grad()
 def quick_val_iou(model: PicoDet, loader, device, epoch_num: int = -1, debug_prints: bool = True):
