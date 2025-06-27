@@ -8,15 +8,27 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.ops as tvops
 
-if False:
-    try:
-        # Ensure this path is correct for your setup
-        folder_to_add = r"/Users/colincatlin/Documents-NoCloud/qat_onnx_models/scripts"
-        sys.path.append(folder_to_add)
+# --- Custom Backbone Import ---
+try:
+    # User should ensure customMobilenetNetv4.py is accessible.
+    # The original script had a specific path; adjust if necessary or ensure it's in PYTHONPATH.
+    folder_to_add = r"/Users/colincatlin/Documents-NoCloud/qat_onnx_models/scripts" # User-specific path
+    # Check if the path and file exist before trying to add to sys.path and import
+    custom_module_path = os.path.join(folder_to_add, "customMobilenetNetv4.py")
+    if os.path.exists(custom_module_path):
+        if folder_to_add not in sys.path:
+             sys.path.insert(0, folder_to_add) # Insert at 0 to prioritize
         from customMobilenetNetv4 import MobileNetV4ConvSmallPico
-    except ImportError:
-        print("Warning: customMobilenetNetv4.py not found. 'mnv4_custom' backbone will not be available.")
+        print(f"[INFO] Successfully imported customMobilenetNetv4 from {folder_to_add}")
+    else:
+        print(f"Warning: Did not find customMobilenetNetv4.py at {custom_module_path}. 'mnv4c' backbone will not be available.")
         MobileNetV4ConvSmallPico = None
+except ImportError as e:
+    print(f"Warning: Failed to import customMobilenetNetv4.py ({e}). 'mnv4c' backbone will not be available.")
+    MobileNetV4ConvSmallPico = None
+except Exception as e: # Catch other potential errors like incorrect path structure
+    print(f"An error occurred during custom backbone import setup: {e}")
+    MobileNetV4ConvSmallPico = None
 
 # ───────────────────────────── layers ──────────────────────────────
 class GhostConv(nn.Module):
@@ -119,13 +131,19 @@ class VarifocalLoss(nn.Module):
         return loss
 
 def build_dfl_targets(offsets: torch.Tensor, reg_max: int) -> torch.Tensor:
-    x = offsets.clamp_(0, reg_max - 1e-6) # Clamp to avoid index out of bounds
+    # Ensure offsets are within [0, reg_max - eps] to avoid issues with floor/ceil at reg_max
+    x = offsets.clamp_(0, reg_max - 1e-6) 
     l = x.floor().long()
     r = l + 1
+    # Clamp r to reg_max to prevent out-of-bounds in one_hot for r if x is very close to reg_max
+    r.clamp_(max=reg_max)
+    
     w_r = x - l.float()
     w_l = 1. - w_r
-    one_hot_l = F.one_hot(l, reg_max + 1).float() * w_l.unsqueeze(-1)
-    one_hot_r = F.one_hot(r, reg_max + 1).float() * w_r.unsqueeze(-1)
+    
+    # Target shape: (..., reg_max + 1)
+    one_hot_l = F.one_hot(l, num_classes=reg_max + 1).float() * w_l.unsqueeze(-1)
+    one_hot_r = F.one_hot(r, num_classes=reg_max + 1).float() * w_r.unsqueeze(-1)
     return one_hot_l + one_hot_r
 
 def dfl_loss(
@@ -249,14 +267,26 @@ class PicoDetHead(nn.Module):
         for conv in self.obj_pred: nn.init.constant_(conv.bias, obj_bias)
 
     @staticmethod
-    def _dfl_to_ltrb(reg_logits: torch.Tensor, dfl_project: torch.Tensor) -> torch.Tensor:
+    def _dfl_to_ltrb(reg_logits: torch.Tensor, dfl_project: torch.Tensor, max_val_for_offset: float = 1000.0) -> torch.Tensor:
         """Decodes DFL logits to LTRB offsets."""
-        reg_max = dfl_project.numel() - 1
+        reg_max = dfl_project.numel() - 1 # This is R (e.g., 8)
+        # reg_logits shape: (B, A, 4 * (R+1)) or (N_pos, 4 * (R+1))
+        # dfl_project shape: (R+1)
+        
         input_shape = reg_logits.shape
-        reg_logits = reg_logits.view(*input_shape[:-1], 4, reg_max + 1)
-        reg_dist = reg_logits.softmax(dim=-1)
-        proj = dfl_project.view((1,) * (reg_dist.dim() - 1) + (-1,))
-        return (reg_dist * proj).sum(dim=-1)
+        # Reshape to (..., 4, R+1)
+        reg_logits_reshaped = reg_logits.reshape(*input_shape[:-1], 4, reg_max + 1)
+        
+        # Softmax over the R+1 dimension
+        reg_dist = reg_logits_reshaped.softmax(dim=-1)
+        
+        # Project: (..., 4, R+1) * (R+1) -> sum over R+1 -> (..., 4)
+        # Ensure dfl_project is broadcastable: (1, ..., 1, R+1)
+        proj_reshaped = dfl_project.reshape((1,) * (reg_dist.dim() - 1) + (-1,))
+        ltrb_offsets = (reg_dist * proj_reshaped).sum(dim=-1)
+        
+        # Clamp offsets to prevent extremely large box coordinates, which can cause NaNs in IoU
+        return torch.clamp(ltrb_offsets, min=0, max=max_val_for_offset)
 
     def decode_predictions(self, reg_logits_flat, anchor_points, strides):
         """Decodes flat regression logits into bounding boxes."""
@@ -456,6 +486,9 @@ def build_transforms(size, train):
         T.ToImage(),
         T.RandomHorizontalFlip(0.5) if train else T.Identity(),
         T.RandomResizedCrop(size, scale=(0.7, 1.0), antialias=True) if train else T.Resize((size, size), antialias=False),
+        # T.RandomPhotometricDistort(p=0.5),
+        # T.RandomZoomOut(fill={Image: (123, 117, 104), "boxes": "mean"}, side_range=(1.0, 1.5), p=0.3),
+        # T.RandomIoUCrop(min_scale=0.3, max_scale=1.0, min_aspect_ratio=0.5, max_aspect_ratio=2.0, p=0.7),  # removed to keep testing simple
         T.ColorJitter(0.2, 0.2, 0.2, 0.1) if train else T.Identity(),
         T.ToDtype(torch.uint8, scale=True),
     ]
@@ -464,101 +497,181 @@ def build_transforms(size, train):
 def collate_v2(batch):
     return torch.stack(list(zip(*batch))[0], 0), list(zip(*batch))[1]
 
-# ───────────────────── New Assigner: Task-Aligned Assigner ────────────────
+# ───────────────────── Task-Aligned Assigner ────────────────
 class TaskAlignedAssigner:
-    """Task-Aligned Assigner from the TOOD paper."""
-    def __init__(self, top_k: int = 13, alpha: float = 1.0, beta: float = 6.0):
+    def __init__(self, top_k: int = 13, alpha: float = 1.0, beta: float = 6.0, eps: float = 1e-9):
         self.top_k = top_k
         self.alpha = alpha
         self.beta = beta
+        self.eps = eps
 
     @torch.no_grad()
-    def __call__(self, pred_scores, pred_boxes, gt_boxes, gt_labels):
-        A, C = pred_scores.shape
-        M = gt_boxes.shape[0]
-        device = pred_scores.device
-
-        if M == 0:
-            return (torch.zeros(A, dtype=torch.bool, device=device),
-                    torch.full((A,), C, dtype=torch.long, device=device), # Use C as background class index
-                    torch.zeros((A,), dtype=torch.float32, device=device))
-
-        # 1. Calculate alignment metric for all (anchor, gt) pairs
-        ious = tvops.box_iou(pred_boxes, gt_boxes) # (A, M)
+    def __call__(self, pred_scores_sigmoid, pred_boxes_decoded, gt_boxes, gt_labels):
+        # pred_scores_sigmoid: (Num_Anchors, Num_Classes), sigmoid applied
+        # pred_boxes_decoded: (Num_Anchors, 4), XYXY format
+        # gt_boxes: (Num_GT, 4), XYXY format
+        # gt_labels: (Num_GT,), long tensor of class indices
         
-        gt_class_indices = gt_labels.reshape(1, M).repeat(A, 1)
-        pred_cls_probs = pred_scores.sigmoid().gather(1, gt_class_indices) # (A, M)
+        num_anchors, num_classes = pred_scores_sigmoid.shape
+        num_gt = gt_boxes.shape[0]
+        device = pred_scores_sigmoid.device
 
-        raw_metric = (pred_cls_probs.pow(self.alpha)) * (ious.pow(self.beta))
-        # normalise so that each GT's best candidate is 1.0
-        max_per_gt = raw_metric.max(dim=0, keepdim=True).values.clamp_(min=1e-6)
-        alignment_metric = raw_metric / max_per_gt
+        if num_gt == 0: # No ground truth boxes
+            return (torch.zeros(num_anchors, dtype=torch.bool, device=device), # fg_mask
+                    torch.full((num_anchors,), num_classes, dtype=torch.long, device=device), # assigned_labels (bg)
+                    torch.zeros((num_anchors,), dtype=torch.float32, device=device)) # assigned_scores (iou)
 
-        # 2. Select top-k candidates for each GT based on the alignment metric
-        _, top_k_indices = torch.topk(alignment_metric, self.top_k, dim=0) # (M, top_k) -> Transposed op
+        # 1. Calculate IoUs between predicted boxes and GT boxes
+        ious = tvops.box_iou(pred_boxes_decoded, gt_boxes) # Shape: (Num_Anchors, Num_GT)
+        # Handle NaN IoUs if boxes are invalid (e.g. zero area) despite prior checks
+        ious = torch.nan_to_num(ious, nan=0.0)
 
-        # 3. Assign GTs to anchors
-        assigned_gt_inds = torch.full((A,), -1, dtype=torch.long, device=device)
-        
-        # Mark all top-k candidates as potential positives
-        candidate_mask = torch.zeros((A, M), dtype=torch.bool, device=device)
-        candidate_mask.scatter_(0, top_k_indices, True)
 
-        # Handle cases where one anchor is assigned to multiple GTs
-        # The anchor is assigned to the GT with which it has the highest alignment_metric
-        anchor_to_gt_max_metric, anchor_to_gt_argmax = alignment_metric.max(dim=1)
+        # 2. Calculate alignment metric
+        # Gather scores for GT classes: pred_scores_sigmoid[:, gt_labels]
+        # gt_labels might have shape (Num_GT), need to expand for gather
+        # gt_labels_expanded shape: (1, Num_GT) repeated to (Num_Anchors, Num_GT)
+        # Or use advanced indexing: pred_scores_sigmoid[:, gt_labels] if gt_labels is 1D tensor of indices
         
-        # An anchor is a foreground candidate if it's a top-k candidate for *any* GT
-        fg_mask = candidate_mask.any(dim=1)
-        # Final assignment: anchor is assigned to the GT that gave it the highest alignment score
-        assigned_gt_inds[fg_mask] = anchor_to_gt_argmax[fg_mask]
+        # pred_cls_probs_for_gt_classes shape (Num_Anchors, Num_GT)
+        # Each column j corresponds to gt_boxes[j] and gt_labels[j]
+        # Element (i, j) is the predicted score of anchor i for the class of gt j
+        pred_cls_probs_for_gt_classes = pred_scores_sigmoid[:, gt_labels]
+
+        # Alignment metric = (predicted_score_for_gt_class ^ alpha) * (iou_with_gt ^ beta)
+        alignment_metric = (pred_cls_probs_for_gt_classes.pow(self.alpha)) * (ious.pow(self.beta))
         
-        # 4. Prepare outputs for loss calculation
-        assigned_labels = torch.full((A,), C, dtype=torch.long, device=device) # Init with background class
-        assigned_scores = torch.zeros((A,), dtype=torch.float32, device=device)
+        # Normalize alignment_metric per GT (commented out in some impls, TOOD paper mentions it for candidate selection)
+        # max_per_gt = alignment_metric.max(dim=0, keepdim=True).values.clamp_(min=self.eps)
+        # alignment_metric = alignment_metric / max_per_gt
+
+
+        # 3. Select top-k candidates for each GT based on alignment metric
+        # topk along anchors (dim=0) for each GT
+        # alignment_metric shape (Num_Anchors, Num_GT)
+        # top_k_metrics shape (top_k, Num_GT), top_k_indices shape (top_k, Num_GT)
+        # Ensure top_k is not larger than num_anchors
+        dynamic_top_k = min(self.top_k, num_anchors)
+        _, top_k_indices_per_gt = torch.topk(alignment_metric, dynamic_top_k, dim=0)
+
+
+        # 4. Assign GTs to anchors
+        # fg_mask: boolean mask for anchors considered foreground (assigned to a GT)
+        # assigned_gt_inds: index of the GT assigned to each anchor, or -1 if background
         
+        # Initialize: all anchors are background
+        assigned_gt_inds = torch.full((num_anchors,), -1, dtype=torch.long, device=device)
+        
+        # Create a mask for candidate anchors (those in top-k for any GT)
+        candidate_mask = torch.zeros_like(alignment_metric, dtype=torch.bool) # (Num_Anchors, Num_GT)
+        candidate_mask.scatter_(0, top_k_indices_per_gt, True) # Mark top-k anchors for each GT
+
+        # Resolve conflicts: if an anchor is top-k for multiple GTs, assign it to the GT
+        # with which it has the highest IoU (or alignment_metric).
+        # alignment_metric_masked: only consider candidates, set others to 0 or -1
+        alignment_metric_masked = torch.where(candidate_mask, alignment_metric, torch.tensor(0., device=device))
+        
+        # anchor_max_alignment_score shape (Num_Anchors,), anchor_best_gt_idx shape (Num_Anchors,)
+        anchor_max_alignment_score, anchor_best_gt_idx = alignment_metric_masked.max(dim=1)
+
+        # An anchor is foreground if its max_alignment_score (with its best GT) is > 0
+        # (meaning it was a candidate for at least one GT and alignment_metric was > 0)
+        fg_mask = anchor_max_alignment_score > self.eps # Use eps to avoid floating point issues
+        
+        # Assign the best GT index to foreground anchors
+        assigned_gt_inds[fg_mask] = anchor_best_gt_idx[fg_mask]
+        
+        # 5. Prepare outputs for loss calculation
+        # assigned_labels: class label for each anchor (background_class_idx if background)
+        # assigned_scores: IoU score for VFL for each positive anchor
+        assigned_labels = torch.full((num_anchors,), num_classes, dtype=torch.long, device=device) # Init with background
+        assigned_scores = torch.zeros((num_anchors,), dtype=torch.float32, device=device) # Init with 0 score
+
         if fg_mask.any():
-            pos_gt_inds = assigned_gt_inds[fg_mask]
-            assigned_labels[fg_mask] = gt_labels[pos_gt_inds]
-            assigned_scores[fg_mask] = ious[fg_mask, pos_gt_inds]
+            pos_anchor_indices = torch.where(fg_mask)[0]
+            pos_assigned_gt_indices = assigned_gt_inds[pos_anchor_indices]
+            
+            assigned_labels[pos_anchor_indices] = gt_labels[pos_assigned_gt_indices]
+            # VFL uses IoU as the target score for positive samples
+            assigned_scores[pos_anchor_indices] = ious[pos_anchor_indices, pos_assigned_gt_indices]
 
         return fg_mask, assigned_labels, assigned_scores
 
 # ─── utils/ema.py ──────────────────────────────────────────────────────────────
 class ModelEMA:
-    """
-    Keeps a moving average of model parameters.
-    Call `update(model)` once after every optimiser step.
-    Use `ema_model = ema.ema` for evaluation / export.
-    """
     def __init__(self, model: torch.nn.Module, decay: float = 0.9999, device=None):
-        # Make a deep copy of the model for accumulating averages
-        self.ema = copy.deepcopy(model).eval()
+        self.ema = copy.deepcopy(model).eval() # Creates a new model instance for EMA
         for p in self.ema.parameters():
             p.requires_grad_(False)
-
         self.decay = decay
+        self.device = device # Store device for potential future use if needed
         if device is not None:
             self.ema.to(device, non_blocking=True)
+        
+        # For QAT models, buffers like observer min/max might be initialized empty.
+        # It's good to run a forward pass on `model` if it's a QAT model
+        # to ensure observers are initialized before the first EMA update.
+        # However, this is usually handled by the training loop itself.
 
     @torch.no_grad()
     def update(self, model: torch.nn.Module):
-        d = self.decay
-        msd = model.state_dict()
-        for k, v in self.ema.state_dict().items():
-            t = msd[k]
-            # new / replaced observers may have size 0 (or simply different)  
-            if v.numel() == 0 or t.numel() == 0 or v.shape != t.shape:
-                v.copy_(t)         # naïve copy keeps states consistent
-                continue
-            if not v.dtype.is_floating_point:
-                v.copy_(t)
-            else:
-                v.mul_(d).add_(t.detach(), alpha=1.0 - d)
+        if self.device is None and next(model.parameters(), None) is not None:
+            self.device = next(model.parameters()).device # Infer device if not set
+        
+        # Ensure EMA model is on the same device as the live model
+        if self.device is not None and self.ema.device != self.device:
+            self.ema.to(self.device)
 
+        # Update Parameters
+        for ema_param, model_param in zip(self.ema.parameters(), model.parameters()):
+            if model_param.device != ema_param.device: # Ensure params are on same device
+                 model_param_detached = model_param.detach().to(ema_param.device)
+            else:
+                 model_param_detached = model_param.detach()
+            
+            if ema_param.shape != model_param_detached.shape:
+                warnings.warn(f"EMA: Parameter shape mismatch. EMA: {ema_param.shape}, Model: {model_param_detached.shape}. Skipping EMA for this param.")
+                continue
+            ema_param.mul_(self.decay).add_(model_param_detached, alpha=1.0 - self.decay)
+
+        # Update Buffers (handles observer states in QAT)
+        for (ema_name, ema_buffer), (model_name, model_buffer) in zip(self.ema.named_buffers(), model.named_buffers()):
+            if ema_name != model_name: # Should not happen if deepcopy worked
+                warnings.warn(f"EMA: Buffer name mismatch. EMA: {ema_name}, Model: {model_name}. Potential error in EMA state.")
+                continue
+
+            if model_buffer.device != ema_buffer.device:
+                model_buffer_detached = model_buffer.detach().to(ema_buffer.device)
+            else:
+                model_buffer_detached = model_buffer.detach()
+
+            if ema_buffer.shape != model_buffer_detached.shape:
+                # This handles cases like observer min/max starting empty and becoming populated.
+                # We need to replace the buffer in self.ema, not just copy into a detached tensor.
+                # Find the module path and attribute name for the buffer in self.ema
+                module_path_parts = ema_name.split('.')
+                attr_name = module_path_parts.pop()
+                current_module = self.ema
+                try:
+                    for part in module_path_parts:
+                        current_module = getattr(current_module, part)
+                    
+                    # Delete old buffer and register the new one (cloned from model_buffer)
+                    delattr(current_module, attr_name) 
+                    current_module.register_buffer(attr_name, model_buffer_detached.clone())
+                    # print(f"DEBUG EMA: Replaced buffer {ema_name} due to shape change. New shape: {model_buffer_detached.shape}")
+                except AttributeError:
+                    warnings.warn(f"EMA: Could not replace buffer {ema_name} in EMA model structure despite shape mismatch.")
+                continue # Skip decay logic for this buffer; it's now synced or warning issued.
+
+            # If shapes match, apply update (copy for non-float, EMA for float)
+            if not ema_buffer.dtype.is_floating_point:
+                ema_buffer.copy_(model_buffer_detached)
+            else: # If it's a floating point buffer that needs EMA (rare, but possible)
+                ema_buffer.mul_(self.decay).add_(model_buffer_detached, alpha=1.0 - self.decay)
+                
     def copy_to(self, model: torch.nn.Module):
-        """Load EMA weights into a model instance (for export or final eval)."""
-        model.load_state_dict(self.ema.state_dict(), strict=False)
+        model.load_state_dict(self.ema.state_dict(), strict=True) # Use strict=True for safety
 
 
 # ───────────────────── Updated Training Loop ────────────────────────
@@ -652,6 +765,8 @@ def train_epoch(
             anchor_points_fg - assigned_boxes_fg[:, :2],
             assigned_boxes_fg[:, 2:] - anchor_points_fg
         ], 1) / anchor_strides_fg
+        # Ensure ltrb_targets are non-negative for build_dfl_targets
+        ltrb_targets.clamp_(min=0)
         
         dfl_target_dist = build_dfl_targets(ltrb_targets, reg_max)
         loss_dfl = dfl_loss(reg_preds_fg, dfl_target_dist)
@@ -755,6 +870,13 @@ def quick_val_iou(model: PicoDet, loader, device, epoch_num: int = -1, debug_pri
     return final_mean_iou
 
 def qat_prepare(model: nn.Module, example_input: torch.Tensor) -> torch.fx.GraphModule:
+    # For QAT, inplace activations can sometimes be problematic.
+    if True:
+        for module in model.modules():
+            if isinstance(module, (nn.ReLU, nn.ReLU6, nn.Hardswish)):
+                if hasattr(module, 'inplace') and module.inplace:
+                    module.inplace = False
+
     qconfig = QConfig(activation=MovingAverageMinMaxObserver.with_args(dtype=torch.quint8, qscheme=torch.per_tensor_affine),
                       weight=MovingAveragePerChannelMinMaxObserver.with_args(dtype=torch.qint8, qscheme=torch.per_channel_symmetric))
     qmap = get_default_qat_qconfig_mapping("x86").set_global(qconfig).set_module_name('pre', None)
@@ -767,34 +889,164 @@ class ONNXExportableModel(nn.Module):
     def forward(self, x: torch.Tensor):
         return self.quantized_model(x)
 
-def append_nms_to_onnx(in_path: str, out_path: str, score_thresh: float, iou_thresh: float, max_det: int):
-    model = onnx.load(in_path)
-    graph = model.graph
-    
-    graph.initializer.extend([
-        oh.make_tensor("iou_threshold", TP.FLOAT, [], [iou_thresh]),
-        oh.make_tensor("score_threshold", TP.FLOAT, [], [score_thresh]),
-        oh.make_tensor("max_output_boxes_per_class", TP.INT64, [], [max_det]),
+def append_nms_to_onnx(
+        in_path: str,
+        out_path: str,
+        score_thresh: float,
+        iou_thresh: float,
+        max_det: int,
+        *,
+        raw_boxes: str = "raw_boxes",     # [B , A , 4]
+        raw_scores: str = "raw_scores",   # [B , A , C]
+        top_k_before_nms: bool = False,
+        k_value: int = 800,
+):
+    m = onnx.load(in_path)
+    g = m.graph
+
+    # ───────── constants ─────────
+    g.initializer.extend([
+        oh.make_tensor("nms_iou_th",   TP.FLOAT, [], [iou_thresh]),
+        oh.make_tensor("nms_score_th", TP.FLOAT, [], [score_thresh]),
+        oh.make_tensor("nms_max_det",  TP.INT64, [], [max_det]),
+        oh.make_tensor("nms_axis0", TP.INT64, [1], [0]),
+        oh.make_tensor("nms_axis1", TP.INT64, [1], [1]),
+        oh.make_tensor("nms_axis2", TP.INT64, [1], [2]),
+        oh.make_tensor("nms_shape_boxes3d",  TP.INT64, [3], [0, -1, 4]),
+        oh.make_tensor("nms_shape_scores3d", TP.INT64, [3], [0, 0, -1]),
     ])
-    
-    scores_transposed = "scores_transposed"
-    graph.node.append(oh.make_node("Transpose", ["raw_scores"], [scores_transposed], perm=[0, 2, 1]))
-    
-    selected_indices = "selected_indices"
-    graph.node.append(oh.make_node(
+    if top_k_before_nms:
+        g.initializer.extend([
+            oh.make_tensor("nms_k_topk", TP.INT64, [1], [k_value]),
+        ])
+
+    # ───────── reshape / transpose raw outputs ─────────
+    boxes3d = "nms_boxes3d"
+    g.node.append(oh.make_node(
+        "Reshape", [raw_boxes, "nms_shape_boxes3d"], [boxes3d],
+        name="nms_Reshape_Boxes3D"))
+
+    scores3d = "nms_scores3d"
+    g.node.append(oh.make_node(
+        "Reshape", [raw_scores, "nms_shape_scores3d"], [scores3d],
+        name="nms_Reshape_Scores3D"))
+
+    scores_bca = "nms_scores_bca"
+    g.node.append(oh.make_node(
+        "Transpose", [scores3d], [scores_bca],
+        perm=[0, 2, 1], name="nms_Transpose_BCA"))  # [B , C , A]
+
+    # ───────── optional Top-K filter ─────────
+    if top_k_before_nms:
+        max_conf = "nms_max_conf"
+        g.node.append(oh.make_node(
+            "ReduceMax", [scores_bca, "nms_axis1"], [max_conf],
+            keepdims=0, name="nms_ReduceMax"))
+
+        topk_vals = "nms_topk_vals"
+        topk_idx  = "nms_topk_idx"                 # [B , K]
+        g.node.append(oh.make_node(
+            "TopK",
+            [max_conf, "nms_k_topk"],
+            [topk_vals, topk_idx],
+            axis=1, largest=1, sorted=0,
+            name="nms_TopK"))
+
+        topk_idx_unsq = "nms_topk_idx_unsq"        # [B , K , 1]
+        g.node.append(oh.make_node(
+            "Unsqueeze", [topk_idx, "nms_axis2"], [topk_idx_unsq],
+            name="nms_UnsqTopKIdx"))
+
+        boxes_topk = "nms_boxes_topk"              # [B , K , 4]
+        g.node.append(oh.make_node(
+            "GatherND", [boxes3d, topk_idx_unsq], [boxes_topk],
+            batch_dims=1, name="nms_GatherBoxesTopK"))
+
+        scores_bac = "nms_scores_bac"
+        g.node.append(oh.make_node(
+            "Transpose", [scores_bca], [scores_bac],
+            perm=[0, 2, 1], name="nms_Transpose_BAC"))
+
+        scores_bkc = "nms_scores_bkc"              # [B , K , C]
+        g.node.append(oh.make_node(
+            "GatherND", [scores_bac, topk_idx_unsq], [scores_bkc],
+            batch_dims=1, name="nms_GatherScoresTopK"))
+
+        scores_bck = "nms_scores_bck"              # [B , C , K]
+        g.node.append(oh.make_node(
+            "Transpose", [scores_bkc], [scores_bck],
+            perm=[0, 2, 1], name="nms_Transpose_BCK"))
+
+        nms_boxes  = boxes_topk
+        nms_scores = scores_bck
+    else:
+        nms_boxes  = boxes3d
+        nms_scores = scores_bca
+
+    # ───────── Non-Max Suppression ─────────
+    sel = "nms_selected"                          # [N , 3]
+    g.node.append(oh.make_node(
         "NonMaxSuppression",
-        inputs=["raw_boxes", scores_transposed, "max_output_boxes_per_class", "iou_threshold", "score_threshold"],
-        outputs=[selected_indices]
-    ))
-    
-    del graph.output[:]
-    graph.output.extend([
-        oh.make_tensor_value_info(selected_indices, TP.INT64, ['num_detections', 3]),
+        [nms_boxes, nms_scores,
+         "nms_max_det", "nms_iou_th", "nms_score_th"],
+        [sel], name="nms_NMS"))
+
+    # split indices (batch , class , anchor)
+    g.initializer.extend([
+        oh.make_tensor("nms_split111", TP.INT64, [3], [1, 1, 1]),
+    ])
+    b_col, c_col, a_col = "nms_b", "nms_c", "nms_a"
+    g.node.append(oh.make_node(
+        "Split", [sel, "nms_split111"], [b_col, c_col, a_col],
+        axis=1, name="nms_SplitSel"))
+
+    # squeeze to 1-D
+    b_idx, cls_idx, anc_idx = "batch_idx", "class_idx", "anchor_idx"
+    for src, dst in [(b_col, b_idx), (c_col, cls_idx), (a_col, anc_idx)]:
+        g.node.append(oh.make_node(
+            "Squeeze", [src, "nms_axis1"], [dst],
+            name=f"nms_Squeeze_{dst}"))
+
+    # ───── gather det_boxes  (batch_dims=1, indices=[anchor]) ─────
+    a_unsq = "nms_a_unsq"
+    g.node.append(oh.make_node(
+        "Unsqueeze", [anc_idx, "nms_axis1"], [a_unsq],
+        name="nms_UnsqAnchor"))
+
+    det_boxes = "det_boxes"
+    g.node.append(oh.make_node(
+        "GatherND", [nms_boxes, a_unsq], [det_boxes],
+        batch_dims=1, name="nms_GatherDetBoxes"))
+
+    # ───── gather det_scores  (batch_dims=1, indices=[class,anchor]) ─────
+    cls_unsq = "nms_cls_unsq"
+    g.node.append(oh.make_node(
+        "Unsqueeze", [cls_idx, "nms_axis1"], [cls_unsq],
+        name="nms_UnsqClass"))
+
+    idx_scores = "nms_idx_scores"                 # [N , 2]
+    g.node.append(oh.make_node(
+        "Concat", [cls_unsq, a_unsq], [idx_scores],
+        axis=1, name="nms_CatClassAnchor"))
+
+    det_scores = "det_scores"
+    g.node.append(oh.make_node(
+        "GatherND", [nms_scores, idx_scores], [det_scores],
+        batch_dims=1, name="nms_GatherDetScores"))
+
+    # ───────── declare final outputs ─────────
+    del g.output[:]   # remove existing outputs
+    g.output.extend([
+        oh.make_tensor_value_info(det_boxes,  TP.FLOAT, ['N', 4]),
+        oh.make_tensor_value_info(det_scores, TP.FLOAT, ['N']),
+        oh.make_tensor_value_info(cls_idx,    TP.INT64, ['N']),
+        oh.make_tensor_value_info(b_idx,      TP.INT64, ['N']),
     ])
 
-    onnx.checker.check_model(model)
-    onnx.save(model, out_path)
-    print(f"[SAVE] Final ONNX with NMS indices output -> {out_path}")
+    onnx.checker.check_model(m)
+    onnx.save(m, out_path)
+    print(f"[SAVE] Final ONNX with NMS → {out_path}")
+
 
 # ───────────────────────── Main Execution ────────────────────────────────
 def main(argv: List[str] | None = None):
@@ -831,7 +1083,7 @@ def main(argv: List[str] | None = None):
     scaler = torch.amp.GradScaler(enabled=(dev.type == 'cuda'))
     
     assigner = TaskAlignedAssigner(top_k=13)
-    ema = ModelEMA(model, decay=0.999)
+    ema = ModelEMA(model, decay=0.999, device=dev)
     
     print(f"[INFO] Starting FP32 training for {cfg.epochs} epochs...")
     for ep in range(cfg.epochs):
@@ -868,7 +1120,7 @@ def main(argv: List[str] | None = None):
     scaler_q = torch.amp.GradScaler(enabled=(dev.type == 'cuda'))
     
     print(f"[INFO] Starting QAT finetuning for {cfg.qat_epochs} epochs...")
-    ema_q = ModelEMA(qat_model, decay=0.99)
+    ema_q = ModelEMA(qat_model, decay=0.99, device=dev)
     for qep in range(cfg.qat_epochs):
         train_loss_q = train_epoch(qat_model, tr_loader, opt_q, scaler_q, assigner, dev, qep, cfg.qat_epochs)
         ema_q.update(qat_model) 
