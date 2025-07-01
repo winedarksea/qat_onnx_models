@@ -619,7 +619,7 @@ class ModelEMA:
             self.device = next(model.parameters()).device # Infer device if not set
         
         # Ensure EMA model is on the same device as the live model
-        if self.device is not None and self.ema.device != self.device:
+        if self.device is not None:  # and self.ema.device != self.device:
             self.ema.to(self.device)
 
         # Update Parameters
@@ -869,7 +869,9 @@ def quick_val_iou(model: PicoDet, loader, device, epoch_num: int = -1, debug_pri
     
     return final_mean_iou
 
-def qat_prepare(model: nn.Module, example_input: torch.Tensor) -> torch.fx.GraphModule:
+pack = "qnnpack"
+
+def qat_prepare_old(model: nn.Module, example_input: torch.Tensor) -> torch.fx.GraphModule:
     # For QAT, inplace activations can sometimes be problematic.
     if True:
         for module in model.modules():
@@ -879,8 +881,57 @@ def qat_prepare(model: nn.Module, example_input: torch.Tensor) -> torch.fx.Graph
 
     qconfig = QConfig(activation=MovingAverageMinMaxObserver.with_args(dtype=torch.quint8, qscheme=torch.per_tensor_affine),
                       weight=MovingAveragePerChannelMinMaxObserver.with_args(dtype=torch.qint8, qscheme=torch.per_channel_symmetric))
-    qmap = get_default_qat_qconfig_mapping("x86").set_global(qconfig).set_module_name('pre', None)
+    qmap = get_default_qat_qconfig_mapping(pack).set_global(qconfig).set_module_name('pre', None)
     return prepare_qat_fx(model.cpu().train(), qmap, example_input.cpu())
+
+
+def qat_prepare(model: nn.Module, example_input: torch.Tensor) -> torch.fx.GraphModule:
+    """
+    Prepares the model for Quantization-Aware Training (QAT) using FX graph mode.
+
+    Args:
+        model: The PyTorch nn.Module to prepare for QAT.
+        example_input: A representative example input tensor for tracing the model.
+
+    Returns:
+        A torch.fx.GraphModule prepared for QAT.
+    """
+    # 1. Define the desired QConfig for most layers
+    #    Activations: per-tensor, affine, quint8
+    #    Weights: per-channel, symmetric, qint8 (common for conv/linear layers)
+    global_qconfig = QConfig(
+        activation=MovingAverageMinMaxObserver.with_args(
+            dtype=torch.quint8, qscheme=torch.per_tensor_affine
+        ),
+        weight=MovingAveragePerChannelMinMaxObserver.with_args(
+            dtype=torch.qint8, qscheme=torch.per_channel_symmetric
+        )
+    )
+
+    # 2. Get the default QAT qconfig mapping for the chosen backend
+    #    'x86' or 'qnnpack' (for ARM) are common backends.
+    backend_config = pack
+    qconfig_mapping = get_default_qat_qconfig_mapping(backend_config)
+
+    # 3. Apply the global QConfig to the mapping
+    #    This will apply `global_qconfig` to all quantizable module types
+    #    unless overridden by more specific settings (e.g., per module type/instance).
+    qconfig_mapping = qconfig_mapping.set_global(global_qconfig)
+
+    # 4. Specify modules to skip quantization
+    #    The 'pre' module (ResizeNorm) handles uint8 input and normalization;
+    qconfig_mapping = qconfig_mapping.set_module_name('pre', None)
+
+    # 5. Prepare the model for QAT using FX graph mode
+    model.cpu().train() # Ensure model is on CPU and in train mode
+    
+    prepared_model = prepare_qat_fx(
+        model,
+        qconfig_mapping,
+        example_input # Must also be on CPU
+    )
+    
+    return prepared_model
 
 class ONNXExportableModel(nn.Module):
     def __init__(self, qat_model: PicoDet):
@@ -1044,6 +1095,7 @@ def append_nms_to_onnx(
     ])
 
     onnx.checker.check_model(m)
+    # onnx.utils.polish_model()
     onnx.save(m, out_path)
     print(f"[SAVE] Final ONNX with NMS → {out_path}")
 
@@ -1053,7 +1105,7 @@ def main(argv: List[str] | None = None):
     pa = argparse.ArgumentParser()
     pa.add_argument('--coco_root', default='coco')
     pa.add_argument('--arch', default='mnv4c', choices=['mnv4c'])
-    pa.add_argument('--epochs', type=int, default=2) 
+    pa.add_argument('--epochs', type=int, default=4) 
     pa.add_argument('--qat_epochs', type=int, default=1) 
     pa.add_argument('--batch', type=int, default=32)
     pa.add_argument('--workers', type=int, default=0)
@@ -1083,7 +1135,7 @@ def main(argv: List[str] | None = None):
     scaler = torch.amp.GradScaler(enabled=(dev.type == 'cuda'))
     
     assigner = TaskAlignedAssigner(top_k=13)
-    ema = ModelEMA(model, decay=0.999, device=dev)
+    # ema = ModelEMA(model, decay=0.999, device=dev)
     
     print(f"[INFO] Starting FP32 training for {cfg.epochs} epochs...")
     for ep in range(cfg.epochs):
@@ -1096,15 +1148,27 @@ def main(argv: List[str] | None = None):
             print("[INFO] Backbone unfrozen – full network now training")
 
         train_loss = train_epoch(model, tr_loader, opt, scaler, assigner, dev, ep, cfg.epochs)
-        ema.update(model)  
-        val_iou = quick_val_iou(ema.ema, vl_loader, dev, epoch_num=ep)
+        # ema.update(model)  
+        val_iou = quick_val_iou(model, vl_loader, dev, epoch_num=ep)
         print(f"Epoch {ep+1}/{cfg.epochs} | Train Loss: {train_loss:.4f} | Val IoU: {val_iou:.4f} | LR: {opt.param_groups[0]['lr']:.6f}\n")
         sch.step()
 
     print("\n[INFO] Preparing model for QAT...")
     model.train()
 
-    qat_model = qat_prepare(model, torch.randint(0, 256, (1, 3, IMG_SIZE, IMG_SIZE), dtype=torch.uint8))
+    # qat_model = qat_prepare_old(model, torch.randint(0, 256, (1, 3, IMG_SIZE, IMG_SIZE), dtype=torch.uint8))
+    example = torch.randint(
+        low=0, high=256,
+        size=(1, 3, IMG_SIZE, IMG_SIZE),
+        dtype=torch.uint8
+    )
+    qat_model = qat_prepare(model, example).to(dev)
+    qat_model.eval()
+    with torch.no_grad():
+        for imgs_batch, _ in tr_loader:
+            qat_model(imgs_batch.to(dev))
+            break
+    qat_model.train()
 
     # Manually re-attach the necessary attributes from the original model to the new qat_model.
     # This makes them accessible to train_epoch() and quick_val_iou().
@@ -1120,25 +1184,26 @@ def main(argv: List[str] | None = None):
     scaler_q = torch.amp.GradScaler(enabled=(dev.type == 'cuda'))
     
     print(f"[INFO] Starting QAT finetuning for {cfg.qat_epochs} epochs...")
-    ema_q = ModelEMA(qat_model, decay=0.99, device=dev)
     for qep in range(cfg.qat_epochs):
         train_loss_q = train_epoch(qat_model, tr_loader, opt_q, scaler_q, assigner, dev, qep, cfg.qat_epochs)
-        ema_q.update(qat_model) 
+        # ema.update(qat_model) 
         
         # FIX: Validate using the smoothed EMA weights for consistency with the FP32 loop.
-        val_iou_q = quick_val_iou(ema_q.ema, vl_loader, dev, epoch_num=qep)
+        val_iou_q = quick_val_iou(model, vl_loader, dev, epoch_num=qep)
     
         print(f"QAT Epoch {qep+1}/{cfg.qat_epochs} | Train Loss: {train_loss_q:.4f} | Val IoU: {val_iou_q:.4f}\n")
 
     model.score_th = 0.05  # export threshold
     
     print("\n[INFO] Exporting to ONNX...")
+    temp_onnx_path = cfg.out.replace(".onnx", "_temp.onnx")
+    
     # final_exportable_model = ONNXExportableModel(qat_model)
+    """
+    # old export path
     export_model = copy.deepcopy(qat_model).cpu()
     ema_q.copy_to(export_model)          # use the averaged weights
     final_exportable_model = ONNXExportableModel(export_model)
-    
-    temp_onnx_path = cfg.out.replace(".onnx", "_temp.onnx")
     torch.onnx.export(
         final_exportable_model,
         torch.randint(0, 256, (1, 3, IMG_SIZE, IMG_SIZE), dtype=torch.uint8),
@@ -1148,6 +1213,27 @@ def main(argv: List[str] | None = None):
         dynamic_axes={'images_uint8': {0: 'batch'}, 'raw_boxes': {0: 'batch'}, 'raw_scores': {0: 'batch'}},
         opset_version=18
     )
+    """
+    
+    print("[INFO] Finishing QAT – converting to int8")
+    int8_model = convert_fx(copy.deepcopy(qat_model).cpu().eval())
+    
+    print("[INFO] ONNX export")
+    dummy = torch.rand(1, 3, IMG_SIZE, IMG_SIZE)         # still FP32 input
+    torch.onnx.export(
+            int8_model,
+            dummy,
+            temp_onnx_path,
+            input_names=['images'],
+            output_names=['raw_boxes', 'raw_scores'],
+            dynamic_axes={'images': {0: 'batch'},
+                          'raw_boxes': {0: 'batch'},
+                          'raw_scores': {0: 'batch'}},
+            opset_version=18)
+    append_nms_to_onnx(temp_onnx_path, cfg.out,
+                       score_thresh=model.score_th,
+                       iou_thresh=model.iou_th,
+                       max_det   =model.max_det)
     print(f"[SAVE] Intermediate ONNX (INT8 core, no NMS) -> {temp_onnx_path}")
     
     append_nms_to_onnx(temp_onnx_path, cfg.out, model.score_th, model.iou_th, model.max_det)

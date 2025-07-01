@@ -152,6 +152,7 @@ class SimOTACache:
                  tgt: dict,              # {"boxes":(M,4), "labels":(M,)}
                  cls_logits: torch.Tensor, # Raw class logits (A, C) from model
                  obj_logits: torch.Tensor | None = None,
+                 model_head = None,
                  ):
 
         # 0. early-exit if no GT
@@ -167,6 +168,18 @@ class SimOTACache:
                    torch.zeros((A,),      dtype=torch.float32, device=device)
 
         # 1. collect anchor centres & strides (with cache)
+        
+        anchor_centers = torch.cat(
+            [getattr(model_head, f'anchor_points_level_{i}') for i in range(model_head.nl)],
+        0).to(device)
+        
+        anchor_strides = torch.cat([
+            model_head.strides_buffer[i].expand(getattr(model_head, f'anchor_points_level_{i}').size(0))
+            for i in range(model_head.nl)
+        ], 0).to(device)
+
+        ####
+        """
         centres_l, strides_l = [], []
         for H, W, s_val in f_shapes:
             key = (H, W, s_val, torch.device(device).type)  
@@ -184,6 +197,7 @@ class SimOTACache:
 
         anchor_centers = torch.cat(centres_l, 0)     # (A,2)
         anchor_strides = torch.cat(strides_l, 0)     # (A,)
+        """
         A = anchor_centers.size(0)
 
         # 2. IoU and centre-radius mask
@@ -394,7 +408,8 @@ def train_epoch(
             fg_mask_img, gt_labels, gt_boxes, gt_ious = assigner(
                     fmap_shapes, device, target_dict_for_assigner,
                     cls_logits=cls_p_img, # Raw class logits
-                    obj_logits=obj_p_img # Raw objectness logits (or None)
+                    obj_logits=obj_p_img, # Raw objectness logits (or None)
+                    model_head=model.head,
             )
             reg_p_fg_img = reg_p_img[fg_mask_img]
             box_targets_fg_img = gt_boxes[fg_mask_img]
@@ -409,11 +424,6 @@ def train_epoch(
             ##########
             # --- Distribution Focal Loss (DFL) & IoU Loss for BBox Regression ---
             # (These are independent of the classification/objectness choice above and operate on reg_p_img)
-            strides_all_anchors_img = torch.cat(
-                [torch.full((H_lvl * W_lvl,), float(s_lvl_val), device=device)
-                 for H_lvl, W_lvl, s_lvl_val in fmap_shapes], dim=0
-            )
-            strides_fg_img = strides_all_anchors_img[fg_mask_img].unsqueeze(-1)
 
             pred_ltrb_offsets_fg_img = PicoDetHead.dfl_decode_for_training(
                 reg_p_fg_img,
@@ -421,11 +431,31 @@ def train_epoch(
                 head_reg_max_for_loss
             )
 
+            """
+            strides_all_anchors_img = torch.cat(
+                [torch.full((H_lvl * W_lvl,), float(s_lvl_val), device=device)
+                 for H_lvl, W_lvl, s_lvl_val in fmap_shapes], dim=0
+            )
+            strides_fg_img = strides_all_anchors_img[fg_mask_img].unsqueeze(-1)
             anchor_centers_all_img = torch.cat(
                 [assigner.cache[(H_lvl, W_lvl, s_lvl_val, str(device))]
                  for H_lvl, W_lvl, s_lvl_val in fmap_shapes], dim=0
             )
             anchor_centers_fg_img = anchor_centers_all_img[fg_mask_img]
+            """
+            # build anchors & strides from the head buffers (always consistent)
+            head_anchors_list  = []
+            head_strides_list  = []
+            for lvl_idx in range(model.head.nl):
+                anchor_level = getattr(model.head, f'anchor_points_level_{lvl_idx}').to(device)
+                stride_val   = model.head.strides_buffer[lvl_idx].to(device)          # scalar tensor
+                head_anchors_list.append(anchor_level)
+                head_strides_list.append(stride_val.expand(anchor_level.size(0)))
+            
+            anchor_centers_all_img = torch.cat(head_anchors_list, 0)     # (A , 2)
+            anchor_centers_fg_img = anchor_centers_all_img[fg_mask_img]
+            strides_all_anchors_img = torch.cat(head_strides_list, 0)    # (A ,)
+            strides_fg_img = strides_all_anchors_img[fg_mask_img].unsqueeze(-1)
 
             if debug_prints and epoch == 0 and i == 0 and b_idx == 0:
                 head_anchors_flat_list = []
@@ -1252,7 +1282,7 @@ def main(argv: List[str] | None = None):
         backbone, 
         feat_chs,
         num_classes=80, 
-        neck_out_ch=96,
+        neck_out_ch=128,  # 96
         img_size=IMG_SIZE,
         inplace_act_for_head_neck=not cfg.no_inplace_head_neck # Control from arg
     ).to(dev)
