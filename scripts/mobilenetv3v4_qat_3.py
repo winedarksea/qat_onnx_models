@@ -33,9 +33,27 @@ warnings.filterwarnings(
     "ignore", message="'.*has_(cuda|cudnn|mps|mkldnn).*is deprecated", module="torch.overrides"
 )
 
+try:
+    folder_to_add = r"/Users/colincatlin/Documents-NoCloud/qat_onnx_models/scripts" 
+    # folder_to_add = r"C:\Users\Colin\qat_onnx_models\scripts"
+    # folder_to_add = r"/home/colin/img_data"
+    # Check if the path and file exist before trying to add to sys.path and import
+    custom_module_path = os.path.join(folder_to_add, "customMobilenetNetv4.py")
+    if os.path.exists(custom_module_path):
+        if folder_to_add not in sys.path:
+             sys.path.insert(0, folder_to_add)
+        from customMobilenetNetv4 import MobileNetV4ConvSmallPico, MobileNetV4
+        print(f"[INFO] Successfully imported customMobilenetNetv4 from {folder_to_add}")
+    else:
+        print(f"Warning: Did not find customMobilenetNetv4.py at {custom_module_path}. 'mnv4c' backbone will not be available.")
+        MobileNetV4ConvSmallPico = None
+except ImportError as e:
+    print(f"Warning: Failed to import customMobilenetNetv4.py ({e}). 'mnv4c' backbone will not be available.")
+    MobileNetV4ConvSmallPico = None
+except Exception as e: # Catch other potential errors like incorrect path structure
+    print(f"An error occurred during custom backbone import setup: {e}")
+    MobileNetV4ConvSmallPico = None
 
-folder_to_add = r"C:\Users\Colin\qat_onnx_models\scripts" # Use 'r' for raw string to handle backslashes
-sys.path.append(folder_to_add)
 
 SEED, IMG_SIZE, NUM_WORKERS = 42, 224, 0
 DUMMY_H, DUMMY_W = IMG_SIZE + 32, IMG_SIZE + 64 # Used for QAT example input
@@ -221,17 +239,30 @@ def get_backbone(arch: str, ncls: int, width: float,
         
         model.classifier = nn.Sequential(*new_classifier_layers)
     elif arch == "mnv4c":
-        # For PicoDet, you might want to set num_classes=0 and specify out_indices
-        # For classification as in this script, num_classes=ncls
         model = MobileNetV4ConvSmallPico(
             width_multiplier=width,
             num_classes=ncls,
             drop_rate=drop_rate, # For classifier
             drop_path_rate=drop_path_rate # For stochastic depth in blocks
-            # out_features_indices can be set if used for detection later
         )
         # The model already has its own classifier if ncls > 0
         # No need to replace model.classifier like for mnv3/mnv2
+    elif arch == "mnv4c-s":
+        model = MobileNetV4(
+            variant='conv_s',
+            width_multiplier=width,
+            num_classes=ncls,
+            drop_rate=drop_rate, # For classifier
+            drop_path_rate=drop_path_rate
+        )
+    elif arch == "mnv4c-m":
+        model = MobileNetV4(
+            variant='conv_m',
+            width_multiplier=width,
+            num_classes=ncls,
+            drop_rate=drop_rate, # For classifier
+            drop_path_rate=drop_path_rate
+        )
     elif arch in {"mnv4s", "mnv4m"}:
         try:
             import timm
@@ -392,6 +423,44 @@ def save_backbone(model,  output_base_name, dev):
         print(f"[SAVE] FP32 PyTorch backbone state_dict → {bpath}")
     # model.to(dev) (if not doing deepcopy)
 
+def load_backbone_from_checkpoint(model: nn.Module,
+                                  checkpoint_path: str,
+                                  classifier_key_patterns: list[str] = None,
+                                  map_location: str | torch.device = 'cpu'):
+    """
+    Loads all matching weights from checkpoint_path into model, skipping keys
+    that correspond to the old classification head.
+    
+    Args:
+        model: your new nn.Module with a freshly initialized head.
+        checkpoint_path: path to .pt or .pth file saved via torch.save().
+        classifier_key_patterns: list of substrings; any key containing one of these
+                                 will be skipped. Defaults to ["classifier", "head"].
+        map_location: device mapping for torch.load().
+    """
+    ckpt = torch.load(checkpoint_path, map_location=map_location)
+    # unwrap if needed
+    state_dict = ckpt.get('state_dict', ckpt)
+    
+    # by default skip anything in "classifier" or "head"
+    if classifier_key_patterns is None:
+        classifier_key_patterns = ['classifier', 'head']
+    
+    filtered = {}
+    for k, v in state_dict.items():
+        if any(pat in k for pat in classifier_key_patterns):
+            # skip this key
+            continue
+        filtered[k] = v
+    
+    # load with strict=False so that only the filtered keys are filled
+    missing, unexpected = model.load_state_dict(filtered, strict=False)
+    if missing:
+        print(f"[WARN] Missing keys in new model (will be randomly initialized): {missing}")
+    if unexpected:
+        print(f"[WARN] Unexpected keys in checkpoint not used: {unexpected}")
+    print(f"[INFO] Loaded {len(filtered)} parameters from '{checkpoint_path}'.")
+
 
 # --- Main script execution ---
 data_dir: str = "filtered_imagenet2_native" # Example, replace with your actual path
@@ -464,6 +533,7 @@ tr = get_loader(data_dir, batch, True, dev)
 vl = get_loader(data_dir, batch, False, dev)
 
 model = build_model(ncls, width_mult, dev, arch=arch, pretrained=pretrained, drop_rate=drop_rate)
+# load_backbone_from_checkpoint(model, f"{output_base_name}_fp32_backbone.pt")
 
 crit = nn.CrossEntropyLoss(label_smoothing=0.1)
 scaler = torch.amp.GradScaler(enabled=(dev.type == "cuda" and not compile_model)) # torch.compile may not like scaler with fullgraph

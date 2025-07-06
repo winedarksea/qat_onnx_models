@@ -7,8 +7,7 @@ try:
 except ImportError:
     # Fallback DropPath if timm is not available
     class DropPath(nn.Module):
-        """Drop paths (Stochastic Depth) per sample (when applied in main path of residual blocks).
-        """
+        """Drop paths (Stochastic Depth) per sample (when applied in main path of residual blocks)."""
         def __init__(self, drop_prob: float = 0., scale_by_keep: bool = True):
             super(DropPath, self).__init__()
             self.drop_prob = drop_prob
@@ -18,7 +17,7 @@ except ImportError:
             if self.drop_prob == 0. or not self.training:
                 return x
             keep_prob = 1 - self.drop_prob
-            shape = (x.shape[0],) + (1,) * (x.ndim - 1)  # work with diff dim tensors, not just 2D ConvNets
+            shape = (x.shape[0],) + (1,) * (x.ndim - 1)
             random_tensor = x.new_empty(shape).bernoulli_(keep_prob)
             if keep_prob > 0.0 and self.scale_by_keep:
                 random_tensor.div_(keep_prob)
@@ -29,16 +28,10 @@ except ImportError:
 
 
 def _make_divisible(v: float, divisor: int, min_value: Optional[int] = None) -> int:
-    """
-    This function is taken from the original tf repo.
-    It ensures that all layers have a channel number that is divisible by 8
-    It can be seen here:
-    https://github.com/tensorflow/models/blob/master/research/slim/nets/mobilenet/mobilenet.py
-    """
+    """Ensures that all layers have a channel number that is divisible by 8."""
     if min_value is None:
         min_value = divisor
     new_v = max(min_value, int(v + divisor / 2) // divisor * divisor)
-    # Make sure that round down does not go down by more than 10%.
     if new_v < 0.9 * v:
         new_v += divisor
     return new_v
@@ -55,7 +48,7 @@ class ConvBNAct(nn.Module):
         act_layer: Optional[Type[nn.Module]] = nn.ReLU,
         bn_layer: Type[nn.Module] = nn.BatchNorm2d,
         padding: Optional[int] = None,
-        bias: bool = False, # Usually False if BN is used
+        bias: bool = False,
     ):
         super().__init__()
         if padding is None:
@@ -66,41 +59,17 @@ class ConvBNAct(nn.Module):
         self.bn = bn_layer(out_channels)
         self.act = act_layer(inplace=False) if act_layer is nn.ReLU else act_layer() if act_layer else nn.Identity()
 
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.conv(x)
-        x = self.bn(x)
-        x = self.act(x)
-        return x
+        return self.act(self.bn(self.conv(x)))
 
 
 class MNV4_FusedInvertedBottleneck(nn.Module):
     """Fused Inverted Bottleneck block for MobileNetV4."""
-    def __init__(
-        self,
-        in_channels: int,
-        out_channels: int,
-        expanded_channels: int,
-        kernel_size: int, # This is dw_k2 from table, used for the main 3x3 conv
-        stride: int,
-        act_layer: Type[nn.Module],
-        bn_layer: Type[nn.Module],
-        drop_path_rate: float = 0.0,
-    ):
+    def __init__(self, in_channels, out_channels, expanded_channels, kernel_size, stride, act_layer, bn_layer, drop_path_rate=0.0):
         super().__init__()
-        self.stride = stride
         self.use_residual = stride == 1 and in_channels == out_channels
-
-        # Fused part: Conv-BN-Act
-        self.conv_fused = ConvBNAct(
-            in_channels, expanded_channels, kernel_size=kernel_size, stride=stride,
-            act_layer=act_layer, bn_layer=bn_layer
-        )
-        # Projection: Conv-BN
-        self.conv_proj = ConvBNAct(
-            expanded_channels, out_channels, kernel_size=1, stride=1,
-            act_layer=None, bn_layer=bn_layer # No activation before residual add
-        )
+        self.conv_fused = ConvBNAct(in_channels, expanded_channels, kernel_size=kernel_size, stride=stride, act_layer=act_layer, bn_layer=bn_layer)
+        self.conv_proj = ConvBNAct(expanded_channels, out_channels, kernel_size=1, stride=1, act_layer=None, bn_layer=bn_layer)
         self.drop_path = DropPath(drop_path_rate) if drop_path_rate > 0.0 else nn.Identity()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -114,36 +83,12 @@ class MNV4_FusedInvertedBottleneck(nn.Module):
 
 class MNV4_InvertedBottleneck(nn.Module):
     """Inverted Bottleneck block (IB) for MobileNetV4."""
-    def __init__(
-        self,
-        in_channels: int,
-        out_channels: int,
-        expanded_channels: int,
-        dw_kernel_size: int, # This is dw_k2 from table
-        stride: int,
-        act_layer: Type[nn.Module],
-        bn_layer: Type[nn.Module],
-        drop_path_rate: float = 0.0,
-    ):
+    def __init__(self, in_channels, out_channels, expanded_channels, dw_kernel_size, stride, act_layer, bn_layer, drop_path_rate=0.0):
         super().__init__()
-        self.stride = stride
         self.use_residual = stride == 1 and in_channels == out_channels
-
-        # Expansion: 1x1 Conv-BN-Act
-        self.conv_pw_exp = ConvBNAct(
-            in_channels, expanded_channels, kernel_size=1, stride=1,
-            act_layer=act_layer, bn_layer=bn_layer
-        )
-        # Depthwise: DWConv-BN-Act
-        self.conv_dw = ConvBNAct(
-            expanded_channels, expanded_channels, kernel_size=dw_kernel_size, stride=stride,
-            groups=expanded_channels, act_layer=act_layer, bn_layer=bn_layer
-        )
-        # Projection: 1x1 Conv-BN
-        self.conv_pw_proj = ConvBNAct(
-            expanded_channels, out_channels, kernel_size=1, stride=1,
-            act_layer=None, bn_layer=bn_layer # No activation before residual add
-        )
+        self.conv_pw_exp = ConvBNAct(in_channels, expanded_channels, kernel_size=1, stride=1, act_layer=act_layer, bn_layer=bn_layer)
+        self.conv_dw = ConvBNAct(expanded_channels, expanded_channels, kernel_size=dw_kernel_size, stride=stride, groups=expanded_channels, act_layer=act_layer, bn_layer=bn_layer)
+        self.conv_pw_proj = ConvBNAct(expanded_channels, out_channels, kernel_size=1, stride=1, act_layer=None, bn_layer=bn_layer)
         self.drop_path = DropPath(drop_path_rate) if drop_path_rate > 0.0 else nn.Identity()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -158,42 +103,13 @@ class MNV4_InvertedBottleneck(nn.Module):
 
 class MNV4_ExtraDepthwiseBlock(nn.Module):
     """Extra Depthwise block (ExtraDW) for MobileNetV4."""
-    def __init__(
-        self,
-        in_channels: int,
-        out_channels: int,
-        expanded_channels: int,
-        dw_kernel_size1: int,
-        dw_kernel_size2: int,
-        stride: int,
-        act_layer: Type[nn.Module],
-        bn_layer: Type[nn.Module],
-        drop_path_rate: float = 0.0,
-    ):
+    def __init__(self, in_channels, out_channels, expanded_channels, dw_kernel_size1, dw_kernel_size2, stride, act_layer, bn_layer, drop_path_rate=0.0):
         super().__init__()
-        self.stride = stride
         self.use_residual = stride == 1 and in_channels == out_channels
-
-        # Expansion: 1x1 Conv-BN-Act
-        self.conv_pw_exp = ConvBNAct(
-            in_channels, expanded_channels, kernel_size=1, stride=1,
-            act_layer=act_layer, bn_layer=bn_layer
-        )
-        # Depthwise 1: DWConv-BN-Act
-        self.conv_dw1 = ConvBNAct(
-            expanded_channels, expanded_channels, kernel_size=dw_kernel_size1, stride=stride, # Stride applied here
-            groups=expanded_channels, act_layer=act_layer, bn_layer=bn_layer
-        )
-        # Depthwise 2: DWConv-BN-Act
-        self.conv_dw2 = ConvBNAct(
-            expanded_channels, expanded_channels, kernel_size=dw_kernel_size2, stride=1,
-            groups=expanded_channels, act_layer=act_layer, bn_layer=bn_layer
-        )
-        # Projection: 1x1 Conv-BN
-        self.conv_pw_proj = ConvBNAct(
-            expanded_channels, out_channels, kernel_size=1, stride=1,
-            act_layer=None, bn_layer=bn_layer # No activation before residual add
-        )
+        self.conv_pw_exp = ConvBNAct(in_channels, expanded_channels, kernel_size=1, stride=1, act_layer=act_layer, bn_layer=bn_layer)
+        self.conv_dw1 = ConvBNAct(expanded_channels, expanded_channels, kernel_size=dw_kernel_size1, stride=stride, groups=expanded_channels, act_layer=act_layer, bn_layer=bn_layer)
+        self.conv_dw2 = ConvBNAct(expanded_channels, expanded_channels, kernel_size=dw_kernel_size2, stride=1, groups=expanded_channels, act_layer=act_layer, bn_layer=bn_layer)
+        self.conv_pw_proj = ConvBNAct(expanded_channels, out_channels, kernel_size=1, stride=1, act_layer=None, bn_layer=bn_layer)
         self.drop_path = DropPath(drop_path_rate) if drop_path_rate > 0.0 else nn.Identity()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -208,63 +124,44 @@ class MNV4_ExtraDepthwiseBlock(nn.Module):
 
 
 class MNV4_ConvNeXtLikeBlock(nn.Module):
-    """ConvNeXt-like block for MobileNetV4 (simplified)."""
-    def __init__(
-        self,
-        in_channels: int,
-        out_channels: int,
-        expanded_channels: int,
-        dw_kernel_size: int, # This is dw_k1 from table
-        stride: int,
-        act_layer: Type[nn.Module],
-        bn_layer: Type[nn.Module],
-        drop_path_rate: float = 0.0,
-    ):
+    """ConvNeXt-like block for MobileNetV4."""
+    def __init__(self, in_channels, out_channels, expanded_channels, dw_kernel_size, stride, act_layer, bn_layer, drop_path_rate=0.0):
         super().__init__()
-        self.stride = stride
         self.use_residual = stride == 1 and in_channels == out_channels
-        
-        # Depthwise conv part (stride is applied here)
-        self.conv_dw = ConvBNAct(
-            in_channels, in_channels, kernel_size=dw_kernel_size, stride=stride,
-            groups=in_channels, act_layer=act_layer, bn_layer=bn_layer
-        )
-        # Pointwise expansion (MLP-like part)
-        self.conv_pw_exp = ConvBNAct(
-            in_channels, expanded_channels, kernel_size=1, stride=1,
-            act_layer=act_layer, bn_layer=bn_layer
-        )
-        # Pointwise projection
-        self.conv_pw_proj = ConvBNAct(
-            expanded_channels, out_channels, kernel_size=1, stride=1,
-            act_layer=None, bn_layer=bn_layer # No activation before residual add
-        )
+        self.conv_dw = ConvBNAct(in_channels, in_channels, kernel_size=dw_kernel_size, stride=stride, groups=in_channels, act_layer=act_layer, bn_layer=bn_layer)
+        self.conv_pw_exp = ConvBNAct(in_channels, expanded_channels, kernel_size=1, act_layer=act_layer, bn_layer=bn_layer)
+        self.conv_pw_proj = ConvBNAct(expanded_channels, out_channels, kernel_size=1, act_layer=None, bn_layer=bn_layer)
         self.drop_path = DropPath(drop_path_rate) if drop_path_rate > 0.0 else nn.Identity()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         shortcut = x
         x = self.conv_dw(x)
-        # Note: In original ConvNeXt, the input to PW convs is the output of DW.
-        # If DW changes channel count (not here), then PW needs to match.
-        # Here, in_channels for conv_pw_exp is same as input to conv_dw.
-        x_mlp = self.conv_pw_exp(x) # Taking output of DW Conv as input to MLP part
+        x_mlp = self.conv_pw_exp(x)
         x_mlp = self.conv_pw_proj(x_mlp)
-
         if self.use_residual:
-            # If DW conv changes spatial res (stride > 1), shortcut is typically identity mapped
-            # or downsampled. Here, residual is only if stride=1.
-            x = self.drop_path(x_mlp) + shortcut
-        else:
-            # If not using residual (e.g. stride != 1 or channels changed in a way that disallows it)
-            # the output is just the MLP part.
-            # However, standard ConvNeXt block structure *always* has a residual.
-            # If stride > 1, the shortcut path is typically downsampled.
-            # For MNv4, it seems residual is only for S=1, C_in=C_out blocks.
-            # If the DW conv has stride > 1, the output `x` from conv_dw is already downsampled.
-            # The residual connection logic for blocks with stride > 1 is typically handled by not having one,
-            # or by having a parallel path that also downsamples the shortcut.
-            # For simplicity and adherence to typical MobileNet patterns, residual only if S=1, C_in=C_out.
-            x = x_mlp 
+            return self.drop_path(x_mlp) + shortcut
+        return x_mlp
+
+
+class MNV4_FFNBlock(nn.Module):
+    """Feed Forward Network block (1x1 convs) for MobileNetV4."""
+    def __init__(self, in_channels, out_channels, expanded_channels, stride, act_layer, bn_layer, drop_path_rate=0.0):
+        super().__init__()
+        self.use_residual = stride == 1 and in_channels == out_channels
+        # This block does not apply stride. Stride > 1 would need a downsampling projection on the shortcut.
+        # As per the table, stride is always 1 for FFN blocks.
+        assert stride == 1, "FFN block only supports stride 1"
+        
+        self.conv_pw_exp = ConvBNAct(in_channels, expanded_channels, kernel_size=1, act_layer=act_layer, bn_layer=bn_layer)
+        self.conv_pw_proj = ConvBNAct(expanded_channels, out_channels, kernel_size=1, act_layer=None, bn_layer=bn_layer)
+        self.drop_path = DropPath(drop_path_rate) if drop_path_rate > 0.0 else nn.Identity()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        shortcut = x
+        x = self.conv_pw_exp(x)
+        x = self.conv_pw_proj(x)
+        if self.use_residual:
+            x = self.drop_path(x) + shortcut
         return x
 
 
@@ -466,6 +363,196 @@ class MobileNetV4ConvSmallPico(nn.Module):
         return info
 
 
+class MobileNetV4(nn.Module):
+    """
+    MobileNetV4 Universal ConvNet Backbone.
+    Supports multiple variants like 'conv_s' and 'conv_m'.
+    Designed for classification, object detection (multi-scale features), and VLM integration.
+    """
+    # [block_type, dw_k1, dw_k2, exp_ch, out_ch, stride]
+    _MNV4_CONV_S_SPECS = [
+        ["FusedIB", None, 3, 32, 32, 2],
+        ["FusedIB", None, 3, 96, 64, 2],
+        ["ExtraDW", 5, 5, 192, 96, 2],
+        ["IB", None, 3, 192, 96, 1], ["IB", None, 3, 192, 96, 1],
+        ["ConvNext", 3, None, 384, 96, 1], ["ConvNext", 3, None, 192, 96, 1], ["ConvNext", 3, None, 192, 96, 1],
+        ["ExtraDW", 3, 3, 576, 128, 2],
+        ["ExtraDW", 5, 5, 512, 128, 1], ["IB", None, 5, 512, 128, 1], ["IB", None, 5, 384, 128, 1],
+        ["IB", None, 3, 512, 128, 1], ["IB", None, 3, 512, 128, 1],
+    ]
+
+    _MNV4_CONV_M_SPECS = [
+        # Stem is handled separately, spec starts after stem
+        ["FusedIB", None, 3, 128, 48, 2],
+        ["ExtraDW", 3, 5, 192, 80, 2],
+        ["ExtraDW", 3, 3, 160, 80, 1],
+        ["ExtraDW", 3, 5, 480, 160, 2],
+        ["ExtraDW", 3, 3, 160, 160, 1], ["ExtraDW", 3, 3, 160, 160, 1], ["ExtraDW", 3, 5, 640, 160, 1],
+        ["ExtraDW", 3, 3, 640, 160, 1], ["ConvNext", 3, None, 640, 160, 1], ["FFN", None, None, 320, 160, 1],
+        ["ConvNext", 3, None, 640, 160, 1],
+        ["ExtraDW", 5, 5, 960, 256, 2],
+        ["ExtraDW", 5, 5, 1024, 256, 1], ["ExtraDW", 3, 5, 1024, 256, 1], ["ExtraDW", 3, 5, 1024, 256, 1],
+        ["FFN", None, None, 512, 256, 1], ["ConvNext", 3, None, 1024, 256, 1], ["ExtraDW", 3, 5, 1024, 256, 1],
+        ["ExtraDW", 5, 5, 1024, 256, 1], ["FFN", None, None, 512, 256, 1], ["FFN", None, None, 512, 256, 1],
+        ["ConvNext", 5, None, 1024, 256, 1],
+    ]
+    
+    _MODEL_SPECS = {
+        'conv_s': _MNV4_CONV_S_SPECS,
+        'conv_m': _MNV4_CONV_M_SPECS,
+    }
+    
+    _FEATURE_INDICES = {
+        'conv_s': {'p3_s8': 1, 'p4_s16': 2, 'p5_s32': 8}, # Block indices for strides 8, 16, 32
+        'conv_m': {'p2_s4': 0, 'p3_s8': 1, 'p4_s16': 3, 'p5_s32': 11}, # Block indices for strides 4, 8, 16, 32
+    }
+
+    def __init__(
+        self,
+        variant: str = 'conv_s',
+        width_multiplier: float = 1.0,
+        num_classes: int = 1000,
+        out_features_names: Optional[List[str]] = None,
+        out_features_indices: Optional[Tuple[int, ...]] = None,
+        features_only: bool = False,
+        drop_rate: float = 0.0,
+        drop_path_rate: float = 0.0,
+        act_layer: Type[nn.Module] = nn.ReLU,
+        bn_layer: Type[nn.Module] = nn.BatchNorm2d,
+    ):
+        super().__init__()
+        self.variant = variant
+        self.width_multiplier = width_multiplier
+        self.num_classes = num_classes
+        self.features_only = features_only
+        self.act_layer = act_layer
+        self.bn_layer = bn_layer
+
+        block_specs = self._MODEL_SPECS[variant]
+        default_feature_indices = self._FEATURE_INDICES[variant]
+
+        self.return_features_indices: Optional[Tuple[int, ...]] = None
+        if out_features_indices:
+            self.return_features_indices = tuple(sorted(list(set(out_features_indices))))
+        elif out_features_names:
+            self.return_features_indices = tuple(sorted(list(set(
+                default_feature_indices[name] for name in out_features_names
+            ))))
+        
+        # Stem convolution
+        stem_out_channels = _make_divisible(32 * width_multiplier, 8)
+        self.stem = ConvBNAct(3, stem_out_channels, kernel_size=3, stride=2, act_layer=act_layer, bn_layer=bn_layer)
+        current_channels = stem_out_channels
+
+        # Build blocks
+        self.blocks = nn.ModuleList()
+        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, len(block_specs))]
+        
+        block_builder_map = {
+            "FusedIB": MNV4_FusedInvertedBottleneck, "IB": MNV4_InvertedBottleneck,
+            "ExtraDW": MNV4_ExtraDepthwiseBlock, "ConvNext": MNV4_ConvNeXtLikeBlock,
+            "FFN": MNV4_FFNBlock,
+        }
+
+        for i, spec in enumerate(block_specs):
+            block_type, dw_k1, dw_k2, exp_ch_abs, out_ch_abs, stride = spec
+            exp_channels = _make_divisible(exp_ch_abs * width_multiplier, 8) if exp_ch_abs else 0
+            out_channels = _make_divisible(out_ch_abs * width_multiplier, 8)
+            
+            builder = block_builder_map[block_type]
+            if block_type == "FusedIB":
+                block = builder(current_channels, out_channels, exp_channels, kernel_size=dw_k2, stride=stride, act_layer=act_layer, bn_layer=bn_layer, drop_path_rate=dpr[i])
+            elif block_type == "IB":
+                block = builder(current_channels, out_channels, exp_channels, dw_kernel_size=dw_k2, stride=stride, act_layer=act_layer, bn_layer=bn_layer, drop_path_rate=dpr[i])
+            elif block_type == "ExtraDW":
+                block = builder(current_channels, out_channels, exp_channels, dw_kernel_size1=dw_k1, dw_kernel_size2=dw_k2, stride=stride, act_layer=act_layer, bn_layer=bn_layer, drop_path_rate=dpr[i])
+            elif block_type == "ConvNext":
+                block = builder(current_channels, out_channels, exp_channels, dw_kernel_size=dw_k1, stride=stride, act_layer=act_layer, bn_layer=bn_layer, drop_path_rate=dpr[i])
+            elif block_type == "FFN":
+                block = builder(current_channels, out_channels, exp_channels, stride=stride, act_layer=act_layer, bn_layer=bn_layer, drop_path_rate=dpr[i])
+            else:
+                raise ValueError(f"Unknown block type: {block_type}")
+
+            self.blocks.append(block)
+            current_channels = out_channels
+        
+        self.final_block_out_channels = current_channels
+
+        # Classifier Head
+        if num_classes > 0 and not features_only:
+            # Head specs differ slightly per variant but follow a similar pattern
+            if variant in ['conv_s', 'conv_m']:
+                head_dim1 = 960 # Fixed for 's' and 'm' from paper
+                head_dim2 = 1280 # Fixed for 's' and 'm' from paper
+            else: # Fallback for future variants
+                head_dim1 = _make_divisible(960 * width_multiplier, 8)
+                head_dim2 = _make_divisible(1280 * width_multiplier, 8)
+            
+            self.num_features = head_dim2
+            self.head = nn.Sequential(
+                ConvBNAct(self.final_block_out_channels, head_dim1, 1, act_layer=act_layer, bn_layer=bn_layer),
+                ConvBNAct(head_dim1, head_dim2, 1, act_layer=act_layer, bn_layer=bn_layer),
+                nn.AdaptiveAvgPool2d(1),
+                nn.Flatten(1),
+                nn.Dropout(p=drop_rate, inplace=False) if drop_rate > 0. else nn.Identity(),
+                nn.Linear(head_dim2, num_classes)
+            )
+        else:
+            self.num_features = self.final_block_out_channels
+            self.head = nn.Identity()
+
+    def forward_features(self, x: torch.Tensor) -> Union[torch.Tensor, List[torch.Tensor]]:
+        """
+        Run the stem and blocks.
+        - If out_features_indices is set, returns a list of specified intermediate feature maps.
+        - Otherwise, returns the final feature map tensor.
+        This design supports both object detection (multi-scale) and VLM (single-scale) use cases.
+        """
+        x = self.stem(x)
+        if self.return_features_indices:
+            features_out = []
+            for i, block in enumerate(self.blocks):
+                x = block(x)
+                if i in self.return_features_indices:
+                    features_out.append(x)
+            return features_out
+        else:
+            for block in self.blocks:
+                x = block(x)
+            return x
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.forward_features(x)
+        if self.features_only:
+            return x
+        # If returning multiple features, the head operates on the last one
+        if isinstance(x, list):
+            x = x[-1]
+        x = self.head(x)
+        return x
+
+    def get_feature_info(self):
+        """ Returns information about feature maps for specified default feature indices """
+        info = []
+        spec_list = self._MODEL_SPECS[self.variant]
+        feature_indices_map = self._FEATURE_INDICES[self.variant]
+
+        current_channels = _make_divisible(32 * self.width_multiplier, 8)
+        current_stride = 2
+
+        for i, spec in enumerate(spec_list):
+            _, _, _, _, out_ch_abs, stride = spec
+            out_channels = _make_divisible(out_ch_abs * self.width_multiplier, 8)
+            current_channels = out_channels
+            current_stride *= stride
+            
+            for name, idx in feature_indices_map.items():
+                if i == idx:
+                    info.append(dict(num_chs=current_channels, reduction=current_stride, module=f'blocks.{i}', name=name))
+                    break
+        return info
+
+
 if __name__ == '__main__':
     # Example Usage:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -528,4 +615,60 @@ if __name__ == '__main__':
     temp_model_for_info.width_multiplier = 1.0 # ensure it's set for the method
     feature_info = temp_model_for_info.get_feature_info()
     for info_item in feature_info:
+        print(info_item)
+
+
+    # NEW CODE
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    dummy_input = torch.randn(2, 3, 224, 224).to(device)
+
+    # --- Test MNv4-Conv-S (Small) ---
+    print("--- Testing MNv4-Conv-S (Small) ---")
+    
+    # 1. Classification Mode
+    print("\n1. Classification Mode:")
+    model_s_cls = MobileNetV4(variant='conv_s', num_classes=100, width_multiplier=0.75).to(device)
+    output_s_cls = model_s_cls(dummy_input)
+    print(f"Input shape: {dummy_input.shape}")
+    print(f"Output classification shape: {output_s_cls.shape}")
+
+    # 2. Object Detection Feature Mode
+    print("\n2. Object Detection Mode (multi-scale features):")
+    model_s_det = MobileNetV4(variant='conv_s', features_only=True, out_features_names=['p3_s8', 'p4_s16', 'p5_s32']).to(device)
+    features_s = model_s_det(dummy_input)
+    print(f"Number of feature maps: {len(features_s)}")
+    for i, feat in enumerate(features_s):
+        print(f"Feature map {i} shape: {feat.shape}")
+
+    # 3. VLM Backbone Mode
+    print("\n3. VLM Backbone Mode (single final feature map):")
+    model_s_vlm = MobileNetV4(variant='conv_s', features_only=True).to(device)
+    feature_s_vlm = model_s_vlm(dummy_input)
+    print(f"Final feature map shape: {feature_s_vlm.shape}")
+    print(f"Number of output features for projector: {model_s_vlm.num_features}")
+
+    # --- Test MNv4-Conv-M (Medium) ---
+    print("\n--- Testing MNv4-Conv-M (Medium) ---")
+
+    # 1. Classification Mode
+    print("\n1. Classification Mode:")
+    # Using 256x256 input as per Table 12
+    dummy_input_256 = torch.randn(2, 3, 256, 256).to(device)
+    model_m_cls = MobileNetV4(variant='conv_m', num_classes=1000).to(device)
+    output_m_cls = model_m_cls(dummy_input_256)
+    print(f"Input shape: {dummy_input_256.shape}")
+    print(f"Output classification shape: {output_m_cls.shape}")
+
+    # 2. Object Detection Feature Mode
+    print("\n2. Object Detection Mode (multi-scale features):")
+    model_m_det = MobileNetV4(variant='conv_m', features_only=True, out_features_names=['p3_s8', 'p4_s16', 'p5_s32']).to(device)
+    features_m = model_m_det(dummy_input_256)
+    print(f"Number of feature maps: {len(features_m)}")
+    for i, feat in enumerate(features_m):
+        print(f"Feature map {i} shape: {feat.shape}")
+
+    # 3. Get Feature Info
+    print("\nFeature info for MNv4-Conv-M (width_multiplier=1.0):")
+    info_m = model_m_det.get_feature_info()
+    for info_item in info_m:
         print(info_item)

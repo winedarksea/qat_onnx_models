@@ -1284,6 +1284,7 @@ def main(argv: List[str] | None = None):
         num_classes=80, 
         neck_out_ch=128,  # 96
         img_size=IMG_SIZE,
+        head_reg_max=8 if IMG_SIZE < 320 else (2 * math.ceil(IMG_SIZE / 128) + 3),
         inplace_act_for_head_neck=not cfg.no_inplace_head_neck # Control from arg
     ).to(dev)
 
@@ -1516,6 +1517,15 @@ def main(argv: List[str] | None = None):
     # 'model.pre' will be skipped for quantization inserts due to set_module_name('pre', None)
     # but it will be part of the traced graph.
     qat_model = qat_prepare(model, example_input_for_qat_entire_model)
+    qat_head = qat_model.head      # ObservedGraphModule
+    orig_head = model.head         # FP32
+    
+    qat_head.nl = orig_head.nl
+    qat_head.register_buffer('strides_buffer', orig_head.strides_buffer, persistent=False)
+    for i in range(orig_head.nl):
+        buf = getattr(orig_head, f'anchor_points_level_{i}')
+        qat_head.register_buffer(f'anchor_points_level_{i}', buf, persistent=False)
+    qat_head.register_buffer('dfl_project_buffer', orig_head.dfl_project_buffer, persistent=False)
     qat_model = qat_model.to(dev)
     print("[INFO] QAT model prepared and moved to device.")
 

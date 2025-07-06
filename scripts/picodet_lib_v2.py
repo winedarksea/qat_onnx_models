@@ -13,7 +13,7 @@ import timm
 try:
     folder_to_add = r"/home/colin/qat_onnx_models/scripts"
     sys.path.append(folder_to_add)
-    from customMobilenetNetv4 import MobileNetV4ConvSmallPico
+    from customMobilenetNetv4 import MobileNetV4ConvSmallPico, MobileNetV4
 except ImportError:
     print("Warning: customMobilenetNetv4.py not found. 'mnv4_custom' backbone will not be available.")
     MobileNetV4ConvSmallPico = None
@@ -48,14 +48,14 @@ class GhostConv(nn.Module):
                 nn.BatchNorm2d(self.cheap_ch), nn.ReLU6(inplace=inplace_act)
             )
         else:
-            self.cheap = None # Use None for clarity
+            self.cheap = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         y_primary = self.primary(x)
         if self.cheap:
             y_cheap = self.cheap(y_primary)
             return torch.cat([y_primary, y_cheap], 1)
-        return y_primary # Already has c_out (init_ch) channels if cheap_ch is 0
+        return y_primary
 
     @property
     def out_channels(self):
@@ -93,7 +93,6 @@ class CSPPAN(nn.Module):
         super().__init__()
         self.reduce = nn.ModuleList([GhostConv(c, out_ch, 1, inplace_act=inplace_act) for c in in_chs])
         self.lat    = nn.ModuleList([DWConv(out_ch, k=5, inplace_act=inplace_act) for _ in in_chs[:-1]])
-        # self.out    = nn.ModuleList([CSPBlock(out_ch, inplace_act=inplace_act)  for _ in in_chs])
         lst_ly = len(in_chs) - 1
         self.out = nn.ModuleList([
             CSPBlock(out_ch, n=2 if i == lst_ly else 1, m_k = 3 if i == lst_ly else 1, inplace_act=inplace_act) for i in range(len(in_chs))
@@ -172,7 +171,7 @@ class PicoDetHead(nn.Module):
         self.nc = num_classes
         self.reg_max = reg_max
         self.nl = num_levels
-        self.max_det = max_det # Store for use in ONNX NMS construction
+        self.max_det = max_det
         self.score_th = score_thresh
         self.iou_th = nms_iou
         self.reg_conv_depth = 2
@@ -239,11 +238,6 @@ class PicoDetHead(nn.Module):
         for conv in self.obj_pred:
             if conv.bias is not None:
                 nn.init.constant_(conv.bias, obj_bias)
-
-        # regression branch
-        # for conv in self.reg_pred:
-        #     nn.init.zeros_(conv.bias)
-        #     nn.init.normal_(conv.weight, mean=0.0, std=0.001)
 
     def _dfl_to_ltrb_inference(self, x_reg_logits_3d: torch.Tensor) -> torch.Tensor:
         b, n_anchors_img, _ = x_reg_logits_3d.shape
@@ -559,7 +553,29 @@ def get_backbone(arch: str, ckpt: str | None, img_size: int = 224):
             # Re-calculate feat_chs might be needed if ckpt changed arch details, though unlikely for channels
             feat_chs = _get_dynamic_feat_chs(net, img_size, temp_device_for_init)
 
-    elif arch == "mnv4c":
+    elif arch == "mnv4c-s":
+        net = MobileNetV4(
+            variant='conv_s',
+            width_multiplier=1.0,
+            features_only=True,
+            out_features_names=['p3_s8', 'p4_s16', 'p5_s32'],
+        )
+        feature_info = net.get_feature_info()
+        feat_chs = tuple(info['num_chs'] for info in feature_info)
+        print(f"[INFO] Detected feature channels: {feat_chs}")
+        ckpt = "mobilenet_w1_0_mnv4c-m_pretrained_drp0_2_fp32_backbone.pt"
+    elif arch == "mnv4c-m":
+        net = MobileNetV4(
+            variant='conv_m',
+            width_multiplier=1.0,
+            features_only=True,
+            out_features_names=['p2_s4', 'p3_s8', 'p4_s16', 'p5_s32'],
+        )
+        feature_info = net.get_feature_info()
+        feat_chs = tuple(info['num_chs'] for info in feature_info)
+        print(f"[INFO] Detected feature channels: {feat_chs}")
+        ckpt = "mobilenet_w1_0_mnv4c-s_pretrained_drp0_2_fp32_backbone.pt"
+    elif arch == "mnv4c":  # older but still functional
         if MobileNetV4ConvSmallPico is None:
             raise ImportError("Cannot create 'mnv4_custom' backbone. `customMobilenetNetv4.py` not found or failed to import.")
         
@@ -580,24 +596,19 @@ def get_backbone(arch: str, ckpt: str | None, img_size: int = 224):
         )
 
         ckpt = "mobilenet_w1_2_mnv4c_pretrained_drp0_2_fp32_backbone.pt"
+    else:
+        raise ValueError(f'Unknown arch {arch}')
+    
+    if arch in ["mnv4c", "mnv4c-s", "mnv4c-m"]:
         if os.path.exists(ckpt):
             print(f"[INFO] Loading pre-trained backbone weights from: {ckpt}")
-            # Load the state_dict saved from classifier script
             backbone_sd = torch.load(ckpt, map_location='cpu')
-            
-            # The keys should match perfectly because you are using the same
-            # MobileNetV4ConvSmallPico class, just instantiated differently
-            # (with features_only=True vs. num_classes>0). The block names are identical.
             missing_keys, unexpected_keys = net.load_state_dict(backbone_sd, strict=False)
-            
-            # Since the detector backbone has no classifier head, 'unexpected_keys'
-            # should be empty if the checkpoint was saved correctly (backbone only).
-            # 'missing_keys' should also be empty.
+
             if missing_keys:
                 warnings.warn(f"Warning: Missing keys when loading backbone weights: {missing_keys}")
             if unexpected_keys:
                 warnings.warn(f"Warning: Unexpected keys when loading backbone weights: {unexpected_keys}")
-            
             print("[INFO] Successfully loaded backbone weights.")
         else:
             print("[INFO] Initializing backbone with random weights (no checkpoint provided).")
@@ -606,54 +617,6 @@ def get_backbone(arch: str, ckpt: str | None, img_size: int = 224):
         # The custom backbone already returns a list of features, so no wrapper is needed.
         feat_chs = _get_dynamic_feat_chs(net, img_size, temp_device_for_init)
         print(f"[INFO] Custom MNv4 feature channels: {feat_chs}")
-
-    elif arch in {'mnv4s', 'mnv4m'}:
-        # The pick_nodes_by_stride is less critical here but could be a sanity check.
-        name_map = {
-            'mnv4s': 'mobilenetv4_conv_small.pyt_in1k',
-            'mnv4m': 'mobilenetv4_conv_medium.pyt_in1k'
-        }
-        model_name = name_map[arch]
-
-        # Use timm's feature_info to determine out_indices
-        temp_model_for_info = timm.create_model(model_name, pretrained=False, features_only=True)
-        desired_strides_set = {8, 16, 32}
-        actual_reductions = temp_model_for_info.feature_info.reduction()
-        out_indices_mnv4 = [i for i, r in enumerate(actual_reductions) if r in desired_strides_set]
-        
-        if len(out_indices_mnv4) != 3:
-            warnings.warn(f"Could not find exactly 3 features for strides 8,16,32 in {model_name} using feature_info. "
-                          f"Found indices {out_indices_mnv4} for reductions {actual_reductions}. "
-                          f"Defaulting to (2,3,4).") # Or a more informed default based on timm docs
-            out_indices_mnv4 = (2,3,4) # Example fallback
-        del temp_model_for_info
-
-        net = timm.create_model(
-            model_name,
-            pretrained=pretrained,
-            features_only=True,
-            out_indices=out_indices_mnv4, # Use dynamically determined indices
-            num_classes=0,
-            drop_rate=0.0,
-            drop_path_rate=0.0
-        )
-        feat_chs = _get_dynamic_feat_chs(net, img_size, temp_device_for_init)
-
-        if ckpt is not None and not pretrained:
-            sd = torch.load(ckpt, map_location='cpu')
-            missing, unexpected = net.load_state_dict(sd, strict=False)
-            if missing: warnings.warn(f'Missing keys in timm model ckpt ({arch}): {missing}')
-            if unexpected: warnings.warn(f'Unexpected keys in timm model ckpt ({arch}): {unexpected}')
-            feat_chs = _get_dynamic_feat_chs(net, img_size, temp_device_for_init)
-    else:
-        raise ValueError(f'Unknown arch {arch}')
-
-    # General checkpoint loading for the 'net' object itself (if 'ckpt' is for the wrapped/feature extractor model)
-    # This logic seems a bit complex with `pretrained` flag.
-    # If ckpt is provided and pretrained is True, it implies ImageNet weights were loaded AND then a specific ckpt for 'net' should be loaded.
-    # If ckpt is provided and pretrained is False, the above blocks handle loading into 'base' (mnv3) or 'net' (timm).
-    # This might need simplification depending on the intended use of 'ckpt' and 'pretrained'.
-    # For now, let's assume the above blocks handle the primary ckpt loading.
 
     net.train()
     return net, feat_chs
