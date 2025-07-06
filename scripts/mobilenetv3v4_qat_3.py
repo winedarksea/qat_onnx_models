@@ -84,8 +84,27 @@ class PreprocNorm(nn.Module):
         self.register_buffer("s", s, persistent=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x.float().div_(255)
-        return (x - self.m) / self.s
+        # x already float thanks to BilinearResize
+        return (x / 255.0 - self.m) / self.s
+
+
+class BilinearResize(nn.Module):
+    def __init__(self, dst_hw: int = IMG_SIZE):
+        super().__init__()
+        self.dst_hw = (dst_hw, dst_hw)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Always cast – torch.float32 → torch.float32 is a no-op,
+        # so this is safe and side-effect-free.
+        x = x.float()
+        return F.interpolate(
+            x,
+            size=self.dst_hw,
+            mode="bilinear",
+            align_corners=False,
+            antialias=False,   # keep explicit for ONNX clarity
+        )
+
 
 def _mnv4_id(kind: str, width: float) -> str:
     base = f"mobilenetv4_conv_{'small' if kind=='mnv4s' else 'medium'}"
@@ -202,7 +221,6 @@ def get_backbone(arch: str, ncls: int, width: float,
         
         model.classifier = nn.Sequential(*new_classifier_layers)
     elif arch == "mnv4c":
-        from customMobilenetNetv4 import MobileNetV4ConvSmallPico
         # For PicoDet, you might want to set num_classes=0 and specify out_indices
         # For classification as in this script, num_classes=ncls
         model = MobileNetV4ConvSmallPico(
@@ -307,7 +325,8 @@ def build_model(
                         drop_rate=drop_rate,
                         drop_path_rate=drop_path_rate)
     model = nn.Sequential(
-        T_v2.Resize((IMG_SIZE, IMG_SIZE), antialias=True), # 0: Resize, antialias=False would be faster, antialias requires opset 18
+        BilinearResize(IMG_SIZE),
+        # T_v2.Resize((IMG_SIZE, IMG_SIZE), antialias=True), # 0: Resize, antialias=False would be faster, antialias requires opset 18
         PreprocNorm(),                                   # 1: Preprocessing
         backbone                                         # 2: Backbone
     ).to(
@@ -376,12 +395,12 @@ def save_backbone(model,  output_base_name, dev):
 
 # --- Main script execution ---
 data_dir: str = "filtered_imagenet2_native" # Example, replace with your actual path
-epochs: int = 550
+epochs: int = 75
 qat_epochs: int = 10
 batch: int = 64
 lr: float = 0.025
 qat_lr_factor: float = 0.05
-width_mult: float = 0.8
+width_mult: float = 1.0
 device_arg = None
 compile_model: bool = False
 arch: str = "mnv4c" # Change to "mnv2", "mnv3", "mnv3l", "mnv4s", "mnv4m", "mnv4c" as needed
