@@ -212,7 +212,7 @@ def inspect_onnx_graph(onnx_model_path):
 
 # ───────────────────────────── main ─────────────────────────────
 # onnx_path = "mobilenet_w1_0_mnv3_pretrained_int8_fullpipe.onnx"
-onnx_path = "mobilenet_w1_2_mnv4c_pretrained_drp0_2fp32_model_ptq_int8.onnx"
+onnx_path = "mobilenet_w0_8_mnv4c_pretrained_drp0_2fp32_onnx.onnx"
 data_dir = "filtered_imagenet2_native" # Make sure this path is correct
 batch = 1 # Keep batch=1 for per-image timing, but can increase for throughput tests
 provider = "CPUExecutionProvider"  # CPUExecutionProvider, CUDAExecutionProvider
@@ -232,6 +232,7 @@ try:
         print(f"[INFO] #classes = {ncls}")
 except FileNotFoundError:
     print("[WARN] class_mapping.json not found. Cannot confirm number of classes.")
+
 
 # Perform detailed graph inspection
 inspection_successful = inspect_onnx_graph(onnx_path)
