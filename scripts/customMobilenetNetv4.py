@@ -213,29 +213,23 @@ class SSM2D(nn.Module):
         self.out_proj = nn.Conv2d(self.d_inner, in_channels, kernel_size=1)
 
     def forward(self, x):
-        # x: (B, C, H, W)
-        
-        # Input projection and SiLU activation
+        B, C, H, W = x.shape
+    
         x_proj = F.silu(self.in_proj(x))
-
-        # Horizontal scans
-        h_fwd = self.conv_h_fwd(x_proj)
-        h_bwd = self.conv_h_bwd(torch.flip(x_proj, dims=[3])) # Flip horizontally
-        h_bwd = torch.flip(h_bwd, dims=[3]) # Flip back
-
-        # Vertical scans
-        v_fwd = self.conv_v_fwd(x_proj)
-        v_bwd = self.conv_v_bwd(torch.flip(x_proj, dims=[2])) # Flip vertically
-        v_bwd = torch.flip(v_bwd, dims=[2]) # Flip back
-
-        # Gating and merging
-        # The gate controls which information from the scans to pass through
-        scan_result = h_fwd + h_bwd + v_fwd + v_bwd
+    
+        # horizontal scans
+        h_fwd = self.conv_h_fwd(x_proj)[..., :W]                        # (B,C,H,W)
+        h_bwd = torch.flip(self.conv_h_bwd(torch.flip(x_proj, [3])),   # flip-→conv-→flip
+                           [3])[..., :W]
+    
+        # vertical scans
+        v_fwd = self.conv_v_fwd(x_proj)[..., :H, :]                     # (B,C,H,W)
+        v_bwd = torch.flip(self.conv_v_bwd(torch.flip(x_proj, [2])),
+                           [2])[..., :H, :]
+    
+        scan_result  = h_fwd + h_bwd + v_fwd + v_bwd                   # now shapes match
         gated_result = scan_result * F.silu(self.gate(x_proj))
-
-        # Output projection
-        y = self.out_proj(gated_result)
-        return y
+        return self.out_proj(gated_result)
 
 
 class MNV4_SSHybridBlock(nn.Module):
@@ -321,6 +315,7 @@ class MobileNetV4ConvSmallPico(nn.Module):
         self.features_only = features_only if num_classes > 0 else True # Force features_only if no classifier
         self.act_layer = act_layer
         self.bn_layer = bn_layer
+        self.width_multiplier = width_multiplier
 
         # Determine which features to output
         self.return_features_indices: Optional[Tuple[int, ...]] = None
@@ -329,7 +324,7 @@ class MobileNetV4ConvSmallPico(nn.Module):
         elif out_features_names:
             self.return_features_indices = tuple(sorted(list(set(
                 self._DEFAULT_FEATURE_INDICES[name] for name in out_features_names
-                if name in self.DEFAULT_FEATURE_INDICES
+                if name in self._DEFAULT_FEATURE_INDICES
             ))))
         
         if self.return_features_indices and not self.features_only:
