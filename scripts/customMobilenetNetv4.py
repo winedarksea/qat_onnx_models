@@ -396,15 +396,77 @@ class MobileNetV4(nn.Module):
         ["ExtraDW", 5, 5, 1024, 256, 1], ["FFN", None, None, 512, 256, 1], ["FFN", None, None, 512, 256, 1],
         ["ConvNext", 5, None, 1024, 256, 1],
     ]
+    _MNV4_CONV_L_SPECS: List[List[Union[str, int, None]]] = [
+        # block_type , dw_k1 , dw_k2 ,  exp_ch , out_ch , stride
+        ["FusedIB", None, 3,   96,    48,   2],      # S4
+        ["ExtraDW", 3,    5,  192,    96,   2],      # S8
+        ["ExtraDW", 3,    3,  384,    96,   1],
+        ["ExtraDW", 3,    5,  384,   192,   2],      # S16
+        ["ExtraDW", 3,    3,  768,   192,   1],
+        ["ExtraDW", 3,    3,  768,   192,   1],
+        ["ExtraDW", 3,    3,  768,   192,   1],
+        ["ExtraDW", 3,    5,  768,   192,   1],
+        ["ExtraDW", 5,    3,  768,   192,   1],
+        ["ExtraDW", 5,    3,  768,   192,   1],
+        ["ConvNext", 3, None, 768,   192,   1],
+        ["ExtraDW", 5,    5,  768,   512,   2],      # S32
+        ["ExtraDW", 5,    5, 2048,   512,   1],
+        ["ExtraDW", 5,    5, 2048,   512,   1],
+        ["ExtraDW", 5,    5, 2048,   512,   1],
+        ["ConvNext", 5, None,2048,   512,   1],
+        ["ExtraDW", 5,    3, 2048,   512,   1],
+        ["ConvNext", 5, None,2048,   512,   1],
+        ["ConvNext", 5, None,2048,   512,   1],
+        ["ExtraDW", 5,    3, 2048,   512,   1],
+        ["ExtraDW", 5,    5, 2048,   512,   1],
+        ["ConvNext", 5, None,2048,   512,   1],
+        ["ConvNext", 5, None,2048,   512,   1],
+        ["ConvNext", 5, None,2048,   512,   1],
+    ]
+    _MNV4_CONV_XL_SPECS = [
+        # block_type, dw_k1, dw_k2, exp_ch, out_ch, stride
+        ["FusedIB", None, 3,   128,    64,    2],  # S4
+        ["ExtraDW", 3,    5,   256,   128,    2],  # S8
+        ["ExtraDW", 3,    3,   512,   128,    1],
+        ["ExtraDW", 3,    5,   512,   256,    2],  # S16
+        ["ExtraDW", 3,    3,  1024,   256,    1],
+        ["ExtraDW", 3,    3,  1024,   256,    1],
+        ["ExtraDW", 5,    3,  1024,   256,    1],
+        ["ConvNext", 3, None, 1024,   256,    1],
+        ["ConvNext", 3, None, 1024,   256,    1],
+        ["ConvNext", 3, None, 1024,   256,    1],
+    
+        ["ExtraDW", 5,    5,  1024,   640,    2],  # S32
+        ["ExtraDW", 5,    5,  2048,   640,    1],
+        ["ExtraDW", 5,    5,  2048,   640,    1],
+        ["ExtraDW", 5,    5,  2048,   640,    1],
+        ["ExtraDW", 5,    5,  2048,   640,    1],
+        ["ConvNext", 5, None, 2048,   640,    1],
+        ["ConvNext", 5, None, 2048,   640,    1],
+        ["ConvNext", 5, None, 2048,   640,    1],
+        ["ConvNext", 5, None, 2048,   640,    1],
+        ["ConvNext", 5, None, 2048,   640,    1],
+        ["ExtraDW", 5,    3,  2048,   640,    1],
+        ["ExtraDW", 3,    5,  2048,   640,    1],
+    ]
     
     _MODEL_SPECS = {
         'conv_s': _MNV4_CONV_S_SPECS,
         'conv_m': _MNV4_CONV_M_SPECS,
+        'conv_l': _MNV4_CONV_L_SPECS,
+        'conv_xl': _MNV4_CONV_XL_SPECS,
     }
     
     _FEATURE_INDICES = {
         'conv_s': {'p3_s8': 1, 'p4_s16': 2, 'p5_s32': 8}, # Block indices for strides 8, 16, 32
         'conv_m': {'p2_s4': 0, 'p3_s8': 1, 'p4_s16': 3, 'p5_s32': 11}, # Block indices for strides 4, 8, 16, 32
+        'conv_l': {'p2_s4': 0, 'p3_s8': 1, 'p4_s16': 3, 'p5_s32': 11},
+        'conv_xl': {
+            'p2_s4': 0,
+            'p3_s8': 1,
+            'p4_s16': 3,
+            'p5_s32': 10,
+        }
     }
 
     def __init__(
@@ -484,9 +546,14 @@ class MobileNetV4(nn.Module):
             if variant in ['conv_s', 'conv_m']:
                 head_dim1 = 960 # Fixed for 's' and 'm' from paper
                 head_dim2 = 1280 # Fixed for 's' and 'm' from paper
-            else: # Fallback for future variants
+            elif variant in ["conv_l"]: # Fallback for future variants
                 head_dim1 = _make_divisible(960 * width_multiplier, 8)
                 head_dim2 = _make_divisible(1280 * width_multiplier, 8)
+            elif variant in ["conv_xl"]:
+                head_dim1 = _make_divisible(1280 * width_multiplier, 8)
+                head_dim2 = _make_divisible(2048 * width_multiplier, 8)
+            else:
+                raise NotImplementedError()
             
             self.num_features = head_dim2
             self.head = nn.Sequential(
