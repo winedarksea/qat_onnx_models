@@ -557,20 +557,41 @@ class MobileNetV4(nn.Module):
         ["ExtraDW", 3,    5,  2048,   640,    1],
     ]
     _MNV4_SSHYBRID_S_SPECS = [
-        ["FusedIB", None, 3, 32, 32, 2],
-        ["FusedIB", None, 3, 96, 64, 2],
-        ["ExtraDW", 5, 5, 192, 96, 2],
-        ["SSHybrid", None, None, None, 96, 1], 
-        ["IB", None, 3, 192, 96, 1],
-        ["IB", None, 3, 192, 96, 1],
-        ["SSHybrid", None, None, None, 96, 1], 
-        ["ConvNext", 3, None, 192, 96, 1],
-        ["ConvNext", 3, None, 192, 96, 1],
-        ["ExtraDW", 3, 3, 576, 128, 2],
-        ["ExtraDW", 5, 5, 512, 128, 1],
-        ["SSHybrid", None, None, None, 128, 1],
-        ["IB", None, 5, 384, 128, 1],
-        ["SSHybrid", None, None, None, 128, 1],
+        # Stages S4->S8->S16 (Identical to the original conv_s model)
+        ["FusedIB",  None, 3,   32,  32, 2],
+        ["FusedIB",  None, 3,   96,  64, 2],
+        ["ExtraDW",  5,    5,  192,  96, 2],
+        ["IB",       None, 3,  192,  96, 1],
+        ["IB",       None, 3,  192,  96, 1],
+        ["ConvNext", 3,    None,384,  96, 1],
+        ["ConvNext", 3,    None,192,  96, 1],
+        ["ConvNext", 3,    None,192,  96, 1],
+        # Stage S32 (7x7 features - P5) - Refined with alternating blocks
+        ["ExtraDW",  3,    3,  576, 128, 2],
+        ["ExtraDW",  5,    5,  512, 128, 1],
+        ["IB",       None, 5,  512, 128, 1],
+        ["SSHybrid", None, None,None,128, 1],
+        ["IB",       None, 3,  512, 128, 1],
+        ["SSHybrid", None, None,None,128, 1],
+    ]
+    _MNV4_SSHYBRID_S_BALANCED = [
+        # S4->S8 (P3)
+        ["FusedIB",  None, 3,   32,  32, 2],
+        ["FusedIB",  None, 3,   96,  64, 2],
+        # S16 Stage (14x14 features - P4)
+        ["ExtraDW",  5,    5,  192,  96, 2],
+        ["IB",       None, 3,  192,  96, 1],
+        ["IB",       None, 3,  192,  96, 1],
+        ["ConvNext", 3, None, 384, 96, 1],
+        ["SSHybrid", None, None,None, 96,  1],
+        ["ConvNext", 3, None,  192,  96, 1],
+        # S32 Stage (7x7 features - P5)
+        ["ExtraDW",  3,    3,  576, 128, 2],
+        ["ExtraDW",  5,    5,  512, 128, 1],
+        ["IB",       None, 5,  512, 128, 1],
+        ["IB",       None, 5,  384, 128, 1],
+        ["IB",       None, 3,  512, 128, 1],
+        ["SSHybrid", None, None,None,128, 1],
     ]
     _MNV4_SSHYBRID_M_SPECS = [
         # block_type , dw_k1 , dw_k2 , exp_ch , out_ch , stride
@@ -591,7 +612,6 @@ class MobileNetV4(nn.Module):
         ["FFN",     None,None, 640,  160,   1],
         ["SSHybrid", None, None, None, 160, 1],
         ["ConvNext", 3, None, 640,  160,   1],
-           
         # ---------- downsample to 8×8 ----------
         ["ExtraDW", 5,    5,   960,  256,   2],
         ["ExtraDW", 5,    5,  1024,  256,   1],
@@ -614,7 +634,6 @@ class MobileNetV4(nn.Module):
         ["FusedIB", None, 3,   96,    48,   2],
         ["ExtraDW", 3,    5,  192,    96,   2],
         ["ExtraDW", 3,    3,  384,    96,   1],
-           
         ["ExtraDW", 3,    5,  384,   192,   2],
         ["ExtraDW", 3,    3,  768,   192,   1],
         ["ExtraDW", 3,    3,  768,   192,   1],
@@ -647,6 +666,7 @@ class MobileNetV4(nn.Module):
         ["SSHybrid",None,None,None, 512,   1],
         ["ConvNext",5, None,2048,   512,   1],
         ["SSHybrid",None,None,None, 512,   1],
+        ["ConvNext",5, None,2048,   512,   1],
     ]
         
     _MODEL_SPECS = {
@@ -654,9 +674,10 @@ class MobileNetV4(nn.Module):
         'conv_m': _MNV4_CONV_M_SPECS,
         'conv_l': _MNV4_CONV_L_SPECS,
         'conv_xl': _MNV4_CONV_XL_SPECS,
+        "ssh_hybrid_s": _MNV4_SSHYBRID_S_SPECS,
+        "ssh_hybrid_s_bl": _MNV4_SSHYBRID_S_BALANCED,
         'ssh_hybrid_m': _MNV4_SSHYBRID_M_SPECS,
         'ssh_hybrid_l': _MNV4_SSHYBRID_L_SPECS,
-        "ssh_hybrid_s": _MNV4_SSHYBRID_S_SPECS,
     }
     
     _FEATURE_INDICES = {
@@ -668,11 +689,22 @@ class MobileNetV4(nn.Module):
             'p3_s8': 1,
             'p4_s16': 3,
             'p5_s32': 10,
+        },
+        'ssh_hybrid_s': {'p3_s8': 1, 'p4_s16': 2, 'p5_s32': 8},
+        'ssh_hybrid_s_bl': {'p3_s8': 1, 'p4_s16': 2, 'p5_s32': 8},
+        "ssh_hybrid_m": {
+            'p2_s4':  0,
+            'p3_s8':  1,
+            'p4_s16': 3,
+            'p5_s32': 15,
+        },
+        "ssh_hybrid_l": {
+            'p2_s4':  0,
+            'p3_s8':  1,
+            'p4_s16': 3,
+            'p5_s32': 18,
         }
     }
-    _FEATURE_INDICES["ssh_hybrid_s"] = _FEATURE_INDICES["conv_s"]  # same strides
-    _FEATURE_INDICES['ssh_hybrid_m'] = _FEATURE_INDICES['conv_m']
-    _FEATURE_INDICES['ssh_hybrid_l'] = _FEATURE_INDICES['conv_l']
 
     def __init__(
         self,
@@ -756,10 +788,10 @@ class MobileNetV4(nn.Module):
         # Classifier Head
         if num_classes > 0 and not features_only:
             # Head specs differ slightly per variant but follow a similar pattern
-            if variant in ['conv_s', 'conv_m']:
+            if variant in ['conv_s', 'conv_m', "ssh_hybrid_s_bl", "ssh_hybrid_s", "ssh_hybrid_m"]:
                 head_dim1 = 960 # Fixed for 's' and 'm' from paper
                 head_dim2 = 1280 # Fixed for 's' and 'm' from paper
-            elif variant in ["conv_l"]: # Fallback for future variants
+            elif variant in ["conv_l", "ssh_hybrid_l"]: # Fallback for future variants
                 head_dim1 = _make_divisible(960 * width_multiplier, 8)
                 head_dim2 = _make_divisible(1280 * width_multiplier, 8)
             elif variant in ["conv_xl"]:
