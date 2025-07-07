@@ -244,7 +244,7 @@ class MNV4_SSHybridBlock(nn.Module):
         self.drop_path = DropPath(drop_path_rate) if drop_path_rate > 0. else nn.Identity()
 
         # Use BatchNorm2d for normalization, which is NPU-friendly
-        self.norm = nn.BatchNorm2d(in_channels)
+        # self.norm = nn.BatchNorm2d(in_channels)  # removed as there is an inner BatchNorm2d in SSM2D
         
         # The core State Space Model, now fully convolutional
         self.ssm = SSM2D(in_channels=in_channels, **kwargs)
