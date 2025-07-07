@@ -263,6 +263,14 @@ def get_backbone(arch: str, ncls: int, width: float,
             drop_rate=drop_rate, # For classifier
             drop_path_rate=drop_path_rate
         )
+    elif arch in ["ssh_hybrid_s", "ssh_hybrid_s_bl", "ssh_hybrid_m", "ssh_hybrid_l", "conv-l", "conv-xl"]:
+        model = MobileNetV4(
+            variant=arch,
+            width_multiplier=width,
+            num_classes=ncls,
+            drop_rate=drop_rate, # For classifier
+            drop_path_rate=drop_path_rate
+        )
     elif arch in {"mnv4s", "mnv4m"}:
         try:
             import timm
