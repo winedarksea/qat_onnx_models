@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from typing import List, Tuple, Optional, Type, Union, Dict
 
 try:
@@ -162,6 +163,112 @@ class MNV4_FFNBlock(nn.Module):
         x = self.conv_pw_proj(x)
         if self.use_residual:
             x = self.drop_path(x) + shortcut
+        return x
+
+
+class SSM2D(nn.Module):
+    """
+    Hardware-Friendly 2D-Selective-Scan module.
+
+    This module replaces the Py-loop-based scan with a parallel,
+    convolutional implementation suitable for NPUs. It operates entirely
+    on NCHW tensors.
+    """
+    def __init__(self, in_channels, d_state=16, d_conv=3, expand=2, **kwargs):
+        super().__init__()
+        self.in_channels = in_channels
+        self.d_inner = int(expand * in_channels)
+        self.d_state = d_state
+        self.d_conv = d_conv
+
+        # 1. Input Projection
+        self.in_proj = nn.Sequential(
+            nn.Conv2d(in_channels, self.d_inner, kernel_size=1),
+            nn.BatchNorm2d(self.d_inner),
+        )
+
+        # 2. 2D Selective Scan (implemented as four parallel 1D causal convolutions)
+        # We use separate convolutions for each of the 4 directions
+        self.conv_h_fwd = nn.Conv2d(
+            self.d_inner, self.d_inner, kernel_size=(1, d_conv), padding=(0, d_conv - 1),
+            groups=self.d_inner, bias=True
+        )
+        self.conv_h_bwd = nn.Conv2d(
+            self.d_inner, self.d_inner, kernel_size=(1, d_conv), padding=(0, d_conv - 1),
+            groups=self.d_inner, bias=True
+        )
+        self.conv_v_fwd = nn.Conv2d(
+            self.d_inner, self.d_inner, kernel_size=(d_conv, 1), padding=(d_conv - 1, 0),
+            groups=self.d_inner, bias=True
+        )
+        self.conv_v_bwd = nn.Conv2d(
+            self.d_inner, self.d_inner, kernel_size=(d_conv, 1), padding=(d_conv - 1, 0),
+            groups=self.d_inner, bias=True
+        )
+
+        # 3. Gating and Merging
+        self.gate = nn.Conv2d(self.d_inner, self.d_inner, kernel_size=1)
+        
+        # 4. Output Projection
+        self.out_proj = nn.Conv2d(self.d_inner, in_channels, kernel_size=1)
+
+    def forward(self, x):
+        # x: (B, C, H, W)
+        
+        # Input projection and SiLU activation
+        x_proj = F.silu(self.in_proj(x))
+
+        # Horizontal scans
+        h_fwd = self.conv_h_fwd(x_proj)
+        h_bwd = self.conv_h_bwd(torch.flip(x_proj, dims=[3])) # Flip horizontally
+        h_bwd = torch.flip(h_bwd, dims=[3]) # Flip back
+
+        # Vertical scans
+        v_fwd = self.conv_v_fwd(x_proj)
+        v_bwd = self.conv_v_bwd(torch.flip(x_proj, dims=[2])) # Flip vertically
+        v_bwd = torch.flip(v_bwd, dims=[2]) # Flip back
+
+        # Gating and merging
+        # The gate controls which information from the scans to pass through
+        scan_result = h_fwd + h_bwd + v_fwd + v_bwd
+        gated_result = scan_result * F.silu(self.gate(x_proj))
+
+        # Output projection
+        y = self.out_proj(gated_result)
+        return y
+
+
+class MNV4_SSHybridBlock(nn.Module):
+    """
+    Revised State Space Hybrid Block for MobileNetV4.
+    Uses NPU-friendly components (Conv2d, BatchNorm2d) and operates on NCHW.
+    """
+    def __init__(self, in_channels, out_channels, stride, drop_path_rate=0.0, **kwargs):
+        super().__init__()
+        assert stride == 1, "SSHybridBlock currently only supports stride 1"
+        self.use_residual = in_channels == out_channels
+        self.drop_path = DropPath(drop_path_rate) if drop_path_rate > 0. else nn.Identity()
+
+        # Use BatchNorm2d for normalization, which is NPU-friendly
+        self.norm = nn.BatchNorm2d(in_channels)
+        
+        # The core State Space Model, now fully convolutional
+        self.ssm = SSM2D(in_channels=in_channels, **kwargs)
+
+        # Pointwise convolution to adjust channels if needed (rarely, as per spec)
+        self.proj_conv = ConvBNAct(in_channels, out_channels, kernel_size=1, act_layer=None) if in_channels != out_channels else nn.Identity()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, C, H, W)
+        shortcut = x
+        
+        x = self.norm(x)
+        x = self.ssm(x)
+        x = self.proj_conv(x) # Project if needed
+        
+        if self.use_residual:
+            x = self.drop_path(x) + shortcut
+            
         return x
 
 
@@ -449,12 +556,107 @@ class MobileNetV4(nn.Module):
         ["ExtraDW", 5,    3,  2048,   640,    1],
         ["ExtraDW", 3,    5,  2048,   640,    1],
     ]
-    
+    _MNV4_SSHYBRID_S_SPECS = [
+        ["FusedIB", None, 3, 32, 32, 2],
+        ["FusedIB", None, 3, 96, 64, 2],
+        ["ExtraDW", 5, 5, 192, 96, 2],
+        ["SSHybrid", None, None, None, 96, 1], 
+        ["IB", None, 3, 192, 96, 1],
+        ["IB", None, 3, 192, 96, 1],
+        ["SSHybrid", None, None, None, 96, 1], 
+        ["ConvNext", 3, None, 192, 96, 1],
+        ["ConvNext", 3, None, 192, 96, 1],
+        ["ExtraDW", 3, 3, 576, 128, 2],
+        ["ExtraDW", 5, 5, 512, 128, 1],
+        ["SSHybrid", None, None, None, 128, 1],
+        ["IB", None, 5, 384, 128, 1],
+        ["SSHybrid", None, None, None, 128, 1],
+    ]
+    _MNV4_SSHYBRID_M_SPECS = [
+        # block_type , dw_k1 , dw_k2 , exp_ch , out_ch , stride
+        ["FusedIB", None, 3,   128,   48,   2],
+        ["ExtraDW", 3,    5,   192,   80,   2],
+        ["ExtraDW", 3,    3,   160,   80,   1],
+           
+        ["ExtraDW", 3,    5,   480,  160,   2],
+        ["ExtraDW", 3,    3,   640,  160,   1],
+        ["ExtraDW", 3,    3,   640,  160,   1],
+        ["ExtraDW", 3,    5,   640,  160,   1],
+        # ---------- SS-hybrid “16×16 stage” ----------
+        ["SSHybrid", None, None, None, 160, 1],  # replaces first MQA
+        ["ExtraDW", 3,    3,   640,  160,   1],
+        ["SSHybrid", None, None, None, 160, 1],
+        ["ConvNext", 3, None, 640,  160,   1],
+        ["SSHybrid", None, None, None, 160, 1],
+        ["FFN",     None,None, 640,  160,   1],
+        ["SSHybrid", None, None, None, 160, 1],
+        ["ConvNext", 3, None, 640,  160,   1],
+           
+        # ---------- downsample to 8×8 ----------
+        ["ExtraDW", 5,    5,   960,  256,   2],
+        ["ExtraDW", 5,    5,  1024,  256,   1],
+        ["ExtraDW", 3,    5,  1024,  256,   1],
+        ["ExtraDW", 3,    5,  1024,  256,   1],
+        ["FFN",     None,None,1024,  256,   1],
+        ["ConvNext",3, None, 1024,  256,   1],
+        ["ExtraDW", 3,    5,   512,  256,   1],
+        ["SSHybrid",None,None,None, 256,   1],
+        ["ExtraDW", 5,    5,  1024,  256,   1],
+        ["SSHybrid",None,None,None, 256,   1],
+        ["FFN",     None,None,1024,  256,   1],
+        ["SSHybrid",None,None,None, 256,   1],
+        ["FFN",     None,None,1024,  256,   1],
+        ["SSHybrid",None,None,None, 256,   1],
+        ["ConvNext",5, None,  512,  256,   1],
+    ]
+
+    _MNV4_SSHYBRID_L_SPECS = [
+        ["FusedIB", None, 3,   96,    48,   2],
+        ["ExtraDW", 3,    5,  192,    96,   2],
+        ["ExtraDW", 3,    3,  384,    96,   1],
+           
+        ["ExtraDW", 3,    5,  384,   192,   2],
+        ["ExtraDW", 3,    3,  768,   192,   1],
+        ["ExtraDW", 3,    3,  768,   192,   1],
+        ["ExtraDW", 3,    3,  768,   192,   1],
+        ["ExtraDW", 3,    5,  768,   192,   1],
+        ["ExtraDW", 5,    3,  768,   192,   1],
+        ["ExtraDW", 5,    3,  768,   192,   1],
+        # ---------- SS-hybrid “24×24 stage” ----------
+        ["SSHybrid", None,None,None, 192, 1],
+        ["ExtraDW", 5,    3,  768,   192,   1],
+        ["SSHybrid", None,None,None, 192, 1],
+        ["ExtraDW", 5,    3,  768,   192,   1],
+        ["SSHybrid", None,None,None, 192, 1],
+        ["ExtraDW", 5,    3,  768,   192,   1],
+        ["SSHybrid", None,None,None, 192, 1],
+        ["ConvNext",3, None, 768,   192,   1],
+        # ---------- downsample to 12×12 ----------
+        ["ExtraDW", 5,    5,  768,   512,   2],
+        ["ExtraDW", 5,    5, 2048,   512,   1],
+        ["ExtraDW", 5,    5, 2048,   512,   1],
+        ["ExtraDW", 5,    5, 2048,   512,   1],
+        ["ConvNext",5, None,2048,   512,   1],
+        ["ExtraDW", 5,    3, 2048,   512,   1],
+        ["ConvNext",5, None,2048,   512,   1],
+        ["ConvNext",5, None,2048,   512,   1],
+        ["ExtraDW", 5,    3, 2048,   512,   1],
+        ["ExtraDW", 5,    5, 2048,   512,   1],
+        ["SSHybrid",None,None,None, 512,   1],
+        ["ConvNext",5, None,2048,   512,   1],
+        ["SSHybrid",None,None,None, 512,   1],
+        ["ConvNext",5, None,2048,   512,   1],
+        ["SSHybrid",None,None,None, 512,   1],
+    ]
+        
     _MODEL_SPECS = {
         'conv_s': _MNV4_CONV_S_SPECS,
         'conv_m': _MNV4_CONV_M_SPECS,
         'conv_l': _MNV4_CONV_L_SPECS,
         'conv_xl': _MNV4_CONV_XL_SPECS,
+        'ssh_hybrid_m': _MNV4_SSHYBRID_M_SPECS,
+        'ssh_hybrid_l': _MNV4_SSHYBRID_L_SPECS,
+        "ssh_hybrid_s": _MNV4_SSHYBRID_S_SPECS,
     }
     
     _FEATURE_INDICES = {
@@ -468,6 +670,9 @@ class MobileNetV4(nn.Module):
             'p5_s32': 10,
         }
     }
+    _FEATURE_INDICES["ssh_hybrid_s"] = _FEATURE_INDICES["conv_s"]  # same strides
+    _FEATURE_INDICES['ssh_hybrid_m'] = _FEATURE_INDICES['conv_m']
+    _FEATURE_INDICES['ssh_hybrid_l'] = _FEATURE_INDICES['conv_l']
 
     def __init__(
         self,
@@ -514,6 +719,7 @@ class MobileNetV4(nn.Module):
             "FusedIB": MNV4_FusedInvertedBottleneck, "IB": MNV4_InvertedBottleneck,
             "ExtraDW": MNV4_ExtraDepthwiseBlock, "ConvNext": MNV4_ConvNeXtLikeBlock,
             "FFN": MNV4_FFNBlock,
+            "SSHybrid": MNV4_SSHybridBlock,
         }
 
         for i, spec in enumerate(block_specs):
@@ -532,6 +738,13 @@ class MobileNetV4(nn.Module):
                 block = builder(current_channels, out_channels, exp_channels, dw_kernel_size=dw_k1, stride=stride, act_layer=act_layer, bn_layer=bn_layer, drop_path_rate=dpr[i])
             elif block_type == "FFN":
                 block = builder(current_channels, out_channels, exp_channels, stride=stride, act_layer=act_layer, bn_layer=bn_layer, drop_path_rate=dpr[i])
+            elif block_type == "SSHybrid":
+                block = builder(
+                    current_channels, out_channels,
+                    stride=stride,                     # must be 1 in your specs
+                    drop_path_rate=dpr[i],
+                    d_state=16, d_conv=3, expand=2,    # defaults; tweak freely
+                )
             else:
                 raise ValueError(f"Unknown block type: {block_type}")
 
