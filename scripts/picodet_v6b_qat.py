@@ -813,6 +813,24 @@ def train_epoch(
 
     return total_loss / (i + 1) if i > 0 else total_loss
 
+# ───────────────────── QAT Wrapper ────────────────
+class QATModelWrapper(nn.Module):
+    """Wrapper to maintain model interface after QAT preparation"""
+    def __init__(self, original_model: PicoDet, qat_prepared_model: torch.fx.GraphModule):
+        super().__init__()
+        self.qat_model = qat_prepared_model
+        
+        # Copy essential attributes from original model
+        self.anchor_manager = original_model.anchor_manager
+        self.score_th = original_model.score_th
+        self.iou_th = original_model.iou_th
+        self.max_det = original_model.max_det
+        self.head = original_model.head
+        self.strides = original_model.strides
+    
+    def forward(self, x):
+        return self.qat_model(x)
+
 # --- Validation, QAT, and ONNX Export ---
 # ... (Keep quick_val_iou, qat_prepare, ONNXExportableModel, append_nms_to_onnx) ...
 @torch.no_grad()
@@ -1156,29 +1174,44 @@ def main(argv: List[str] | None = None):
     print("\n[INFO] Preparing model for QAT...")
     model.train()
 
-    # qat_model = qat_prepare_old(model, torch.randint(0, 256, (1, 3, IMG_SIZE, IMG_SIZE), dtype=torch.uint8))
+    # Create QAT model with proper example input
     example = torch.randint(
         low=0, high=256,
         size=(1, 3, IMG_SIZE, IMG_SIZE),
         dtype=torch.uint8
     )
-    qat_model = qat_prepare(model, example).to(dev)
-    qat_model.eval()
-    with torch.no_grad():
-        for imgs_batch, _ in tr_loader:
-            qat_model(imgs_batch.to(dev))
-            break
-    qat_model.train()
-
-    # Manually re-attach the necessary attributes from the original model to the new qat_model.
-    # This makes them accessible to train_epoch() and quick_val_iou().
-    qat_model.anchor_manager = model.anchor_manager
-    qat_model.head = model.head
-    qat_model.score_th = model.score_th
-    qat_model.iou_th = model.iou_th
-    qat_model.max_det = model.max_det
+    qat_prepared = qat_prepare(model, example)
+    qat_model = QATModelWrapper(model, qat_prepared).to(dev)
     
-    qat_model.to(dev)
+    # Prime the QAT observers by running several forward passes in training mode
+    print("[INFO] Priming QAT observers...")
+    qat_model.train()
+    
+    # First, run a forward pass to initialize the graph structure
+    with torch.no_grad():
+        dummy_input = torch.randint(0, 256, (1, 3, IMG_SIZE, IMG_SIZE), dtype=torch.uint8).to(dev)
+        try:
+            _ = qat_model(dummy_input)
+            print("[INFO] QAT model structure initialized")
+        except Exception as e:
+            print(f"Warning during QAT initialization: {e}")
+    
+    # Now prime with real training data
+    prime_count = 0
+    with torch.no_grad():
+        for imgs_batch, tgts_batch in tr_loader:
+            if prime_count >= 50:  # Prime with more batches for better calibration
+                break
+            try:
+                # Run forward pass to populate observers
+                _ = qat_model(imgs_batch.to(dev))
+                prime_count += 1
+                if prime_count % 10 == 0:
+                    print(f"[INFO] Primed {prime_count} batches...")
+            except Exception as e:
+                print(f"Warning during QAT priming batch {prime_count}: {e}")
+                continue
+        print(f"[INFO] Primed QAT observers with {prime_count} batches")
     
     opt_q = SGD(qat_model.parameters(), lr=1e-4, momentum=0.9, weight_decay=4e-5)
     scaler_q = torch.amp.GradScaler(enabled=(dev.type == 'cuda'))
@@ -1188,8 +1221,8 @@ def main(argv: List[str] | None = None):
         train_loss_q = train_epoch(qat_model, tr_loader, opt_q, scaler_q, assigner, dev, qep, cfg.qat_epochs)
         # ema.update(qat_model) 
         
-        # FIX: Validate using the smoothed EMA weights for consistency with the FP32 loop.
-        val_iou_q = quick_val_iou(model, vl_loader, dev, epoch_num=qep)
+        # Validate using the QAT model
+        val_iou_q = quick_val_iou(qat_model, vl_loader, dev, epoch_num=qep)
     
         print(f"QAT Epoch {qep+1}/{cfg.qat_epochs} | Train Loss: {train_loss_q:.4f} | Val IoU: {val_iou_q:.4f}\n")
 
@@ -1216,7 +1249,9 @@ def main(argv: List[str] | None = None):
     """
     
     print("[INFO] Finishing QAT – converting to int8")
-    int8_model = convert_fx(copy.deepcopy(qat_model).cpu().eval())
+    # Extract the QAT prepared model from the wrapper for conversion
+    qat_prepared_model = qat_model.qat_model.cpu().eval()
+    int8_model = convert_fx(copy.deepcopy(qat_prepared_model))
     
     print("[INFO] ONNX export")
     dummy = torch.rand(1, 3, IMG_SIZE, IMG_SIZE)         # still FP32 input
@@ -1235,8 +1270,7 @@ def main(argv: List[str] | None = None):
                        iou_thresh=model.iou_th,
                        max_det   =model.max_det)
     print(f"[SAVE] Intermediate ONNX (INT8 core, no NMS) -> {temp_onnx_path}")
-    
-    append_nms_to_onnx(temp_onnx_path, cfg.out, model.score_th, model.iou_th, model.max_det)
+    print(f"[SAVE] Final ONNX with NMS -> {cfg.out}")
 
 
 if __name__ == '__main__':

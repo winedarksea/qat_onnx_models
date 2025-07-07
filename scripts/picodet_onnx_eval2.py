@@ -170,6 +170,17 @@ def evaluate_onnx_model(onnx_model_path: str, coco_root_dir: str, batch_size: in
         collate_fn=collate_fn_eval, pin_memory=(device_str.lower() == 'cuda' and 'CUDAExecutionProvider' in providers[0])
     )
     print(f"Dataset loaded: {len(val_dataset)} images. Batch size: {batch_size}.")
+    
+    # Verify class mapping consistency between training and eval
+    print(f"Using CANONICAL_COCO80_MAP with {len(CANONICAL_COCO80_MAP)} classes")
+    sample_classes = list(CANONICAL_COCO80_MAP.items())[:5]
+    print(f"Sample class mappings: {sample_classes}")
+    print(f"Contiguous ID range: 0-{len(CANONICAL_COCO80_IDS)-1}")
+    print(f"Original COCO ID range: {min(CANONICAL_COCO80_IDS)}-{max(CANONICAL_COCO80_IDS)}")
+    
+    # Verify class names mapping
+    sample_names = {i: class_names_map[i] for i in range(min(5, len(class_names_map)))}
+    print(f"Sample class names: {sample_names}")
 
     all_coco_results = []
     total_inference_time_ms = 0
@@ -267,7 +278,13 @@ def evaluate_onnx_model(onnx_model_path: str, coco_root_dir: str, batch_size: in
                 coco_w, coco_h = max(0, scaled_x2 - scaled_x1), max(0, scaled_y2 - scaled_y1)
                 coco_box_xywh = [scaled_x1, scaled_y1, coco_w, coco_h]
 
+                # Convert contiguous class ID (0-79) back to original COCO category ID (1-90 range)
                 original_coco_cat_id = CANONICAL_COCO80_IDS[int(label_pred_cont)] # Ensure label_pred_cont is int for list indexing
+                
+                # Validation check (can be removed in production)
+                if int(label_pred_cont) < 0 or int(label_pred_cont) >= len(CANONICAL_COCO80_IDS):
+                    print(f"WARNING: Invalid contiguous class ID {label_pred_cont}, skipping detection")
+                    continue
                 all_coco_results.append({
                     "image_id": img_id, "category_id": original_coco_cat_id,
                     "bbox": [round(float(c), 3) for c in coco_box_xywh],
@@ -382,7 +399,7 @@ def evaluate_onnx_model(onnx_model_path: str, coco_root_dir: str, batch_size: in
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Evaluate PicoDet ONNX model on COCO validation dataset.")
-    parser.add_argument("--onnx_model_path", type=str, default="picodet_int8.onnx", help="Path to the ONNX model file.")
+    parser.add_argument("--onnx_model_path", type=str, default="picodet_v5_int8.onnx", help="Path to the ONNX model file.")
     parser.add_argument("--coco_root", type=str, default="coco", help="Root directory of the COCO dataset.")
     parser.add_argument("--batch_size", type=int, default=1, help="Batch size for evaluation. Default 1 for more accurate per-image time.")
     parser.add_argument("--workers", type=int, default=0, help="Number of DataLoader workers.")
