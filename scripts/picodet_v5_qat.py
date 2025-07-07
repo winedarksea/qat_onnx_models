@@ -310,9 +310,9 @@ def train_epoch(
         dfl_project_buffer_for_decode: torch.Tensor,
         max_epochs: int = 500,
         quality_floor_vfl: float = 0.01,
-        w_cls_loss: float = 3.0,
-        w_obj_loss: float = 0.5, # Weight for the objectness loss
-        w_iou_initial: float = 5.0, # Initial weight for IoU loss
+        w_cls_loss: float = 2.5,  # Slight reduction from 3.0, but not too aggressive
+        w_obj_loss: float = 0.8,  # Moderate increase from 0.5
+        w_iou_initial: float = 4.0, # Slight reduction from 5.0
         w_iou_final: float = 2.0,   # Final weight for IoU loss
         iou_weight_change_epoch: int = None, # Epoch to change IoU weight
         use_focal_loss: bool = False,
@@ -461,7 +461,6 @@ def train_epoch(
                 head_anchors_flat_list = []
                 for lvl_idx_head in range(model.head.nl):
                     # Ensure model.head is accessible; if qat_model is passed, might need model_fp32.head
-                    # Assuming 'model' is the original FP32 model reference for head params
                     anchor_points_level = getattr(model.head, f'anchor_points_level_{lvl_idx_head}')
                     head_anchors_flat_list.append(anchor_points_level.to(device))
                 head_anchors_concatenated = torch.cat(head_anchors_flat_list, dim=0)
@@ -529,10 +528,10 @@ def train_epoch(
             else:  # Varifocal Loss path (final)
                 # — dynamic vfl alpha scheduling —
                 progress = epoch / max_epochs if max_epochs > 0 else 0.0
-                alpha_dyn = 0.25 + (0.75 - 0.25) * 0.5 * (1 - math.cos(math.pi * progress))
+                alpha_dyn = 0.15 + (0.5 - 0.15) * 0.5 * (1 - math.cos(math.pi * progress))  # Less aggressive
             
                 # sum‐reduction so we can normalize ourselves
-                vfl = VarifocalLoss(alpha=alpha_dyn, gamma=2.0, reduction='sum')
+                vfl = VarifocalLoss(alpha=alpha_dyn, gamma=1.5, reduction='sum')  # Reduced gamma
             
                 # — build “quality” targets: IoU for FG, 0 for BG —
                 quality_floor = torch.tensor(
@@ -543,8 +542,8 @@ def train_epoch(
             
                 # — joint logits for VFL —
                 # (cls + obj) broadcast-adds the objectness scalar to each class logit
-                # joint_logits = cls_p_img + obj_p_img.unsqueeze(1)  # (A, C)
-                joint_logits = blend_joint_logit(cls_p_img, obj_p_img.unsqueeze(1), alpha)
+                joint_logits = cls_p_img + obj_p_img.unsqueeze(1)  # (A, C)
+                # joint_logits = blend_joint_logit(cls_p_img, obj_p_img.unsqueeze(1), alpha)
             
                 # — VFL targets: zero everywhere except FG[class] = quality —
                 vfl_targets = torch.zeros_like(joint_logits, dtype=joint_logits.dtype)
@@ -608,20 +607,42 @@ def train_epoch(
                         [lvl.detach().permute(0, 2, 3, 1).reshape(-1, 1)
                          for lvl in obj_preds_levels], dim=0)                # [A_total , 1]
             
+                    # Classification confidence analysis
+                    cls_probs = cls_logits_all.sigmoid()
+                    obj_probs = obj_logits_all.sigmoid()
                     joint_conf = (cls_logits_all + obj_logits_all).sigmoid().flatten()
+                    
+                    # Per-class prediction distribution
+                    max_cls_probs, max_cls_indices = cls_probs.max(dim=1)
+                    print(f"\n[DBG] Epoch {epoch} Classification Analysis:")
+                    print(f"  Cls logits range: [{cls_logits_all.min().item():.3f}, {cls_logits_all.max().item():.3f}]")
+                    print(f"  Obj logits range: [{obj_logits_all.min().item():.3f}, {obj_logits_all.max().item():.3f}]")
+                    print(f"  Joint conf range: [{joint_conf.min().item():.3f}, {joint_conf.max().item():.3f}]")
+                    
+                    # Class distribution
+                    print(f"  Top predicted classes:")
+                    for class_id in range(min(5, head_nc_for_loss)):
+                        count = (max_cls_indices == class_id).sum().item()
+                        avg_conf = cls_probs[:, class_id].mean().item()
+                        print(f"    Class {class_id}: {count:6d} predictions, avg_conf: {avg_conf:.4f}")
             
-                    # sample at most 100 k values to keep it fast
+                    # sample at most 100k values to keep it fast
                     if joint_conf.numel() > 100000:
                         idx = torch.randperm(joint_conf.numel(), device=joint_conf.device)[:100_000]
                         joint_conf = joint_conf[idx]
             
                     q50, q90, q99 = torch.quantile(
                         joint_conf.cpu(), torch.tensor([0.5, 0.9, 0.99]))
-                    print(f"[DBG] Epoch {epoch}  Conf quantiles 50/90/99 % : "
-                          f"{q50:.3f}  {q90:.3f}  {q99:.3f}")
-                    # less than 0.1, likely issues. More than 0.9, possibly overfit
+                    print(f"  Conf quantiles 50/90/99%: {q50:.3f} {q90:.3f} {q99:.3f}")
+                    
+                    # Confidence thresholds
+                    for thresh in [0.01, 0.05, 0.1, 0.25]:
+                        above_thresh = (joint_conf > thresh).sum().item()
+                        percentage = 100 * above_thresh / joint_conf.numel()
+                        print(f"  >{thresh:.2f}: {percentage:.1f}%")
+                        
             except Exception as e:
-                print(repr(e))
+                print(f"[DEBUG ERROR] {repr(e)}")
 
     if total_samples_contributing_to_loss_epoch > 0:
         avg_epoch_loss_per_sample = tot_loss_accum / total_samples_contributing_to_loss_epoch
@@ -862,7 +883,7 @@ def quick_val_iou(
                 print(f"  Num Preds AFTER NMS (final): {num_actual_dets_this_img}")
 
             if actual_predicted_boxes.numel() == 0: # No detections after NMS for this image
-                # image_avg_iou will effectively be 0 for this image if we consider max_iou_per_gt
+                # image_avg_iou will effectively 0 for this image if we consider max_iou_per_gt
                 # We sum max_iou_per_gt, so if no preds, it contributes 0 to sum for these GTs
                 if batch_idx == 0 and i < 2:
                     print(f"  No actual predicted boxes after NMS for Img {num_images_processed-1} with GTs.")
@@ -1040,9 +1061,17 @@ class ONNXExportablePicoDet(nn.Module):
         self.postprocessor = head_postprocessor
 
     def forward(self, x: torch.Tensor): # x is images_uint8
-        # core_model is expected to return the tuple of (typically 12) flattened tensors
-        # from the baked-in training output path of PicoDetHead.
+        # ------------------ CRITICAL BUG FIX ------------------
+        # The core_model (a converted QAT model) will be in eval() mode by default
+        # when export is called. This would make it output only 2 tensors, causing a
+        # mismatch with the postprocessor which expects the 4-tuple training output.
+        # We temporarily set it to train() to get the raw logits, then switch back.
+        # This is a controlled way to resolve the interface mismatch for export purposes.
+        is_training_before = self.core_model.training
+        self.core_model.train()
         raw_feature_outputs_tuple = self.core_model(x)
+        self.core_model.training = is_training_before # Restore original mode
+        # -------------------------------------------------
 
         # The postprocessor takes this tuple and decodes it to the inference outputs
         return self.postprocessor(raw_feature_outputs_tuple)
@@ -1206,6 +1235,59 @@ def append_nms_to_onnx(
     onnx.save(m, out_path)
     print(f"[SAVE] Final ONNX with NMS → {out_path}")
 
+def save_fp32_onnx_reference(model, cfg):
+    """
+    Export a 'lower risk' FP32 ONNX model for comparison.
+    This uses the model directly in eval mode without complex wrappers.
+    """
+    print("[INFO] Exporting FP32 reference ONNX model...")
+    model.cpu().eval()
+    
+    # Create a simple wrapper that matches the expected ONNX output format
+    class FP32ReferenceWrapper(nn.Module):
+        def __init__(self, fp32_model):
+            super().__init__()
+            self.model = fp32_model
+            
+        def forward(self, x):
+            # Model in eval mode returns (boxes, scores) directly
+            return self.model(x)
+    
+    fp32_wrapper = FP32ReferenceWrapper(model)
+    dummy_input = torch.randint(0, 256, (1, 3, IMG_SIZE, IMG_SIZE), dtype=torch.uint8)
+    
+    fp32_onnx_path = cfg.out.replace(".onnx", "_fp32_reference.onnx")
+    
+    torch.onnx.export(
+        fp32_wrapper,
+        dummy_input,
+        fp32_onnx_path,
+        input_names=['images_uint8'],
+        output_names=['raw_boxes', 'raw_scores'],
+        dynamic_axes={
+            'images_uint8': {0: 'batch', 2: 'h', 3: 'w'},
+            'raw_boxes':    {0: 'batch', 1: 'anchors'},
+            'raw_scores':   {0: 'batch', 1: 'anchors'}
+        },
+        opset_version=18,
+        keep_initializers_as_inputs=False,
+        do_constant_folding=True,
+    )
+    print(f'[SAVE] FP32 reference ONNX → {fp32_onnx_path}')
+    
+    # Also create NMS version of FP32 model
+    fp32_nms_path = cfg.out.replace(".onnx", "_fp32_reference_with_nms.onnx")
+    append_nms_to_onnx(
+        in_path=fp32_onnx_path,
+        out_path=fp32_nms_path,
+        score_thresh=float(model.head.score_th),
+        iou_thresh=float(model.head.iou_th),
+        max_det=int(model.head.max_det),
+    )
+    print(f'[SAVE] FP32 reference ONNX with NMS → {fp32_nms_path}')
+    return fp32_onnx_path, fp32_nms_path
+
+
 def save_intermediate_onnx(qat_model, cfg, model):
     # --- Convert QAT model to INT8 ---
     qat_copy = copy.deepcopy(qat_model).cpu().eval()
@@ -1259,7 +1341,7 @@ def main(argv: List[str] | None = None):
     pa = argparse.ArgumentParser()
     pa.add_argument('--coco_root', default='coco')
     pa.add_argument('--arch', default='mnv4c', choices=['mnv3', 'mnv4s', 'mnv4', 'mnv4c'])
-    pa.add_argument('--epochs', type=int, default=100) 
+    pa.add_argument('--epochs', type=int, default=20) 
     pa.add_argument('--batch', type=int, default=16)
     pa.add_argument('--workers', type=int, default=0)
     pa.add_argument('--device', default=None)
@@ -1421,7 +1503,7 @@ def main(argv: List[str] | None = None):
         nc=model.head.nc,
         ctr=2.5,  # 2.5
         topk=10,  # 10
-        cls_cost_weight=1.0 if use_focal_loss else 0.5,
+        cls_cost_weight=2.0 if use_focal_loss else 1.5,  # Increased to emphasize classification
         debug_epochs=5 if debug_prints else 0,
     )
 
@@ -1498,6 +1580,11 @@ def main(argv: List[str] | None = None):
         print(f"[INFO] Validation IoU (score_th=0.25): {iou_25:.4f}")
     except Exception as e:
         print(repr(e))
+    
+    # --- Export FP32 reference ONNX for comparison ---
+    print("[INFO] Exporting FP32 reference ONNX models...")
+    fp32_onnx_path, fp32_nms_path = save_fp32_onnx_reference(model, cfg)
+    
     model.train() # Set back for QAT
 
     # --- QAT Preparation ---
@@ -1577,8 +1664,17 @@ def main(argv: List[str] | None = None):
         qat_model.eval() # Switch qat_model to eval for validation
 
         try:
-            # IMPORTANT: Use the evaluation wrapper for quick_val_iou
-            # model.head is the original FP32 head, used to get parameters for PostprocessorForONNX
+            """
+            current_qat_val_iou = quick_val_iou(
+                qat_model, vl_loader, dev,
+                score_thresh=0.05,
+                iou_thresh=model.head.iou_th,
+                max_detections=model.head.max_det,
+                epoch_num=qep,
+                run_name=f"QAT_ep{qep+1}_score0.05",
+                debug_prints=debug_prints,
+            )
+            """
             eval_compatible_qat_model = ONNXExportablePicoDet(qat_model, PostprocessorForONNX(model.head))
             eval_compatible_qat_model.to(dev).eval() # Ensure it's on device and in eval mode
 
