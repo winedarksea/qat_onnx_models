@@ -14,6 +14,7 @@ try:
     # folder_to_add = r"/Users/colincatlin/Documents-NoCloud/qat_onnx_models/scripts" 
     folder_to_add = r"C:\Users\Colin\qat_onnx_models\scripts"
     # folder_to_add = r"/home/colin/img_data"
+    # folder_to_add = r"/home/colin/qat_onnx_models/scripts"
     # Check if the path and file exist before trying to add to sys.path and import
     custom_module_path = os.path.join(folder_to_add, "customMobilenetNetv4.py")
     if os.path.exists(custom_module_path):
