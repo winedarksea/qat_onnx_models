@@ -20,7 +20,7 @@ from onnx import TensorProto as TP, helper as oh
 
 from pycocotools.coco import COCO
 
-if False:
+if False:  # this is just here for a quirk in testing, imports are still available when run
     try: 
         from picodet_lib_v2 import (
             PicoDet, get_backbone, VarifocalLoss, dfl_loss,
@@ -1097,7 +1097,7 @@ def append_nms_to_onnx(
         oh.make_tensor("nms_iou_th",   TP.FLOAT, [], [iou_thresh]),
         oh.make_tensor("nms_score_th", TP.FLOAT, [], [score_thresh]),
         oh.make_tensor("nms_max_det",  TP.INT64, [], [max_det]),
-        oh.make_tensor("nms_axis0", TP.INT64, [1], [0]),
+        # oh.make_tensor("nms_axis0", TP.INT64, [1], [0]),
         oh.make_tensor("nms_axis1", TP.INT64, [1], [1]),
         oh.make_tensor("nms_axis2", TP.INT64, [1], [2]),
         oh.make_tensor("nms_shape_boxes3d",  TP.INT64, [3], [0, -1, 4]),
@@ -1189,8 +1189,8 @@ def append_nms_to_onnx(
         axis=1, name="nms_SplitSel"))
 
     # squeeze to 1-D
-    b_idx, cls_idx, anc_idx = "batch_idx", "class_idx", "anchor_idx"
-    for src, dst in [(b_col, b_idx), (c_col, cls_idx), (a_col, anc_idx)]:
+    b_idx, class_idx, anc_idx = "batch_idx", "class_idx", "anchor_idx"
+    for src, dst in [(b_col, b_idx), (c_col, class_idx), (a_col, anc_idx)]:
         g.node.append(oh.make_node(
             "Squeeze", [src, "nms_axis1"], [dst],
             name=f"nms_Squeeze_{dst}"))
@@ -1209,7 +1209,7 @@ def append_nms_to_onnx(
     # ───── gather det_scores  (batch_dims=1, indices=[class,anchor]) ─────
     cls_unsq = "nms_cls_unsq"
     g.node.append(oh.make_node(
-        "Unsqueeze", [cls_idx, "nms_axis1"], [cls_unsq],
+        "Unsqueeze", [class_idx, "nms_axis1"], [cls_unsq],
         name="nms_UnsqClass"))
 
     idx_scores = "nms_idx_scores"                 # [N , 2]
@@ -1227,7 +1227,7 @@ def append_nms_to_onnx(
     g.output.extend([
         oh.make_tensor_value_info(det_boxes,  TP.FLOAT, ['N', 4]),
         oh.make_tensor_value_info(det_scores, TP.FLOAT, ['N']),
-        oh.make_tensor_value_info(cls_idx,    TP.INT64, ['N']),
+        oh.make_tensor_value_info(class_idx,    TP.INT64, ['N']),
         oh.make_tensor_value_info(b_idx,      TP.INT64, ['N']),
     ])
 

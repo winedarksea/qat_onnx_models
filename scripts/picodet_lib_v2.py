@@ -576,18 +576,28 @@ def get_backbone(arch: str, ckpt: str | None, img_size: int = 224):
         feature_info = net.get_feature_info()
         feat_chs = tuple(info['num_chs'] for info in feature_info)
         print(f"[INFO] Detected feature channels: {feat_chs}")
-        ckpt = "mobilenet_w1_0_mnv4c-m_pretrained_drp0_2_fp32_backbone.pt"
+        ckpt = "mobilenet_w1_0_mnv4c-s_pretrained_drp0_2_fp32_backbone.pt"
     elif arch == "mnv4c-m":
         net = MobileNetV4(
             variant='conv_m',
             width_multiplier=1.0,
-            features_only=True,
             out_features_names=['p2_s4', 'p3_s8', 'p4_s16', 'p5_s32'],
+            features_only=True,
         )
         feature_info = net.get_feature_info()
         feat_chs = tuple(info['num_chs'] for info in feature_info)
         print(f"[INFO] Detected feature channels: {feat_chs}")
-        ckpt = "mobilenet_w1_0_mnv4c-s_pretrained_drp0_2_fp32_backbone.pt"
+        ckpt = "mobilenet_w1_0_mnv4c-m_pretrained_drp0_2_fp32_backbone.pt"
+    elif arch in ["ssh_hybrid_s", "ssh_hybrid_s_bl", "ssh_hybrid_m", "ssh_hybrid_l", "conv-l", "conv-xl"]:
+        net = MobileNetV4(
+            variant=arch,
+            width_multiplier=1.0,
+            features_only=True,
+        )
+        feature_info = net.get_feature_info()
+        feat_chs = tuple(info['num_chs'] for info in feature_info)
+        print(f"[INFO] Detected feature channels: {feat_chs}")
+        ckpt = f"mobilenet_w1_0_{arch}_pretrained_drp0_2_fp32_backbone.pt"
     elif arch == "mnv4c":  # older but still functional
         if MobileNetV4ConvSmallPico is None:
             raise ImportError("Cannot create 'mnv4_custom' backbone. `customMobilenetNetv4.py` not found or failed to import.")
