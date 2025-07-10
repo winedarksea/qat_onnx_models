@@ -499,7 +499,7 @@ def collate_v2(batch):
 
 # ───────────────────── Task-Aligned Assigner ────────────────
 class TaskAlignedAssigner:
-    def __init__(self, top_k: int = 13, alpha: float = 1.0, beta: float = 6.0, eps: float = 1e-9):
+    def __init__(self, top_k: int = 13, alpha: float = 1.0, beta: float = 6.0, eps: float = 1e-12):
         self.top_k = top_k
         self.alpha = alpha
         self.beta = beta
@@ -519,7 +519,8 @@ class TaskAlignedAssigner:
         if num_gt == 0: # No ground truth boxes
             return (torch.zeros(num_anchors, dtype=torch.bool, device=device), # fg_mask
                     torch.full((num_anchors,), num_classes, dtype=torch.long, device=device), # assigned_labels (bg)
-                    torch.zeros((num_anchors,), dtype=torch.float32, device=device)) # assigned_scores (iou)
+                    torch.zeros((num_anchors,), dtype=torch.float32, device=device), # assigned_scores (iou)
+                    torch.full((num_anchors,), -1, dtype=torch.long, device=device)) # assigned_gt_inds
 
         # 1. Calculate IoUs between predicted boxes and GT boxes
         ious = tvops.box_iou(pred_boxes_decoded, gt_boxes) # Shape: (Num_Anchors, Num_GT)
@@ -529,8 +530,7 @@ class TaskAlignedAssigner:
 
         # 2. Calculate alignment metric
         # Gather scores for GT classes: pred_scores_sigmoid[:, gt_labels]
-        # gt_labels might have shape (Num_GT), need to expand for gather
-        # gt_labels_expanded shape: (1, Num_GT) repeated to (Num_Anchors, Num_GT)
+        # gt_labels might have shape (1, Num_GT) repeated to (Num_Anchors, Num_GT)
         # Or use advanced indexing: pred_scores_sigmoid[:, gt_labels] if gt_labels is 1D tensor of indices
         
         # pred_cls_probs_for_gt_classes shape (Num_Anchors, Num_GT)
@@ -548,9 +548,7 @@ class TaskAlignedAssigner:
 
         # 3. Select top-k candidates for each GT based on alignment metric
         # topk along anchors (dim=0) for each GT
-        # alignment_metric shape (Num_Anchors, Num_GT)
-        # top_k_metrics shape (top_k, Num_GT), top_k_indices shape (top_k, Num_GT)
-        # Ensure top_k is not larger than num_anchors
+        alignment_metric = alignment_metric.clamp(min=0) # Ensure no negative values
         dynamic_top_k = min(self.top_k, num_anchors)
         _, top_k_indices_per_gt = torch.topk(alignment_metric, dynamic_top_k, dim=0)
 
@@ -568,16 +566,35 @@ class TaskAlignedAssigner:
 
         # Resolve conflicts: if an anchor is top-k for multiple GTs, assign it to the GT
         # with which it has the highest IoU (or alignment_metric).
-        # alignment_metric_masked: only consider candidates, set others to 0 or -1
-        alignment_metric_masked = torch.where(candidate_mask, alignment_metric, torch.tensor(0., device=device))
+        # alignment_metric_masked: only consider candidates, set others to -1
+        alignment_metric_masked = torch.where(candidate_mask, alignment_metric, torch.tensor(-1., device=device))
         
         # anchor_max_alignment_score shape (Num_Anchors,), anchor_best_gt_idx shape (Num_Anchors,)
         anchor_max_alignment_score, anchor_best_gt_idx = alignment_metric_masked.max(dim=1)
 
-        # An anchor is foreground if its max_alignment_score (with its best GT) is > 0
-        # (meaning it was a candidate for at least one GT and alignment_metric was > 0)
-        fg_mask = anchor_max_alignment_score > self.eps # Use eps to avoid floating point issues
+        # An anchor is foreground if its max_alignment_score (with its best GT) is >= 0
+        # (meaning it was a candidate for at least one GT)
+        fg_mask = anchor_max_alignment_score >= 0
         
+        # For an anchor to be positive, it must also be a candidate for the GT it was assigned to.
+        # This prevents a case where an anchor's highest alignment score is for a GT
+        # for which it was not in the top-k.
+        if fg_mask.any():
+            # Get the GT indices for the foreground anchors
+            best_gt_indices_for_fg = anchor_best_gt_idx[fg_mask]
+            
+            # Get the indices of the foreground anchors themselves
+            fg_indices = torch.where(fg_mask)[0]
+            
+            # Check if the foreground anchors were actual candidates for their assigned GT
+            is_candidate = candidate_mask[fg_indices, best_gt_indices_for_fg]
+            
+            # Update fg_mask: only keep anchors that were valid candidates
+            # Create a new tensor for the updated mask to avoid in-place modification issues
+            updated_fg_mask = fg_mask.clone()
+            updated_fg_mask[fg_indices] = is_candidate
+            fg_mask = updated_fg_mask
+
         # Assign the best GT index to foreground anchors
         assigned_gt_inds[fg_mask] = anchor_best_gt_idx[fg_mask]
         
@@ -595,7 +612,7 @@ class TaskAlignedAssigner:
             # VFL uses IoU as the target score for positive samples
             assigned_scores[pos_anchor_indices] = ious[pos_anchor_indices, pos_assigned_gt_indices]
 
-        return fg_mask, assigned_labels, assigned_scores
+        return fg_mask, assigned_labels, assigned_scores, assigned_gt_inds
 
 # ─── utils/ema.py ──────────────────────────────────────────────────────────────
 class ModelEMA:
@@ -676,15 +693,22 @@ class ModelEMA:
 
 # ───────────────────── Updated Training Loop ────────────────────────
 def train_epoch(
-        model: PicoDet, loader, opt, scaler, assigner: TaskAlignedAssigner, device: torch.device,
-        epoch: int, max_epochs: int, debug_prints: bool = True
+        model, loader, opt, scaler, assigner: TaskAlignedAssigner, device: torch.device,
+        epoch: int, max_epochs: int, debug_prints: bool = True, anchor_manager=None,
+        is_qat: bool = False
 ):
     model.train()
     total_loss, total_fg_count = 0.0, 0
     # Use the existing VarifocalLoss from your library
     vfl_loss_fn = VarifocalLoss(reduction='sum')
     
-    anchor_points, anchor_strides_flat = model.anchor_manager()
+    # Handle both regular PicoDet models and QAT-prepared models
+    if hasattr(model, 'anchor_manager'):
+        anchor_points, anchor_strides_flat = model.anchor_manager()
+    elif anchor_manager is not None:
+        anchor_points, anchor_strides_flat = anchor_manager()
+    else:
+        raise ValueError("Model doesn't have anchor_manager and none provided")
     
     for i, (imgs, tgts_batch) in enumerate(loader):
         imgs = imgs.to(device)
@@ -698,10 +722,20 @@ def train_epoch(
         reg_p_flat = torch.cat([lvl.permute(0, 2, 3, 1).reshape(bs, -1, 4 * (reg_max + 1)) for lvl in reg_preds_levels], 1)
 
         # Decode boxes (detached) to use in the assigner
+        # During QAT, the model might already output sigmoid-ed scores from a quantized op.
+        # However, the assigner requires fresh sigmoid on the logits sum.
+        # Let's ensure we use the logits for consistency.
+        pred_scores_for_assigner = (cls_p_flat.detach() + obj_p_flat.detach()).sigmoid()
         decoded_boxes = model.head.decode_predictions(reg_p_flat.detach(), anchor_points, anchor_strides_flat)
         
         # We need the raw logits for the loss function, but the assigner works best with probabilities
         pred_scores_for_assigner = (cls_p_flat.detach() + obj_p_flat.detach()).sigmoid()
+        
+        # Debug: Check if scores are reasonable during QAT
+        if debug_prints and i == 0 and epoch == 0:
+            print(f"[DEBUG] QAT Pred scores stats: min={pred_scores_for_assigner.min().item():.6f}, "
+                  f"max={pred_scores_for_assigner.max().item():.6f}, "
+                  f"mean={pred_scores_for_assigner.mean().item():.6f}")
 
         all_fg_masks, all_assigned_labels, all_assigned_scores, all_assigned_boxes = [], [], [], []
         
@@ -709,7 +743,9 @@ def train_epoch(
             gt_boxes = tgts_batch[b_idx]["boxes"].to(device)
             gt_labels = tgts_batch[b_idx]["labels"].to(device)
             
-            fg_mask, assigned_labels, assigned_scores = assigner(pred_scores_for_assigner[b_idx], decoded_boxes[b_idx], gt_boxes, gt_labels)
+            fg_mask, assigned_labels, assigned_scores, assigned_gt_inds = assigner(
+                pred_scores_for_assigner[b_idx], decoded_boxes[b_idx], gt_boxes, gt_labels
+            )
             
             all_fg_masks.append(fg_mask)
             all_assigned_labels.append(assigned_labels)
@@ -719,10 +755,8 @@ def train_epoch(
             assigned_gt_boxes = torch.zeros_like(decoded_boxes[b_idx])
             if fg_mask.any():
                 pos_indices = torch.where(fg_mask)[0]
-                ious = tvops.box_iou(decoded_boxes[b_idx][pos_indices], gt_boxes)
-                if ious.numel() > 0:
-                    _, gt_matches = ious.max(dim=1)
-                    assigned_gt_boxes[pos_indices] = gt_boxes[gt_matches]
+                pos_gt_indices = assigned_gt_inds[pos_indices]
+                assigned_gt_boxes[pos_indices] = gt_boxes[pos_gt_indices]
             all_assigned_boxes.append(assigned_gt_boxes)
 
         fg_mask_batch = torch.stack(all_fg_masks)
@@ -786,9 +820,16 @@ def train_epoch(
                 assigned_boxes_fg[keep],
                 reduction='sum') / (keep.sum() + eps))
 
-        w_iou = 2.0
-        w_vfl = 1.0 
-        w_dfl = 0.25
+        if is_qat:
+            # Use more conservative weights for QAT to aid stability
+            w_iou = 1.0
+            w_vfl = 0.5
+            w_dfl = 0.1
+        else:
+            w_iou = 2.0
+            w_vfl = 1.0 
+            w_dfl = 0.25
+
         loss = w_vfl * loss_vfl + w_dfl * loss_dfl + w_iou * loss_iou
         if not torch.isfinite(loss):
             print(f"[WARN] non-finite loss ({loss.item()}) – using fallback")
@@ -829,51 +870,85 @@ class QATModelWrapper(nn.Module):
         self.strides = original_model.strides
     
     def forward(self, x):
+        # The QAT model always returns training format (3 outputs)
+        # We need to handle inference mode conversion here
+        if not self.training:
+            # Manually call the head in inference mode
+            with torch.no_grad():
+                anchor_points, strides_flat = self.anchor_manager()
+                # The qat_model is the fx.GraphModule, which doesn't have the head
+                # We need to use the copied head from the original model
+                cls_logits, obj_logits, reg_logits = self.qat_model(x)
+                
+                cls_flat = torch.cat([lvl.permute(0, 2, 3, 1).reshape(lvl.shape[0], -1, self.head.nc) for lvl in cls_logits], 1)
+                obj_flat = torch.cat([lvl.permute(0, 2, 3, 1).reshape(lvl.shape[0], -1, 1) for lvl in obj_logits], 1)
+                reg_flat = torch.cat([lvl.permute(0, 2, 3, 1).reshape(lvl.shape[0], -1, 4 * (self.head.reg_max + 1)) for lvl in reg_logits], 1)
+
+                decoded_boxes = self.head.decode_predictions(reg_flat, anchor_points, strides_flat)
+                decoded_scores = (cls_flat + obj_flat).sigmoid()
+                return decoded_boxes, decoded_scores
+        
+        # In training mode, just pass through
         return self.qat_model(x)
 
+
 # --- Validation, QAT, and ONNX Export ---
-# ... (Keep quick_val_iou, qat_prepare, ONNXExportableModel, append_nms_to_onnx) ...
 @torch.no_grad()
-def quick_val_iou(model: PicoDet, loader, device, epoch_num: int = -1, debug_prints: bool = True):
+def quick_val_iou(model, loader, device, epoch_num: int = -1, debug_prints: bool = True):
     model.eval()
-    total_iou_sum, num_gt_total = 0., 0
+    total_iou_sum, num_gt_total = 0.0, 0
     total_preds_after_nms = 0
     num_images_processed = 0
     
     # Correctly determine number of images in the validation set
-    if hasattr(loader.sampler, 'indices'):
-        num_images_total = len(loader.sampler.indices)
-    else:
-        num_images_total = len(loader.dataset)
+    try:
+        num_total_images = len(loader.dataset)
+    except TypeError:
+        num_total_images = "N/A"
+
+    # For QAT models, we need to get attributes from the original model
+    score_th = model.score_th
+    iou_th = model.iou_th
+    max_det = model.max_det
 
     for imgs_batch, tgts_batch in loader:
+        imgs_batch = imgs_batch.to(device)
         num_images_processed += imgs_batch.size(0)
-        raw_pred_boxes, raw_pred_scores = model(imgs_batch.to(device))
         
+        # This now works for both regular and QAT-wrapped models
+        # because model.eval() sets the QAT wrapper to inference mode.
+        raw_pred_boxes, raw_pred_scores = model(imgs_batch)
+
         for b_idx in range(imgs_batch.size(0)):
             gt_boxes = tgts_batch[b_idx]["boxes"].to(device)
-            if gt_boxes.numel() == 0: continue
-            num_gt_total += gt_boxes.shape[0]
+            if gt_boxes.numel() == 0:
+                continue
+            
+            num_gt_total += gt_boxes.size(0)
+            
+            pred_boxes = raw_pred_boxes[b_idx]
+            pred_scores = raw_pred_scores[b_idx]
 
-            scores_per_anchor, labels_per_anchor = torch.max(raw_pred_scores[b_idx], dim=1)
-            keep_mask = scores_per_anchor >= model.score_th
+            conf_per_anchor, labels_per_anchor = torch.max(pred_scores, dim=1)
+            keep_by_score = conf_per_anchor >= score_th
             
-            if not keep_mask.any(): continue
+            boxes_filt = pred_boxes[keep_by_score]
+            scores_filt = conf_per_anchor[keep_by_score]
+            
+            if boxes_filt.numel() == 0:
+                continue
 
-            boxes_pre_nms = raw_pred_boxes[b_idx][keep_mask]
-            scores_pre_nms = scores_per_anchor[keep_mask]
-            labels_pre_nms = labels_per_anchor[keep_mask]
+            keep_by_nms = tvops.nms(boxes_filt, scores_filt, iou_threshold=iou_th)
+            
+            if max_det > 0 and len(keep_by_nms) > max_det:
+                keep_by_nms = keep_by_nms[:max_det]
+            
+            final_boxes = boxes_filt[keep_by_nms]
+            total_preds_after_nms += final_boxes.size(0)
 
-            nms_indices = tvops.batched_nms(boxes_pre_nms, scores_pre_nms, labels_pre_nms, model.iou_th)
-            
-            if len(nms_indices) == 0: continue
-            
-            final_boxes = boxes_pre_nms[nms_indices[:model.max_det]]
-            total_preds_after_nms += final_boxes.shape[0]
-            
-            iou_matrix = tvops.box_iou(final_boxes, gt_boxes)
-            if iou_matrix.numel() > 0:
-                max_iou_per_gt, _ = iou_matrix.max(dim=0)
+            if final_boxes.numel() > 0:
+                ious = tvops.box_iou(final_boxes, gt_boxes)
+                max_iou_per_gt, _ = torch.max(ious, dim=0)
                 total_iou_sum += max_iou_per_gt.sum().item()
 
     avg_preds_after = total_preds_after_nms / num_images_processed if num_images_processed > 0 else 0
@@ -881,7 +956,7 @@ def quick_val_iou(model: PicoDet, loader, device, epoch_num: int = -1, debug_pri
     
     if debug_prints:
         print(f"--- Val E{epoch_num} ---")
-        print(f"Images: {num_images_processed}/{num_images_total}, Total GTs: {num_gt_total}")
+        print(f"Images: {num_images_processed}/{num_total_images}, Total GTs: {num_gt_total}")
         print(f"Avg preds/img (after NMS): {avg_preds_after:.2f}")
         print(f"Validation Mean IoU: {final_mean_iou:.4f}")
     
@@ -1123,14 +1198,14 @@ def main(argv: List[str] | None = None):
     pa = argparse.ArgumentParser()
     pa.add_argument('--coco_root', default='coco')
     pa.add_argument('--arch', default='mnv4c', choices=['mnv4c'])
-    pa.add_argument('--epochs', type=int, default=4) 
+    pa.add_argument('--epochs', type=int, default=2) 
     pa.add_argument('--qat_epochs', type=int, default=1) 
     pa.add_argument('--batch', type=int, default=32)
     pa.add_argument('--workers', type=int, default=0)
     pa.add_argument('--device', default=None)
     pa.add_argument('--out', default='picodet_int8_refactored.onnx')
     cfg = pa.parse_args(argv)
-    BACKBONE_FREEZE_EPOCHS = 2
+    BACKBONE_FREEZE_EPOCHS = 1
 
     dev = torch.device(cfg.device or ('cuda' if torch.cuda.is_available() else 'cpu'))
     print(f'[INFO] Device: {dev}')
@@ -1153,26 +1228,33 @@ def main(argv: List[str] | None = None):
     scaler = torch.amp.GradScaler(enabled=(dev.type == 'cuda'))
     
     assigner = TaskAlignedAssigner(top_k=13)
-    # ema = ModelEMA(model, decay=0.999, device=dev)
+    ema = ModelEMA(model, decay=0.999, device=dev)
     
     print(f"[INFO] Starting FP32 training for {cfg.epochs} epochs...")
+    debug_prints = True
     for ep in range(cfg.epochs):
-        if ep < BACKBONE_FREEZE_EPOCHS:
-            if ep == 0:
-                for p in model.backbone.parameters(): p.requires_grad = False
-                print(f"[INFO] Backbone frozen for {BACKBONE_FREEZE_EPOCHS} epochs…")
-        elif ep == BACKBONE_FREEZE_EPOCHS:
-            for p in model.backbone.parameters(): p.requires_grad = True
-            print("[INFO] Backbone unfrozen – full network now training")
+        print(f"[INFO] Backbone {'frozen' if ep < BACKBONE_FREEZE_EPOCHS else 'unfrozen'} for epoch {ep+1}/{cfg.epochs}...")
+        for name, param in model.backbone.named_parameters():
+            param.requires_grad_(ep >= BACKBONE_FREEZE_EPOCHS)
 
-        train_loss = train_epoch(model, tr_loader, opt, scaler, assigner, dev, ep, cfg.epochs)
-        # ema.update(model)  
-        val_iou = quick_val_iou(model, vl_loader, dev, epoch_num=ep)
+        train_loss = train_epoch(model, tr_loader, opt, scaler, assigner, dev, ep, cfg.epochs, debug_prints=debug_prints, anchor_manager=model.anchor_manager)
+        ema.update(model)
+        
+        # It's better to validate with the EMA model
+        ema_model_for_val = copy.deepcopy(model)
+        ema.copy_to(ema_model_for_val)
+        val_iou = quick_val_iou(ema_model_for_val, vl_loader, dev, epoch_num=ep)
+        
         print(f"Epoch {ep+1}/{cfg.epochs} | Train Loss: {train_loss:.4f} | Val IoU: {val_iou:.4f} | LR: {opt.param_groups[0]['lr']:.6f}\n")
         sch.step()
 
     print("\n[INFO] Preparing model for QAT...")
     model.train()
+
+    # Disable inplace activations before QAT preparation
+    for module in model.modules():
+        if hasattr(module, 'inplace'):
+            module.inplace = False
 
     # Create QAT model with proper example input
     example = torch.randint(
@@ -1180,83 +1262,83 @@ def main(argv: List[str] | None = None):
         size=(1, 3, IMG_SIZE, IMG_SIZE),
         dtype=torch.uint8
     )
-    qat_prepared = qat_prepare(model, example)
-    qat_model = QATModelWrapper(model, qat_prepared).to(dev)
+    qat_prepared_graph = qat_prepare(model, example)
+    
+    # Wrap the prepared graph to handle training/eval mode switching
+    qat_model = QATModelWrapper(model, qat_prepared_graph)
+    qat_model = qat_model.to(dev)
     
     # Prime the QAT observers by running several forward passes in training mode
     print("[INFO] Priming QAT observers...")
     qat_model.train()
-    
-    # First, run a forward pass to initialize the graph structure
-    with torch.no_grad():
-        dummy_input = torch.randint(0, 256, (1, 3, IMG_SIZE, IMG_SIZE), dtype=torch.uint8).to(dev)
-        try:
-            _ = qat_model(dummy_input)
-            print("[INFO] QAT model structure initialized")
-        except Exception as e:
-            print(f"Warning during QAT initialization: {e}")
-    
-    # Now prime with real training data
     prime_count = 0
     with torch.no_grad():
-        for imgs_batch, tgts_batch in tr_loader:
-            if prime_count >= 50:  # Prime with more batches for better calibration
-                break
-            try:
-                # Run forward pass to populate observers
-                _ = qat_model(imgs_batch.to(dev))
-                prime_count += 1
-                if prime_count % 10 == 0:
-                    print(f"[INFO] Primed {prime_count} batches...")
-            except Exception as e:
-                print(f"Warning during QAT priming batch {prime_count}: {e}")
-                continue
-        print(f"[INFO] Primed QAT observers with {prime_count} batches")
-    
-    opt_q = SGD(qat_model.parameters(), lr=1e-4, momentum=0.9, weight_decay=4e-5)
+        for i, (imgs, _) in enumerate(tr_loader):
+            if i >= 50: break
+            qat_model(imgs.to(dev))
+            if (i + 1) % 10 == 0: print(f"[INFO] Primed {i+1} batches...")
+    print(f"[INFO] Primed QAT observers with {i+1} batches")
+
+    # Use AdamW with a low LR for more stable QAT finetuning
+    opt_q = torch.optim.AdamW(qat_model.parameters(), lr=1e-5, weight_decay=0)
+    scheduler_q = torch.optim.lr_scheduler.CosineAnnealingLR(opt_q, T_max=cfg.qat_epochs, eta_min=1e-6)
     scaler_q = torch.amp.GradScaler(enabled=(dev.type == 'cuda'))
-    
+
     print(f"[INFO] Starting QAT finetuning for {cfg.qat_epochs} epochs...")
     for qep in range(cfg.qat_epochs):
-        train_loss_q = train_epoch(qat_model, tr_loader, opt_q, scaler_q, assigner, dev, qep, cfg.qat_epochs)
-        # ema.update(qat_model) 
+        train_loss_q = train_epoch(qat_model, tr_loader, opt_q, scaler_q, assigner, dev, qep, cfg.qat_epochs, is_qat=True)
         
         # Validate using the QAT model
         val_iou_q = quick_val_iou(qat_model, vl_loader, dev, epoch_num=qep)
-    
         print(f"QAT Epoch {qep+1}/{cfg.qat_epochs} | Train Loss: {train_loss_q:.4f} | Val IoU: {val_iou_q:.4f}\n")
+        scheduler_q.step()
 
     model.score_th = 0.05  # export threshold
-    
+
     print("\n[INFO] Exporting to ONNX...")
     temp_onnx_path = cfg.out.replace(".onnx", "_temp.onnx")
-    
-    # final_exportable_model = ONNXExportableModel(qat_model)
-    """
-    # old export path
-    export_model = copy.deepcopy(qat_model).cpu()
-    ema_q.copy_to(export_model)          # use the averaged weights
-    final_exportable_model = ONNXExportableModel(export_model)
-    torch.onnx.export(
-        final_exportable_model,
-        torch.randint(0, 256, (1, 3, IMG_SIZE, IMG_SIZE), dtype=torch.uint8),
-        temp_onnx_path,
-        input_names=['images_uint8'],
-        output_names=['raw_boxes', 'raw_scores'],
-        dynamic_axes={'images_uint8': {0: 'batch'}, 'raw_boxes': {0: 'batch'}, 'raw_scores': {0: 'batch'}},
-        opset_version=18
-    )
-    """
-    
+
     print("[INFO] Finishing QAT – converting to int8")
-    # Extract the QAT prepared model from the wrapper for conversion
-    qat_prepared_model = qat_model.qat_model.cpu().eval()
-    int8_model = convert_fx(copy.deepcopy(qat_prepared_model))
+    # We need to convert the inner qat_model (the fx.GraphModule)
+    qat_model.cpu().eval()
+    # Use the EMA model for conversion for better accuracy
+    # ema.copy_to(qat_model) # EMA is tricky with QAT models, skip for now
     
+    # The model to be converted is the inner fx.GraphModule
+    int8_model_graph = convert_fx(copy.deepcopy(qat_model.qat_model))
+
+    # For export, we need a simple wrapper that calls the converted graph
+    # and then applies the post-processing (decoding) logic.
+    # The QATModelWrapper is not suitable as its forward has Python-control flow.
+    class ONNXExportWrapper(nn.Module):
+        def __init__(self, int8_core_model, head_ref, anchor_manager_ref):
+            super().__init__()
+            self.core_model = int8_core_model
+            self.head = head_ref
+            self.anchor_manager = anchor_manager_ref
+        
+        def forward(self, x):
+            cls_logits, obj_logits, reg_logits = self.core_model(x)
+            
+            anchor_points, strides_flat = self.anchor_manager()
+            
+            cls_flat = torch.cat([lvl.permute(0, 2, 3, 1).reshape(lvl.shape[0], -1, self.head.nc) for lvl in cls_logits], 1)
+            obj_flat = torch.cat([lvl.permute(0, 2, 3, 1).reshape(lvl.shape[0], -1, 1) for lvl in obj_logits], 1)
+            reg_flat = torch.cat([lvl.permute(0, 2, 3, 1).reshape(lvl.shape[0], -1, 4 * (self.head.reg_max + 1)) for lvl in reg_logits], 1)
+
+            decoded_boxes = self.head.decode_predictions(reg_flat, anchor_points, strides_flat)
+            decoded_scores = (cls_flat + obj_flat).sigmoid()
+            return decoded_boxes, decoded_scores
+
+    # The head from the original model is needed for decoding parameters
+    export_model = ONNXExportWrapper(int8_model_graph, model.head, model.anchor_manager)
+    export_model.eval()
+
     print("[INFO] ONNX export")
-    dummy = torch.rand(1, 3, IMG_SIZE, IMG_SIZE)         # still FP32 input
+    # The model now expects uint8 input because the 'pre' layer is inside
+    dummy = torch.randint(0, 256, (1, 3, IMG_SIZE, IMG_SIZE), dtype=torch.uint8)
     torch.onnx.export(
-            int8_model,
+            export_model,
             dummy,
             temp_onnx_path,
             input_names=['images'],
@@ -1268,7 +1350,7 @@ def main(argv: List[str] | None = None):
     append_nms_to_onnx(temp_onnx_path, cfg.out,
                        score_thresh=model.score_th,
                        iou_thresh=model.iou_th,
-                       max_det   =model.max_det)
+                       max_det=model.max_det)
     print(f"[SAVE] Intermediate ONNX (INT8 core, no NMS) -> {temp_onnx_path}")
     print(f"[SAVE] Final ONNX with NMS -> {cfg.out}")
 
