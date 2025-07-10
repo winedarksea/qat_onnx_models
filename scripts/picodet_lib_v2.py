@@ -213,6 +213,9 @@ class PicoDetHead(nn.Module):
         self.reg_pred = nn.ModuleList(
             [nn.Conv2d(num_feats, 4 * (self.reg_max + 1), 1) for _ in range(self.nl)]
         )
+        
+        # Initialized to 1.0 to match the original additive behavior at the start.
+        self.logit_scale = nn.Parameter(torch.ones(1), requires_grad=True)
         self._initialize_biases()
         
         for i in range(self.nl):
@@ -311,7 +314,9 @@ class PicoDetHead(nn.Module):
         y2 = anchor_centers[:,1].unsqueeze(0) + ltrb[...,3]
         boxes = torch.stack([x1,y1,x2,y2], dim=-1)
 
-        scores = (cls_logit_perm + obj_logit_perm).sigmoid()
+        # Use the learned scaler during inference to combine logits.
+        scores = (cls_logit_perm + self.logit_scale * obj_logit_perm).sigmoid()
+        # scores = (cls_logit_perm + obj_logit_perm).sigmoid()
         # scores = cls_logit_perm.sigmoid() * obj_logit_perm.sigmoid()
         # alpha = min(1.0, epoch / warmup_epochs)
         # scores = ((1 - alpha) * (cls_logit_perm + obj_logit_perm).sigmoid() + alpha * (cls_logit_perm.sigmoid() * obj_logit_perm.sigmoid()))

@@ -247,8 +247,14 @@ class SimOTACache:
         if self.use_obj_logit and obj_logits is not None:
             # obj_logits is (A,), unsqueeze to (1,A) for broadcasting with (M,A) logit_cls_gt
             obj_logits_expanded = obj_logits.unsqueeze(0) # Shape (1, A)
-            alpha = self.alpha   # you can store alpha in the class each epoch
-            joint_logits_gt = blend_joint_logit(logit_cls_gt, obj_logits_expanded, alpha)
+            # alpha = self.alpha   # you can store alpha in the class each epoch
+            # joint_logits_gt = blend_joint_logit(logit_cls_gt, obj_logits_expanded, alpha)
+
+            # The label assigner's cost MUST match the loss function's logic.
+            # Use the scaler from the model's head to compute the joint logit.
+            # .detach() is used as this is a no_grad context.
+            scaler = model_head.logit_scale.detach()
+            joint_logits_gt = logit_cls_gt + scaler * obj_logits_expanded
             prob_joint_gt = joint_logits_gt.sigmoid()       # (M , A)
             cost_values_for_cls_term = -torch.log(prob_joint_gt + eps)
         else:
@@ -542,8 +548,11 @@ def train_epoch(
             
                 # — joint logits for VFL —
                 # (cls + obj) broadcast-adds the objectness scalar to each class logit
-                joint_logits = cls_p_img + obj_p_img.unsqueeze(1)  # (A, C)
+                # joint_logits = cls_p_img + obj_p_img.unsqueeze(1)  # (A, C)
                 # joint_logits = blend_joint_logit(cls_p_img, obj_p_img.unsqueeze(1), alpha)
+                # Use the learnable scaler from the head to combine logits for the loss.
+                # The optimizer will automatically tune this parameter.
+                joint_logits = cls_p_img + model.head.logit_scale * obj_p_img.unsqueeze(1)
             
                 # — VFL targets: zero everywhere except FG[class] = quality —
                 vfl_targets = torch.zeros_like(joint_logits, dtype=joint_logits.dtype)
@@ -938,6 +947,9 @@ class PostprocessorForONNX(nn.Module):
         # These will be part of the ONNX graph as constants if not inputs.
         self.register_buffer('strides_buffer', head_ref.strides_buffer.clone().detach(), persistent=False)
         self.register_buffer('dfl_project_buffer', head_ref.dfl_project_buffer.clone().detach(), persistent=False)
+        # Capture the final trained value of the scaler and register it as a buffer.
+        # This makes it a constant in the ONNX graph.
+        self.register_buffer('logit_scale', head_ref.logit_scale.clone().detach(), persistent=False)
         for i in range(self.nl):
             anchor_points = getattr(head_ref, f'anchor_points_level_{i}')
             self.register_buffer(f'anchor_points_level_{i}', anchor_points.clone().detach(), persistent=False)
@@ -1002,7 +1014,9 @@ class PostprocessorForONNX(nn.Module):
 
         # For ONNX, sigmoid should be torch.sigmoid
         # scores_level = torch.sigmoid(cls_logit_perm) * torch.sigmoid(obj_logit_perm)
-        scores_level = torch.sigmoid(cls_logit_perm + obj_logit_perm)
+        # scores_level = torch.sigmoid(cls_logit_perm + obj_logit_perm)
+        # Use the baked-in scaler value for ONNX post-processing.
+        scores_level = torch.sigmoid(cls_logit_perm + self.logit_scale * obj_logit_perm)
 
         return boxes_xyxy_level, scores_level
 
@@ -1553,6 +1567,8 @@ def main(argv: List[str] | None = None):
 
         print(f'Epoch {ep + 1}/{cfg.epochs}  loss {l:.3f}  IoU {m:.3f} lr={current_lr:.6f}')
         sch.step()
+        if ep % 5 == 0:
+            print(f"[INFO] Logit scaler value: {model.head.logit_scale.item():.4f}")
         assigner._dbg_iter = 0   
 
     print("[INFO] Evaluating FP32 model...")
