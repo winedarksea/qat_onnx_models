@@ -596,7 +596,7 @@ def train_epoch(
                   f"tot_batch_avg {averaged_batch_loss.item():.3f}")
         elif debug_prints and i % 500 == 0 and i > 0 and num_samples_with_loss_in_batch > 0:
             print(f"E{epoch} {i:04d}/{len(loader)} loss {averaged_batch_loss.item():.3f} (batch avg)")
-        if debug_prints and epoch == 10 and i == 0:  # only once at start of epoch 10
+        if debug_prints and (epoch == 10 or epoch == 20) and i == 0:
             try:
                 with torch.no_grad():
                     # ─── concatenate logits from all FPN levels ───────────────────
@@ -1478,7 +1478,7 @@ def main(argv: List[str] | None = None):
     else:
         base_lr = 0.006
         warmup_epochs = 3
-        cosine_decay_alpha = 0.0
+        cosine_decay_alpha = 0.04
         opt = SGD(model.parameters(), lr=base_lr, momentum=0.9, weight_decay=1e-4)
         warmup_scheduler = LinearLR(
             opt,
@@ -1501,8 +1501,8 @@ def main(argv: List[str] | None = None):
     use_focal_loss = False
     assigner = SimOTACache(
         nc=model.head.nc,
-        ctr=2.5,  # 2.5
-        topk=10,  # 10
+        ctr=2.6,  # 2.5
+        topk=11,  # 10
         cls_cost_weight=2.0 if use_focal_loss else 1.5,  # Increased to emphasize classification
         debug_epochs=5 if debug_prints else 0,
     )
