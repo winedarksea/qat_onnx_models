@@ -497,6 +497,39 @@ def build_transforms(size, train):
 def collate_v2(batch):
     return torch.stack(list(zip(*batch))[0], 0), list(zip(*batch))[1]
 
+import functools
+def collate_and_filter(batch: list, min_box_size: int = 1):
+    """
+    A custom collate_fn that filters out small bounding boxes and then
+    removes any images from the batch that no longer have annotations.
+    Args:
+        batch: A list of (image, target) tuples from the dataset.
+        min_box_size: The minimum width and height a box must have to be kept.
+                      A value of 1 or 0 effectively disables filtering.
+    Returns:
+        A tuple of (images_tensor, targets_list) or (None, None) if the
+        entire batch is filtered out.
+    """
+    filtered_imgs = []
+    filtered_tgts = []
+    for img, tgt in batch:
+        boxes = tgt.get("boxes")
+        if boxes is None or boxes.numel() == 0:
+            filtered_imgs.append(img)
+            filtered_tgts.append(tgt)
+            continue
+        widths = boxes[:, 2] - boxes[:, 0]
+        heights = boxes[:, 3] - boxes[:, 1]
+        keep_mask = (widths >= min_box_size) & (heights >= min_box_size)
+        tgt["boxes"] = boxes[keep_mask]
+        tgt["labels"] = tgt["labels"][keep_mask]
+        if tgt["boxes"].numel() > 0:
+            filtered_imgs.append(img)
+            filtered_tgts.append(tgt)
+    if not filtered_imgs:
+        return None, None
+    return torch.stack(filtered_imgs, 0), filtered_tgts
+
 # ───────────────────── Task-Aligned Assigner ────────────────
 class TaskAlignedAssigner:
     def __init__(self, top_k: int = 13, alpha: float = 1.0, beta: float = 6.0, eps: float = 1e-12):
@@ -701,16 +734,18 @@ def train_epoch(
     total_loss, total_fg_count = 0.0, 0
     # Use the existing VarifocalLoss from your library
     vfl_loss_fn = VarifocalLoss(reduction='sum')
-    
-    # Handle both regular PicoDet models and QAT-prepared models
     if hasattr(model, 'anchor_manager'):
         anchor_points, anchor_strides_flat = model.anchor_manager()
     elif anchor_manager is not None:
         anchor_points, anchor_strides_flat = anchor_manager()
     else:
         raise ValueError("Model doesn't have anchor_manager and none provided")
-    
     for i, (imgs, tgts_batch) in enumerate(loader):
+        # Handle the case where the entire batch was filtered out
+        if imgs is None or not hasattr(imgs, 'numel') or not imgs.numel():
+            if debug_prints:
+                print(f"Skipping batch {i} because it became empty after filtering.")
+            continue
         imgs = imgs.to(device)
         
         cls_preds_levels, obj_preds_levels, reg_preds_levels = model(imgs)
@@ -1204,6 +1239,7 @@ def main(argv: List[str] | None = None):
     pa.add_argument('--workers', type=int, default=0)
     pa.add_argument('--device', default=None)
     pa.add_argument('--out', default='picodet_int8_refactored.onnx')
+    pa.add_argument('--min_box_size', type=int, default=6, help="Minimum pixel width/height for a GT box to be used in training.")
     cfg = pa.parse_args(argv)
     BACKBONE_FREEZE_EPOCHS = 1
 
@@ -1214,10 +1250,17 @@ def main(argv: List[str] | None = None):
     model = PicoDet(backbone, feat_chs, num_classes=80, neck_out_ch=96, img_size=IMG_SIZE).to(dev)
     model.score_th = 0.02  # inital threshold
 
+    if cfg.min_box_size is not None and cfg.min_box_size > 1:
+        print(f"[INFO] Filtering enabled: Dropping GT boxes smaller than {cfg.min_box_size}x{cfg.min_box_size} pixels.")
+        custom_collate_fn = functools.partial(collate_and_filter, min_box_size=cfg.min_box_size)
+    else:
+        print("[INFO] GT box filtering disabled.")
+        custom_collate_fn = collate_v2
+
     train_ds = CocoDetectionV2(f"{cfg.coco_root}/train2017", f"{cfg.coco_root}/annotations/instances_train2017.json", CANONICAL_COCO80_MAP, build_transforms(IMG_SIZE, True))
     val_ds = CocoDetectionV2(f"{cfg.coco_root}/val2017", f"{cfg.coco_root}/annotations/instances_val2017.json", CANONICAL_COCO80_MAP, build_transforms(IMG_SIZE, False))
-    tr_loader = DataLoader(train_ds, batch_size=cfg.batch, shuffle=True, num_workers=cfg.workers, collate_fn=collate_v2, pin_memory=True, persistent_workers=bool(cfg.workers))
-    vl_loader = DataLoader(val_ds, batch_size=cfg.batch*2, num_workers=cfg.workers, collate_fn=collate_v2, pin_memory=True)
+    tr_loader = DataLoader(train_ds, batch_size=cfg.batch, shuffle=True, num_workers=cfg.workers, collate_fn=custom_collate_fn, pin_memory=True, persistent_workers=bool(cfg.workers))
+    vl_loader = DataLoader(val_ds, batch_size=cfg.batch*2, num_workers=cfg.workers, collate_fn=custom_collate_fn, pin_memory=True)
 
     lr = 0.005
     opt = SGD(model.parameters(), lr=lr, momentum=0.9, weight_decay=4e-5)
