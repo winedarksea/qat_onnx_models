@@ -2,6 +2,7 @@
 # built on pytorch version 2.7
 from __future__ import annotations
 import argparse, random, time, warnings, math, copy
+import functools
 from typing import List, Tuple
 import traceback
 
@@ -111,6 +112,56 @@ def build_transforms(size, train):
 def collate_v2(batch):
     imgs, tgts = zip(*batch)
     return torch.stack(imgs, 0), list(tgts)
+
+def collate_and_filter(batch: list, min_box_size: int = 1):
+    """
+    A custom collate_fn that filters out small bounding boxes and then
+    removes any images from the batch that no longer have annotations.
+
+    Args:
+        batch: A list of (image, target) tuples from the dataset.
+        min_box_size: The minimum width and height a box must have to be kept.
+                      A value of 1 or 0 effectively disables filtering.
+
+    Returns:
+        A tuple of (images_tensor, targets_list) or (None, None) if the
+        entire batch is filtered out.
+    """
+    filtered_imgs = []
+    filtered_tgts = []
+
+    for img, tgt in batch:
+        boxes = tgt.get("boxes")
+
+        # If there are no boxes to begin with, it's a valid negative sample. Keep it.
+        if boxes is None or boxes.numel() == 0:
+            filtered_imgs.append(img)
+            filtered_tgts.append(tgt)
+            continue
+
+        # Get box dimensions (works with torchvision BoundingBoxes object)
+        widths = boxes[:, 2] - boxes[:, 0]
+        heights = boxes[:, 3] - boxes[:, 1]
+
+        # Create a mask to keep only boxes that meet the size criteria
+        keep_mask = (widths >= min_box_size) & (heights >= min_box_size)
+
+        # Apply the mask to boxes and their corresponding labels
+        tgt["boxes"] = boxes[keep_mask]
+        tgt["labels"] = tgt["labels"][keep_mask]
+
+        # IMPORTANT: Only keep the image if it still has annotations after filtering
+        if tgt["boxes"].numel() > 0:
+            filtered_imgs.append(img)
+            filtered_tgts.append(tgt)
+        # If the image has no boxes left, it is implicitly dropped from the batch.
+
+    # If the filtering process removed every single sample from the batch
+    if not filtered_imgs:
+        return None, None
+
+    # Proceed with standard collation for the kept samples
+    return torch.stack(filtered_imgs, 0), filtered_tgts
 
 def logit_of_product(cls_raw, obj_raw):
     p = torch.sigmoid(cls_raw) * torch.sigmoid(obj_raw)
@@ -334,6 +385,12 @@ def train_epoch(
     w_iou = w_iou_initial if epoch < iou_weight_change_epoch else w_iou_final
 
     for i, (imgs, tgts_batch) in enumerate(loader):
+        # Handle the case where the entire batch was filtered out
+        if imgs is None or not imgs.numel():
+            if debug_prints:
+                print(f"Skipping batch {i} because it became empty after filtering.")
+            continue
+
         imgs = imgs.to(device)
         model_outputs = model(imgs)
 
@@ -1361,6 +1418,7 @@ def main(argv: List[str] | None = None):
     pa.add_argument('--device', default=None)
     pa.add_argument('--out', default='picodet_v5_int8.onnx')
     pa.add_argument('--no_inplace_head_neck', default=True, action='store_true', help="Disable inplace activations in head/neck")
+    pa.add_argument('--min_box_size', type=int, default=6, help="Minimum pixel width/height for a GT box to be used in training.")
     cfg = pa.parse_args(argv)
 
     TRAIN_SUBSET = None
@@ -1417,15 +1475,23 @@ def main(argv: List[str] | None = None):
         g = torch.Generator().manual_seed(42)
         val_idx  = torch.randperm(len(val_ds), generator=g)[:VAL_SUBSET].tolist()
         val_sampler = torch.utils.data.SubsetRandomSampler(val_idx)
+
+    if cfg.min_box_size is not None and cfg.min_box_size > 1:
+        print(f"[INFO] Filtering enabled: Dropping GT boxes smaller than {cfg.min_box_size}x{cfg.min_box_size} pixels.")
+        # Use functools.partial to create a collate_fn with our argument "baked in"
+        custom_collate_fn = functools.partial(collate_and_filter, min_box_size=cfg.min_box_size)
+    else:
+        print("[INFO] GT box filtering disabled.")
+        custom_collate_fn = collate_v2
     
     tr_loader = DataLoader(
         train_ds, batch_size=cfg.batch, sampler=train_sampler,
-        num_workers=cfg.workers, collate_fn=collate_v2,
+        num_workers=cfg.workers, collate_fn=custom_collate_fn,
         pin_memory=True, persistent_workers=bool(cfg.workers)
     )
     vl_loader = DataLoader(
         val_ds,   batch_size=cfg.batch, sampler=val_sampler,
-        num_workers=cfg.workers, collate_fn=collate_v2,
+        num_workers=cfg.workers, collate_fn=custom_collate_fn,
         pin_memory=True, persistent_workers=bool(cfg.workers)
     )
     
