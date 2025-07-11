@@ -652,6 +652,8 @@ def train_epoch(
             gradient_norm = 6.0  # 1.0 to 10.0 common, max gradient observed in debug was around 6
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=gradient_norm)
             scaler.step(opt); scaler.update()
+            with torch.no_grad():
+                model.head.logit_scale.clamp_(0.0, 3.0) # Clamp between 0.0 and 3.0
             tot_loss_accum += averaged_batch_loss.item() * num_samples_with_loss_in_batch
             total_samples_contributing_to_loss_epoch += num_samples_with_loss_in_batch
 
@@ -662,7 +664,7 @@ def train_epoch(
                   f"tot_batch_avg {averaged_batch_loss.item():.3f}")
         elif debug_prints and i % 500 == 0 and i > 0 and num_samples_with_loss_in_batch > 0:
             print(f"E{epoch} {i:04d}/{len(loader)} loss {averaged_batch_loss.item():.3f} (batch avg)")
-        if debug_prints and (epoch == 10 or epoch == 20) and i == 0:
+        if debug_prints and (epoch % 10 == 0) and i == 0:
             try:
                 with torch.no_grad():
                     # ─── concatenate logits from all FPN levels ───────────────────
@@ -1418,13 +1420,15 @@ def main(argv: List[str] | None = None):
     pa.add_argument('--device', default=None)
     pa.add_argument('--out', default='picodet_v5_int8.onnx')
     pa.add_argument('--no_inplace_head_neck', default=True, action='store_true', help="Disable inplace activations in head/neck")
-    pa.add_argument('--min_box_size', type=int, default=6, help="Minimum pixel width/height for a GT box to be used in training.")
+    pa.add_argument('--min_box_size', type=int, default=10, help="Minimum pixel width/height for a GT box to be used in training.")
     cfg = pa.parse_args(argv)
 
     TRAIN_SUBSET = None
     VAL_SUBSET   = None
     debug_prints = True
     BACKBONE_FREEZE_EPOCHS = 2 if cfg.epochs < 12 else 3  # 0 to disable
+    use_focal_loss = False
+    FOCAL_LOSS_WARMUP_EPOCHS = 5
 
     if cfg.device is None:
         cfg.device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -1483,12 +1487,41 @@ def main(argv: List[str] | None = None):
     else:
         print("[INFO] GT box filtering disabled.")
         custom_collate_fn = collate_v2
-    
+
+    # Curriculum learning, gradually smaller boxes included
+    curriculum_schedule = [
+        (10, 24),  # Stage 1: For the first 10 epochs, only use boxes >= 24x24 pixels.
+        (20, 16),   # Stage 2: For the next 20 epochs
+        (0, cfg.min_box_size)     # Stage 3: For the rest of training, use boxes >= cfg.min_box_size.
+                   # (Epoch count of 0 or a large number signifies 'the rest')
+    ]
+    current_stage_idx = 0
+    epochs_in_current_stage = 0
+    print("[INFO] Using curriculum learning for training.")
+
+    # Create a dictionary of DataLoaders, one for each stage of the curriculum
+    train_loaders = {}
+    total_scheduled_epochs = 0
+    for i, (num_epochs, min_size) in enumerate(curriculum_schedule):
+        print(f"  - Stage {i+1}: {num_epochs} epochs with min_box_size = {min_size}")
+        collate_fn = functools.partial(collate_and_filter, min_box_size=min_size)
+        
+        # Use the existing train_sampler logic
+        train_loaders[i] = DataLoader(
+            train_ds, batch_size=cfg.batch, sampler=train_sampler,
+            num_workers=cfg.workers,
+            collate_fn=collate_fn,
+            pin_memory=True, persistent_workers=bool(cfg.workers)
+        )
+        if i < len(curriculum_schedule) - 1:
+            total_scheduled_epochs += num_epochs
+    """
     tr_loader = DataLoader(
         train_ds, batch_size=cfg.batch, sampler=train_sampler,
         num_workers=cfg.workers, collate_fn=custom_collate_fn,
         pin_memory=True, persistent_workers=bool(cfg.workers)
     )
+    """
     vl_loader = DataLoader(
         val_ds,   batch_size=cfg.batch, sampler=val_sampler,
         num_workers=cfg.workers, collate_fn=custom_collate_fn,
@@ -1578,12 +1611,11 @@ def main(argv: List[str] | None = None):
         )
     scaler = torch.amp.GradScaler(enabled=dev.type == 'cuda')
 
-    use_focal_loss = False
     assigner = SimOTACache(
         nc=model.head.nc,
         ctr=2.6,  # 2.5
         topk=11,  # 10
-        cls_cost_weight=2.0 if use_focal_loss else 1.5,  # Increased to emphasize classification
+        cls_cost_weight=2.0 if use_focal_loss else 3.0,  # Increased to emphasize classification
         debug_epochs=5 if debug_prints else 0,
     )
 
@@ -1603,6 +1635,28 @@ def main(argv: List[str] | None = None):
             for p in model.backbone.parameters():
                 p.requires_grad = True
             print("[INFO] Backbone unfrozen – full network now training")
+        
+        # Check if we need to advance to the next stage in the curriculum
+        if current_stage_idx < len(curriculum_schedule) - 1:
+            stage_duration, _ = curriculum_schedule[current_stage_idx]
+            if epochs_in_current_stage >= stage_duration:
+                current_stage_idx += 1
+                epochs_in_current_stage = 0
+                print("-" * 50)
+                print(f"[INFO] Curriculum Change: Entering Stage {current_stage_idx + 1} at Epoch {ep + 1}")
+                print(f"[INFO] New min_box_size: {curriculum_schedule[current_stage_idx][1]}")
+                print("-" * 50)
+        
+        # Select the correct loader for the current stage
+        tr_loader = train_loaders[current_stage_idx]
+        epochs_in_current_stage += 1
+        ##########
+        if FOCAL_LOSS_WARMUP_EPOCHS is not None:
+            use_focal_loss_for_epoch = ep < FOCAL_LOSS_WARMUP_EPOCHS
+            if ep == FOCAL_LOSS_WARMUP_EPOCHS:
+                print("[INFO] Switching from Focal Loss warmup to Varifocal Loss for subsequent epochs.")
+        else:
+            use_focal_loss_for_epoch = use_focal_loss
 
         model.train()
         alpha = 0.0  # min(0.9, ep / alpha_warmup_epochs)
@@ -1616,7 +1670,7 @@ def main(argv: List[str] | None = None):
             quality_floor_vfl=0.02,
             debug_prints=debug_prints,
             alpha=alpha,
-            use_focal_loss=use_focal_loss,
+            use_focal_loss=use_focal_loss_for_epoch,
         )
         # ... (validation) ...
         model.eval()
@@ -1695,6 +1749,10 @@ def main(argv: List[str] | None = None):
         buf = getattr(orig_head, f'anchor_points_level_{i}')
         qat_head.register_buffer(f'anchor_points_level_{i}', buf, persistent=False)
     qat_head.register_buffer('dfl_project_buffer', orig_head.dfl_project_buffer, persistent=False)
+    qat_head.register_parameter(
+        'logit_scale',
+        nn.Parameter(orig_head.logit_scale.detach().clone(), requires_grad=True)
+    )
     qat_model = qat_model.to(dev)
     print("[INFO] QAT model prepared and moved to device.")
 

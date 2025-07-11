@@ -532,7 +532,7 @@ def collate_and_filter(batch: list, min_box_size: int = 1):
 
 # ───────────────────── Task-Aligned Assigner ────────────────
 class TaskAlignedAssigner:
-    def __init__(self, top_k: int = 13, alpha: float = 1.0, beta: float = 6.0, eps: float = 1e-12):
+    def __init__(self, top_k: int = 13, alpha: float = 1.0, beta: float = 6.0, eps: float = 1e-9):
         self.top_k = top_k
         self.alpha = alpha
         self.beta = beta
@@ -581,7 +581,7 @@ class TaskAlignedAssigner:
 
         # 3. Select top-k candidates for each GT based on alignment metric
         # topk along anchors (dim=0) for each GT
-        alignment_metric = alignment_metric.clamp(min=0) # Ensure no negative values
+        # Remove the clamp that was suppressing valid alignment scores
         dynamic_top_k = min(self.top_k, num_anchors)
         _, top_k_indices_per_gt = torch.topk(alignment_metric, dynamic_top_k, dim=0)
 
@@ -768,7 +768,13 @@ def train_epoch(
         
         # Debug: Check if scores are reasonable during QAT
         if debug_prints and i == 0 and epoch == 0:
-            print(f"[DEBUG] QAT Pred scores stats: min={pred_scores_for_assigner.min().item():.6f}, "
+            print(f"[DEBUG] Raw cls logits stats: min={cls_p_flat.min().item():.6f}, "
+                  f"max={cls_p_flat.max().item():.6f}, "
+                  f"mean={cls_p_flat.mean().item():.6f}")
+            print(f"[DEBUG] Raw obj logits stats: min={obj_p_flat.min().item():.6f}, "
+                  f"max={obj_p_flat.max().item():.6f}, "
+                  f"mean={obj_p_flat.mean().item():.6f}")
+            print(f"[DEBUG] Combined sigmoid scores stats: min={pred_scores_for_assigner.min().item():.6f}, "
                   f"max={pred_scores_for_assigner.max().item():.6f}, "
                   f"mean={pred_scores_for_assigner.mean().item():.6f}")
 
@@ -905,26 +911,33 @@ class QATModelWrapper(nn.Module):
         self.strides = original_model.strides
     
     def forward(self, x):
-        # The QAT model always returns training format (3 outputs)
-        # We need to handle inference mode conversion here
-        if not self.training:
-            # Manually call the head in inference mode
+        # During training, the QAT model should behave like the original model
+        # The QAT prepared model should output the same format as the original
+        if self.training:
+            # In training mode, just pass through the QAT model
+            return self.qat_model(x)
+        else:
+            # In eval mode, we need to handle the inference format
             with torch.no_grad():
                 anchor_points, strides_flat = self.anchor_manager()
-                # The qat_model is the fx.GraphModule, which doesn't have the head
-                # We need to use the copied head from the original model
+                # The qat_model should output cls_logits, obj_logits, reg_logits
                 cls_logits, obj_logits, reg_logits = self.qat_model(x)
-                
                 cls_flat = torch.cat([lvl.permute(0, 2, 3, 1).reshape(lvl.shape[0], -1, self.head.nc) for lvl in cls_logits], 1)
                 obj_flat = torch.cat([lvl.permute(0, 2, 3, 1).reshape(lvl.shape[0], -1, 1) for lvl in obj_logits], 1)
                 reg_flat = torch.cat([lvl.permute(0, 2, 3, 1).reshape(lvl.shape[0], -1, 4 * (self.head.reg_max + 1)) for lvl in reg_logits], 1)
-
                 decoded_boxes = self.head.decode_predictions(reg_flat, anchor_points, strides_flat)
                 decoded_scores = (cls_flat + obj_flat).sigmoid()
                 return decoded_boxes, decoded_scores
-        
-        # In training mode, just pass through
-        return self.qat_model(x)
+    
+    def train(self, mode: bool = True):
+        self.training = mode
+        self.qat_model.train(mode)
+        return super().train(mode)
+
+    def eval(self):
+        self.training = False
+        self.qat_model.eval()
+        return super().eval()
 
 
 # --- Validation, QAT, and ONNX Export ---
@@ -1239,7 +1252,7 @@ def main(argv: List[str] | None = None):
     pa.add_argument('--workers', type=int, default=0)
     pa.add_argument('--device', default=None)
     pa.add_argument('--out', default='picodet_int8_refactored.onnx')
-    pa.add_argument('--min_box_size', type=int, default=6, help="Minimum pixel width/height for a GT box to be used in training.")
+    pa.add_argument('--min_box_size', type=int, default=8, help="Minimum pixel width/height for a GT box to be used in training.")
     cfg = pa.parse_args(argv)
     BACKBONE_FREEZE_EPOCHS = 1
 
@@ -1270,7 +1283,7 @@ def main(argv: List[str] | None = None):
     sch = SequentialLR(opt, schedulers=[warmup, cosine], milestones=[warmup_iters])
     scaler = torch.amp.GradScaler(enabled=(dev.type == 'cuda'))
     
-    assigner = TaskAlignedAssigner(top_k=13)
+    assigner = TaskAlignedAssigner(top_k=13, alpha=1.0, beta=6.0, eps=1e-9)
     ema = ModelEMA(model, decay=0.999, device=dev)
     
     print(f"[INFO] Starting FP32 training for {cfg.epochs} epochs...")
@@ -1292,10 +1305,14 @@ def main(argv: List[str] | None = None):
         sch.step()
 
     print("\n[INFO] Preparing model for QAT...")
-    model.train()
+    
+    # First, copy the EMA weights to the main model for QAT
+    ema_model_for_qat = copy.deepcopy(model)
+    ema.copy_to(ema_model_for_qat)
+    ema_model_for_qat.train()
 
     # Disable inplace activations before QAT preparation
-    for module in model.modules():
+    for module in ema_model_for_qat.modules():
         if hasattr(module, 'inplace'):
             module.inplace = False
 
@@ -1305,10 +1322,10 @@ def main(argv: List[str] | None = None):
         size=(1, 3, IMG_SIZE, IMG_SIZE),
         dtype=torch.uint8
     )
-    qat_prepared_graph = qat_prepare(model, example)
+    qat_prepared_graph = qat_prepare(ema_model_for_qat, example)
     
     # Wrap the prepared graph to handle training/eval mode switching
-    qat_model = QATModelWrapper(model, qat_prepared_graph)
+    qat_model = QATModelWrapper(ema_model_for_qat, qat_prepared_graph)
     qat_model = qat_model.to(dev)
     
     # Prime the QAT observers by running several forward passes in training mode
@@ -1317,22 +1334,28 @@ def main(argv: List[str] | None = None):
     prime_count = 0
     with torch.no_grad():
         for i, (imgs, _) in enumerate(tr_loader):
-            if i >= 50: break
-            qat_model(imgs.to(dev))
-            if (i + 1) % 10 == 0: print(f"[INFO] Primed {i+1} batches...")
+            if i >= 100: break  # Increased from 50 to 100 for better calibration
+            try:
+                qat_model(imgs.to(dev))
+                if (i + 1) % 10 == 0: 
+                    print(f"[INFO] Primed {i+1} batches...")
+            except Exception as e:
+                print(f"[WARNING] Error during priming batch {i}: {e}")
+                continue
     print(f"[INFO] Primed QAT observers with {i+1} batches")
 
-    # Use AdamW with a low LR for more stable QAT finetuning
-    opt_q = torch.optim.AdamW(qat_model.parameters(), lr=1e-5, weight_decay=0)
+    # Use AdamW with a moderate LR for QAT finetuning
+    # QAT typically needs higher LR than 1e-5 to recover from quantization noise
+    opt_q = torch.optim.AdamW(qat_model.parameters(), lr=1e-4, weight_decay=1e-4)
     scheduler_q = torch.optim.lr_scheduler.CosineAnnealingLR(opt_q, T_max=cfg.qat_epochs, eta_min=1e-6)
     scaler_q = torch.amp.GradScaler(enabled=(dev.type == 'cuda'))
 
     print(f"[INFO] Starting QAT finetuning for {cfg.qat_epochs} epochs...")
     for qep in range(cfg.qat_epochs):
-        train_loss_q = train_epoch(qat_model, tr_loader, opt_q, scaler_q, assigner, dev, qep, cfg.qat_epochs, is_qat=True)
-        
-        # Validate using the QAT model
-        val_iou_q = quick_val_iou(qat_model, vl_loader, dev, epoch_num=qep)
+        qat_model.train()
+        train_loss_q = train_epoch(qat_model, tr_loader, opt_q, scaler_q, assigner, dev, qep, cfg.qat_epochs, debug_prints=debug_prints, is_qat=True)
+        qat_model.eval()
+        val_iou_q = quick_val_iou(qat_model, vl_loader, dev, epoch_num=qep, debug_prints=debug_prints)
         print(f"QAT Epoch {qep+1}/{cfg.qat_epochs} | Train Loss: {train_loss_q:.4f} | Val IoU: {val_iou_q:.4f}\n")
         scheduler_q.step()
 
@@ -1349,6 +1372,8 @@ def main(argv: List[str] | None = None):
     
     # The model to be converted is the inner fx.GraphModule
     int8_model_graph = convert_fx(copy.deepcopy(qat_model.qat_model))
+
+
 
     # For export, we need a simple wrapper that calls the converted graph
     # and then applies the post-processing (decoding) logic.

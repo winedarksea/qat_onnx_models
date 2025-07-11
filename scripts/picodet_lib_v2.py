@@ -243,14 +243,14 @@ class PicoDetHead(nn.Module):
         """
         MULTIPLY_LOGITS = False
         # classification branches
-        cls_prior = 0.02 if MULTIPLY_LOGITS else 0.01
+        cls_prior = 0.02 if MULTIPLY_LOGITS else 0.05
         cls_bias  = -math.log((1. - cls_prior) / cls_prior)      # –4.595, use -2.19 for multiplicative sigmoid
         for conv in self.cls_pred:
             if conv.bias is not None:
                 nn.init.constant_(conv.bias, cls_bias)
 
         # objectness branches   (neutral ⇒ bias = 0.0)
-        obj_prior = 0.1 if MULTIPLY_LOGITS else 0.5
+        obj_prior = 0.1 if MULTIPLY_LOGITS else 0.1
         obj_bias = -math.log((1 - obj_prior) / obj_prior)
         for conv in self.obj_pred:
             if conv.bias is not None:
@@ -531,6 +531,7 @@ def _get_dynamic_feat_chs(model: nn.Module, img_size: int, device: torch.device)
 def get_backbone(arch: str, ckpt: str | None, img_size: int = 224):
     pretrained = ckpt is None
     temp_device_for_init = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    arch_list = ["ssh_hybrid_s", "ssh_hybrid_s_bl", "ssh_hybrid_m", "ssh_hybrid_l", "conv-s", "conv-m", "conv-l", "conv-xl"]
 
     if arch == "mnv3":
         weights = MobileNet_V3_Small_Weights.IMAGENET1K_V1 if pretrained else None
@@ -594,7 +595,7 @@ def get_backbone(arch: str, ckpt: str | None, img_size: int = 224):
         feat_chs = tuple(info['num_chs'] for info in feature_info)
         print(f"[INFO] Detected feature channels: {feat_chs}")
         ckpt = "mobilenet_w1_0_mnv4c-m_pretrained_drp0_2_fp32_backbone.pt"
-    elif arch in ["ssh_hybrid_s", "ssh_hybrid_s_bl", "ssh_hybrid_m", "ssh_hybrid_l", "conv-l", "conv-xl"]:
+    elif arch in arch_list:
         net = MobileNetV4(
             variant=arch,
             width_multiplier=1.0,
@@ -602,7 +603,7 @@ def get_backbone(arch: str, ckpt: str | None, img_size: int = 224):
         )
         feature_info = net.get_feature_info()
         feat_chs = tuple(info['num_chs'] for info in feature_info)
-        print(f"[INFO] Detected feature channels: {feat_chs}")
+        print(f"[INFO] Detected feature channels: {feat_chs} for {arch}")
         ckpt = f"mobilenet_w1_0_{arch}_pretrained_drp0_2_fp32_backbone.pt"
     elif arch == "mnv4c":  # older but still functional
         if MobileNetV4ConvSmallPico is None:
@@ -628,7 +629,7 @@ def get_backbone(arch: str, ckpt: str | None, img_size: int = 224):
     else:
         raise ValueError(f'Unknown arch {arch}')
     
-    if arch in ["mnv4c", "mnv4c-s", "mnv4c-m"]:
+    if arch in ["mnv4c", "mnv4c-s", "mnv4c-m"] or arch in arch_list:
         if os.path.exists(ckpt):
             print(f"[INFO] Loading pre-trained backbone weights from: {ckpt}")
             backbone_sd = torch.load(ckpt, map_location='cpu')
@@ -640,7 +641,7 @@ def get_backbone(arch: str, ckpt: str | None, img_size: int = 224):
                 warnings.warn(f"Warning: Unexpected keys when loading backbone weights: {unexpected_keys}")
             print("[INFO] Successfully loaded backbone weights.")
         else:
-            print("[INFO] Initializing backbone with random weights (no checkpoint provided).")
+            print("[WARNING] Initializing backbone with random weights (no checkpoint provided).")
         
         # Now get the feature channel dimensions dynamically.
         # The custom backbone already returns a list of features, so no wrapper is needed.
