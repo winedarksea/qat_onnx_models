@@ -179,6 +179,7 @@ class SimOTACache:
                  topk: int = 10,
                  cls_cost_weight: float = 0.5,
                  debug_epochs: int = 0,         # 0 = silent
+                 dynamic_k_min: int = 2,
                  ):
         self.nc = nc
         self.r = ctr
@@ -190,7 +191,7 @@ class SimOTACache:
         self._dbg_iter = 0
         self.use_obj_logit = True
         self.simota_prefilter = False
-        self.dynamic_k_min = 2  # 3, or 1-2
+        self.dynamic_k_min = dynamic_k_min  # 3, or 1-2
         self.alpha = 0.0  # additive default
 
     # ------------------------------------------------------------
@@ -367,7 +368,7 @@ def train_epoch(
         dfl_project_buffer_for_decode: torch.Tensor,
         max_epochs: int = 500,
         quality_floor_vfl: float = 0.01,
-        w_cls_loss: float = 2.5,  # Slight reduction from 3.0, but not too aggressive
+        w_cls_loss: float = 3.0,
         w_obj_loss: float = 0.8,  # Moderate increase from 0.5
         w_iou_initial: float = 4.0, # Slight reduction from 5.0
         w_iou_final: float = 2.0,   # Final weight for IoU loss
@@ -427,6 +428,7 @@ def train_epoch(
             gt_labels_img = gt_labels_unfiltered
 
             if gt_boxes_unfiltered.numel() > 0:
+                assert (gt_labels_img < model.head.nc).all(), "Found an invalid class label index!"
                 widths = gt_boxes_unfiltered[:, 2] - gt_boxes_unfiltered[:, 0]
                 heights = gt_boxes_unfiltered[:, 3] - gt_boxes_unfiltered[:, 1]
                 epsilon_wh = 1e-3
@@ -434,6 +436,7 @@ def train_epoch(
                 gt_boxes_img = gt_boxes_unfiltered[valid_gt_mask]
                 gt_labels_img = gt_labels_unfiltered[valid_gt_mask]
 
+            # assert (gt_labels_img < model.head.nc).all()  # make sure labels aren't broken
             target_dict_for_assigner = {'boxes': gt_boxes_img, 'labels': gt_labels_img}
 
             if assigner.nc != head_nc_for_loss and i == 1:
@@ -494,18 +497,6 @@ def train_epoch(
                 head_reg_max_for_loss
             )
 
-            """
-            strides_all_anchors_img = torch.cat(
-                [torch.full((H_lvl * W_lvl,), float(s_lvl_val), device=device)
-                 for H_lvl, W_lvl, s_lvl_val in fmap_shapes], dim=0
-            )
-            strides_fg_img = strides_all_anchors_img[fg_mask_img].unsqueeze(-1)
-            anchor_centers_all_img = torch.cat(
-                [assigner.cache[(H_lvl, W_lvl, s_lvl_val, str(device))]
-                 for H_lvl, W_lvl, s_lvl_val in fmap_shapes], dim=0
-            )
-            anchor_centers_fg_img = anchor_centers_all_img[fg_mask_img]
-            """
             # build anchors & strides from the head buffers (always consistent)
             head_anchors_list  = []
             head_strides_list  = []
@@ -555,82 +546,69 @@ def train_epoch(
             ), dim=1)
             loss_iou = tvops.complete_box_iou_loss(pred_boxes_fg_img, box_targets_fg_img, reduction='sum') / num_fg_img
 
-            #########
-
-            loss_cls = torch.tensor(0.0, device=device)
-            loss_obj = torch.tensor(0.0, device=device)
-
-            if use_focal_loss:
-                alpha_focal, gamma = 0.25, 2.0
-
-                final_fg_indices = fg_mask_img.nonzero(as_tuple=False).squeeze(1)
-                gt_labels_final_fg = gt_labels[final_fg_indices]
-
-                cls_targets = torch.zeros_like(cls_p_img)
-                cls_targets[final_fg_indices, gt_labels_final_fg] = 1.0  # one-hot
+            ########
+            # Joint logits: always the same expression
+            joint_logits = cls_p_img + model.head.logit_scale * obj_p_img.unsqueeze(1)
             
+            # foreground indices for this image
+            pos_indices = fg_mask_img.nonzero(as_tuple=False).squeeze(1)  # (N_fg,)
+            
+            if pos_indices.numel() == 0:          # nothing to learn from this image
+                continue
+            
+            joint_logits_pos = joint_logits[pos_indices]          # (N_fg , C)
+            gt_labels_pos    = gt_labels[pos_indices]             # (N_fg ,)
+            
+            # ------------------------------------------------------------------
+            # 2. Classification loss
+            # ------------------------------------------------------------------
+            if use_focal_loss:          # warm-up path (plain BCE is fine here)
+                cls_targets_pos = torch.zeros_like(joint_logits_pos)
+                cls_targets_pos[
+                    torch.arange(gt_labels_pos.size(0), device=device),
+                    gt_labels_pos
+                ] = 1.0
+            
+                # mean over positives ⇒ gradients independent of batch size
+                loss_cls = F.binary_cross_entropy_with_logits(
+                               joint_logits_pos, cls_targets_pos, reduction='mean')
+                """
+                alpha_focal, gamma = 0.25, 2.0
                 loss_cls = tvops.sigmoid_focal_loss(
                     cls_p_img, cls_targets, alpha=alpha_focal, gamma=gamma, reduction='sum'
-                ) / loss_norm_factor                          # ← divide by #FG only
-                # -----------------------------------------------------------------
+                ) / loss_norm_factor    
+                """
             
-                # ---------- objectness / quality focal ---------------------------
-                qfl_targets = torch.zeros_like(obj_p_img)          # (A,)
-                qfl_targets[final_fg_indices] = gt_ious[final_fg_indices]
-
-                loss_obj = F.binary_cross_entropy_with_logits(
-                    obj_p_img, qfl_targets, reduction='sum'
-                ) / loss_norm_factor
-
-                current_sample_total_loss = loss_cls * w_cls_loss + w_obj_loss * loss_obj + loss_dfl + w_iou * loss_iou
-                # Store for printing the first sample's loss breakdown
-                if num_samples_with_loss_in_batch == 0 and total_samples_contributing_to_loss_epoch == 0:
-                    loss_cls_print, loss_obj_print, loss_dfl_print, loss_iou_print = \
-                        loss_cls.detach(), loss_obj.detach(), loss_dfl.detach(), loss_iou.detach()
-
-            else:  # Varifocal Loss path (final)
-                # — dynamic vfl alpha scheduling —
+            else:                       # Varifocal Loss proper
                 progress = epoch / max_epochs if max_epochs > 0 else 0.0
-                alpha_dyn = 0.15 + (0.5 - 0.15) * 0.5 * (1 - math.cos(math.pi * progress))  # Less aggressive
+                alpha_dyn = 0.15 + 0.35 * 0.5 * (1 - math.cos(math.pi * progress))
             
-                # sum‐reduction so we can normalize ourselves
-                vfl = VarifocalLoss(alpha=alpha_dyn, gamma=1.5, reduction='sum')  # Reduced gamma
+                quality_pos = torch.maximum(
+                    gt_ious[pos_indices], torch.tensor(quality_floor_vfl, device=device))
             
-                # — build “quality” targets: IoU for FG, 0 for BG —
-                quality_floor = torch.tensor(
-                    quality_floor_vfl, device=device, dtype=gt_ious.dtype
-                )
-                quality = torch.zeros_like(gt_ious, dtype=gt_ious.dtype, device=device)
-                quality[fg_mask_img] = torch.maximum(gt_ious[fg_mask_img], quality_floor)
+                # build compact target tensor (FG only)
+                vfl_targets_pos = torch.zeros_like(joint_logits_pos)
+                vfl_targets_pos[
+                    torch.arange(gt_labels_pos.size(0), device=device),
+                    gt_labels_pos
+                ] = quality_pos
             
-                # — joint logits for VFL —
-                # (cls + obj) broadcast-adds the objectness scalar to each class logit
-                # joint_logits = cls_p_img + obj_p_img.unsqueeze(1)  # (A, C)
-                # joint_logits = blend_joint_logit(cls_p_img, obj_p_img.unsqueeze(1), alpha)
-                # Use the learnable scaler from the head to combine logits for the loss.
-                # The optimizer will automatically tune this parameter.
-                joint_logits = cls_p_img + model.head.logit_scale * obj_p_img.unsqueeze(1)
+                vfl = VarifocalLoss(alpha=alpha_dyn, gamma=1.5, reduction='sum')
+                loss_cls = vfl(joint_logits_pos, vfl_targets_pos) / pos_indices.numel()
             
-                # — VFL targets: zero everywhere except FG[class] = quality —
-                vfl_targets = torch.zeros_like(joint_logits, dtype=joint_logits.dtype)
-                pos_idx = fg_mask_img.nonzero(as_tuple=False).squeeze(1)
-                vfl_targets[pos_idx, gt_labels[pos_idx]] = quality[pos_idx]
+            # Final sample loss (obj already inside joint_logits)
+            current_sample_total_loss = (
+                  w_cls_loss * loss_cls
+                + loss_dfl
+                + w_iou * loss_iou
+            )
             
-                # sum reduction + normalize by #FG
-                loss_vfl_unreduced = vfl(joint_logits, vfl_targets)
-                loss_vfl = loss_vfl_unreduced / num_fg_img
-
-                # — final sample loss —
-                w_vfl = w_cls_loss  # loss_obj not needed here as vfl combines it
-                current_sample_total_loss = (
-                    w_vfl  * loss_vfl
-                  + loss_dfl
-                  + w_iou * loss_iou
-                )
-                # relabel vfl as class loss here for simplicity
-                if num_samples_with_loss_in_batch == 0 and total_samples_contributing_to_loss_epoch == 0:
-                    loss_cls_print, loss_obj_print, loss_dfl_print, loss_iou_print = \
-                        loss_vfl.detach(), loss_obj.detach(), loss_dfl.detach(), loss_iou.detach()
+            # for the first sample in the epoch – diagnostics only
+            if num_samples_with_loss_in_batch == 0 and total_samples_contributing_to_loss_epoch == 0:
+                loss_cls_print = loss_cls.detach()
+                loss_obj_print = torch.tensor(0.0)
+                loss_dfl_print = loss_dfl.detach()
+                loss_iou_print = loss_iou.detach()
 
             batch_total_loss += current_sample_total_loss
             num_samples_with_loss_in_batch += 1
@@ -949,6 +927,10 @@ def quick_val_iou(
                 print(f"[Debug Eval Img {num_images_processed-1}] GTs: {len(gt_boxes_list)}. Score Thresh: {score_thresh}.")
                 print(f"  Num Preds BEFORE NMS (passed score_thresh): {debug_num_preds_before_nms_batch[i]}")
                 print(f"  Num Preds AFTER NMS (final): {num_actual_dets_this_img}")
+                
+                g = model.head.cls_pred[0].weight.grad
+                print('grad mean / std on cls_pred[0]:',
+                      g.abs().mean().item(), g.std().item())    
 
             if actual_predicted_boxes.numel() == 0: # No detections after NMS for this image
                 # image_avg_iou will effectively 0 for this image if we consider max_iou_per_gt
@@ -1429,6 +1411,7 @@ def main(argv: List[str] | None = None):
     BACKBONE_FREEZE_EPOCHS = 2 if cfg.epochs < 12 else 3  # 0 to disable
     use_focal_loss = False
     FOCAL_LOSS_WARMUP_EPOCHS = 5
+    OBJ_FREEZE_EPOCHS = 0
 
     if cfg.device is None:
         cfg.device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -1535,11 +1518,11 @@ def main(argv: List[str] | None = None):
     id2name = {v: coco_train_raw.coco.loadCats([k])[0]["name"] for k, v in coco_label_map.items()}  # noqa
 
     if True:
-        peak_lr_adamw = 5e-4  # Slightly more conservative peak LR (common starting point)
-        weight_decay_adamw = 0.01 # Standard AdamW weight decay
-        beta1_adamw = 0.9      # Standard AdamW beta1
-        beta2_adamw = 0.999    # Standard AdamW beta2
-        eps_adamw = 1e-8       # Standard AdamW epsilon
+        peak_lr_adamw = 2e-4
+        weight_decay_adamw = 0.02
+        beta1_adamw = 0.9
+        beta2_adamw = 0.999
+        eps_adamw = 1e-8
 
         warmup_epochs_adamw = max(1, cfg.epochs // 10) if cfg.epochs >=5 else 1 # e.g., 1 epoch for 10 total epochs.
         cosine_decay_to_fraction_adamw = 0.01 # Decay to 1% of peak_lr_adamw
@@ -1553,7 +1536,9 @@ def main(argv: List[str] | None = None):
             if not param.requires_grad:
                 continue
             # Norm layers, biases, and sometimes embedding layers don't use weight decay
-            if len(param.shape) == 1 or name.endswith(".bias") or "norm" in name.lower() or "bn" in name.lower():
+            if ('cls_pred' in name) or ('obj_pred' in name):
+                param_groups[1]['params'].append(param)   # ← goes to no-decay bucket
+            elif len(param.shape) == 1 or name.endswith('.bias') or 'norm' in name.lower():  #  or "bn" in name.lower()
                 param_groups[1]['params'].append(param)
             else:
                 param_groups[0]['params'].append(param)
@@ -1611,12 +1596,16 @@ def main(argv: List[str] | None = None):
         )
     scaler = torch.amp.GradScaler(enabled=dev.type == 'cuda')
 
+    DYN_K_MIN = 2
+    CLS_WEIGHT = 4.0
+    CLS_WEIGHT = 3.0 if use_focal_loss else CLS_WEIGHT
     assigner = SimOTACache(
         nc=model.head.nc,
         ctr=2.6,  # 2.5
         topk=11,  # 10
-        cls_cost_weight=2.0 if use_focal_loss else 3.0,  # Increased to emphasize classification
+        cls_cost_weight=CLS_WEIGHT,  # Increased to emphasize classification
         debug_epochs=5 if debug_prints else 0,
+        dynamic_k_min=DYN_K_MIN,
     )
 
 
@@ -1635,7 +1624,23 @@ def main(argv: List[str] | None = None):
             for p in model.backbone.parameters():
                 p.requires_grad = True
             print("[INFO] Backbone unfrozen – full network now training")
-        
+
+        if ep < OBJ_FREEZE_EPOCHS:
+            # This block will execute for epoch 0
+            if ep == 0:  # Print the message only once
+                print(f"[INFO] Epoch {ep}: Freezing objectness prediction head (obj_pred)...")
+            
+            # The target is model.head.obj_pred, which is an nn.ModuleList
+            for module in model.head.obj_pred:
+                for param in module.parameters():
+                    param.requires_grad = False
+        elif ep == OBJ_FREEZE_EPOCHS:
+            # This block will execute only once
+            print(f"[INFO] Epoch {ep}: Unfreezing objectness prediction head (obj_pred)...")
+            for module in model.head.obj_pred:
+                for param in module.parameters():
+                    param.requires_grad = True
+
         # Check if we need to advance to the next stage in the curriculum
         if current_stage_idx < len(curriculum_schedule) - 1:
             stage_duration, _ = curriculum_schedule[current_stage_idx]
@@ -1653,10 +1658,16 @@ def main(argv: List[str] | None = None):
         ##########
         if FOCAL_LOSS_WARMUP_EPOCHS is not None:
             use_focal_loss_for_epoch = ep < FOCAL_LOSS_WARMUP_EPOCHS
+            if use_focal_loss_for_epoch:
+                assigner.dynamic_k_min = 4
+                assigner.cls_cost_weight = 5.0
             if ep == FOCAL_LOSS_WARMUP_EPOCHS:
                 print("[INFO] Switching from Focal Loss warmup to Varifocal Loss for subsequent epochs.")
+                assigner.dynamic_k_min = DYN_K_MIN
+                assigner.cls_cost_weight = CLS_WEIGHT
         else:
             use_focal_loss_for_epoch = use_focal_loss
+            
 
         model.train()
         alpha = 0.0  # min(0.9, ep / alpha_warmup_epochs)
@@ -1667,10 +1678,11 @@ def main(argv: List[str] | None = None):
             head_reg_max_for_loss=original_model_head_reg_max,
             dfl_project_buffer_for_decode=original_dfl_project_buffer,
             max_epochs=cfg.epochs, # Pass total epochs for VFL alpha scheduling
-            quality_floor_vfl=0.02,
+            quality_floor_vfl=0.02,  # try sometime 0.15
             debug_prints=debug_prints,
             alpha=alpha,
             use_focal_loss=use_focal_loss_for_epoch,
+            w_cls_loss=CLS_WEIGHT,
         )
         # ... (validation) ...
         model.eval()
@@ -1790,6 +1802,7 @@ def main(argv: List[str] | None = None):
             iou_weight_change_epoch=2,
             debug_prints=False,
             alpha=0.0,
+            w_cls_loss=CLS_WEIGHT,
             use_focal_loss=use_focal_loss,
         )
         scheduler_q.step() # Step the QAT LR scheduler
