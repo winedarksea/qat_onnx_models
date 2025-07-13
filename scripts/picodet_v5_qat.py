@@ -619,22 +619,28 @@ def train_epoch(
                 ) / loss_norm_factor    
                 """
             
-            else:                       # Varifocal Loss proper
-                progress = epoch / max_epochs if max_epochs > 0 else 0.0
-                alpha_dyn = 0.15 + 0.35 * 0.5 * (1 - math.cos(math.pi * progress))
-            
-                quality_pos = torch.maximum(
-                    gt_ious[pos_indices], torch.tensor(quality_floor_vfl, device=device))
-            
-                # build compact target tensor (FG only)
-                vfl_targets_pos = torch.zeros_like(joint_logits_pos)
-                vfl_targets_pos[
-                    torch.arange(gt_labels_pos.size(0), device=device),
-                    gt_labels_pos
-                ] = quality_pos
-            
-                vfl = VarifocalLoss(alpha=alpha_dyn, gamma=1.5, reduction='sum')
-                loss_cls = vfl(joint_logits_pos, vfl_targets_pos) / pos_indices.numel()
+            else:                       # Varifocal Loss proper            
+                progress   = epoch / max_epochs if max_epochs > 0 else 0.0
+                alpha_dyn  = 0.15 + 0.35 * 0.5 * (1 - math.cos(math.pi * progress))
+                print(f"alpha_dyn is {alpha_dyn}")
+                vfl = VarifocalLoss(alpha=alpha_dyn, gamma=1.5, reduction='none')
+                
+                # foreground targets and loss
+                quality_pos = torch.maximum(gt_ious[pos_indices],
+                                                 torch.tensor(quality_floor_vfl, device=device))
+                vfl_t_pos = torch.zeros_like(joint_logits_pos)
+                vfl_t_pos[torch.arange(pos_indices.size(0), device=device),
+                          gt_labels[pos_indices]] = quality_pos
+                loss_fg = vfl(joint_logits_pos, vfl_t_pos).mean()   # average over FG
+                
+                # background targets and loss
+                bg_mask = ~fg_mask_img
+                joint_logits_bg = joint_logits[bg_mask]
+                vfl_t_bg = torch.zeros_like(joint_logits_bg)     # all-zero targets
+                loss_bg = vfl(joint_logits_bg, vfl_t_bg).mean()          # average over BG
+                
+                # final (already balanced) classification loss
+                loss_cls = loss_fg + loss_bg
             
             # Final sample loss (obj already inside joint_logits)
             current_sample_total_loss = (
