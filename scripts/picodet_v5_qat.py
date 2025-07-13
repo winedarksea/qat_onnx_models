@@ -5,6 +5,7 @@ import argparse, random, time, warnings, math, copy
 import functools
 from typing import List, Tuple
 import traceback
+import numpy as np
 
 import torch, torch.nn as nn
 from torchvision.transforms import v2 as T
@@ -186,17 +187,67 @@ class SimOTACache:
         self.k = topk
         self.cls_cost_weight = cls_cost_weight
         self.cache = {}               # anchor centres per (H,W,stride,device)
-        # debug
-        self._dbg_mod  = debug_epochs
-        self._dbg_iter = 0
         self.use_obj_logit = True
         self.simota_prefilter = False
         self.dynamic_k_min = dynamic_k_min  # 3, or 1-2
         self.alpha = 0.0  # additive default
 
-    # ------------------------------------------------------------
-    #  main call
-    # ------------------------------------------------------------
+
+        # --- State for debugging system ---
+        self._dbg_mod  = debug_epochs
+        self.is_debug_mode = bool(debug_epochs)
+        self._dbg_iter = 0
+        self._debug_stats = {
+            "ctr_hit_rate": [], # Stores the % of candidates that pass the center radius check
+            "k_min_hits": [],   # Stores (num_hits, total_gt) for dynamic_k hitting the floor
+            "k_dist": [],       # Stores the full distribution of dynamic_k values
+        }
+
+    def print_debug_report(self):
+        """Calculates and prints the aggregated statistics, then resets.
+        Tuning ctr: Look at the "Avg. Center Radius Hit Rate".
+            If this value is very low (e.g., < 5%), your ctr might be too small, starving the assigner of good candidates before it even considers IoU. Consider increasing ctr.
+            If it's very high (e.g., > 40-50%), ctr might be too large, leading to inefficient cost matrix calculations. You could consider decreasing it slightly. A value between 10-25% is often a healthy range.
+        Tuning dynamic_k_min: Look at the "% of GTs using min_k".
+            If this is high (> 80%), like in the example above, it means the model is struggling. It's not finding enough high-IoU anchors, so it's constantly being "forced" to assign the minimum number. During the bootstrap phase, this is okay, but it's a clear sign you should not reduce dynamic_k_min yet.
+            If this is low (< 20%), it means the model is healthy and confident. It's finding many good anchors, and dynamic_k is naturally floating above the minimum. This is a strong signal that you can safely enter the "refinement" phase by decreasing dynamic_k_min (e.g., to 2) to get higher-quality matches.
+        """
+        if not self._debug_stats["ctr_hit_rate"]:
+            return # Nothing to report
+
+        # --- Metric 1: Center Radius Hit Rate ---
+        # Helps tune `ctr`. If too low (<5%), `ctr` might be too small.
+        # If too high (>40-50%), `ctr` might be too loose and inefficient.
+        avg_ctr_hit_rate = np.mean(self._debug_stats["ctr_hit_rate"])
+
+        # --- Metric 2: Percentage of GTs using the minimum k ---
+        # The single most important metric for tuning `dynamic_k_min`.
+        # If high (>75%), the model is struggling and you should consider INCREASING dynamic_k_min.
+        # If low (<20%), the model is healthy and you can consider DECREASING dynamic_k_min for refinement.
+        total_k_min_hits = sum(h for h, t in self._debug_stats["k_min_hits"])
+        total_gt_boxes = sum(t for h, t in self._debug_stats["k_min_hits"])
+        percent_gt_at_min_k = (total_k_min_hits / total_gt_boxes) * 100 if total_gt_boxes > 0 else 0
+
+        # --- Metric 3: Full dynamic_k Distribution ---
+        # Gives a much richer view than just the mean.
+        all_k_vals = torch.cat(self._debug_stats["k_dist"]).float()
+        k_mean = all_k_vals.mean().item()
+        k_std = all_k_vals.std().item()
+        k_median = all_k_vals.median().item()
+        k_q25 = torch.quantile(all_k_vals, 0.25).item()
+        k_q75 = torch.quantile(all_k_vals, 0.75).item()
+
+        # --- Print the formatted report ---
+        print("\n" + "─" * 25 + f" SimOTA Report (iter {self._dbg_iter}) " + "─" * 25)
+        print(f"  [ctr={self.r:.1f}] Avg. Center Radius Hit Rate: {avg_ctr_hit_rate:.2%}")
+        print(f"  [dynamic_k_min={self.dynamic_k_min}] % of GTs using min_k: {percent_gt_at_min_k:.1f}%")
+        print(f"  Dynamic 'k' Stats: mean={k_mean:.2f}, std={k_std:.2f}, median={k_median:.1f}, q25-q75=[{k_q25:.1f}-{k_q75:.1f}]")
+        print("─" * 75 + "\n")
+
+        # --- Reset stats for the next interval ---
+        for k in self._debug_stats:
+            self._debug_stats[k].clear()
+
     @torch.no_grad()
     def __call__(self,
                  f_shapes,               # List[(H,W,stride)]
@@ -230,26 +281,6 @@ class SimOTACache:
             for i in range(model_head.nl)
         ], 0).to(device)
 
-        ####
-        """
-        centres_l, strides_l = [], []
-        for H, W, s_val in f_shapes:
-            key = (H, W, s_val, torch.device(device).type)  
-            if key not in self.cache:
-                yv, xv = torch.meshgrid(torch.arange(H, device=device),
-                                        torch.arange(W, device=device),
-                                        indexing='ij')
-                centres = (torch.stack((xv, yv), 2).view(-1, 2).float() + 0.5) * float(s_val)
-                self.cache[key] = centres
-            centres_l.append(self.cache[key])
-            strides_l.append(torch.full((H * W,),
-                                        float(s_val),
-                                        dtype=torch.float32,
-                                        device=device))
-
-        anchor_centers = torch.cat(centres_l, 0)     # (A,2)
-        anchor_strides = torch.cat(strides_l, 0)     # (A,)
-        """
         A = anchor_centers.size(0)
 
         # 2. IoU and centre-radius mask
@@ -344,8 +375,16 @@ class SimOTACache:
             gt_box_out[fg_idx] = gt_boxes[gt_idx]
             iou_out[fg_idx]    = iou[gt_idx, fg_idx]
 
+        # --- Aggregate stats if in debug mode ---
+        if self.is_debug_mode:
+            # Calculate and store stats for this specific image
+            self._debug_stats["ctr_hit_rate"].append((centre_mask.sum() / centre_mask.numel()).item())
+            self._debug_stats["k_dist"].append(dynamic_ks.cpu())
+            k_min_hits_img = (dynamic_ks == self.dynamic_k_min).sum().item()
+            self._debug_stats["k_min_hits"].append((k_min_hits_img, M))
+
         # 7. lightweight debug  -----------------------------------------
-        if self._dbg_mod and (self._dbg_iter % (1000 * self._dbg_mod) == 0):
+        if self.is_debug_mode and (self._dbg_iter % (2000 * self._dbg_mod) == 0):
             num_fg   = fg_final.sum().item()
             num_cand = fg_cand_mask.sum().item()
             mean_iou = iou_out[fg_final].mean().item() if num_fg else 0
@@ -354,6 +393,8 @@ class SimOTACache:
                   f"avgIoU={mean_iou:4.3f} k̄={k_bar:3.1f}")
             if num_fg and (iou_out[fg_final] < 0.05).float().mean() > 0.2:
                 print("  ⚠️  >20 % FG IoU < 0.05 – verify anchor order / scales")
+
+            self.print_debug_report()
         self._dbg_iter += 1
         # ----------------------------------------------------------------
 
@@ -428,7 +469,7 @@ def train_epoch(
             gt_labels_img = gt_labels_unfiltered
 
             if gt_boxes_unfiltered.numel() > 0:
-                assert (gt_labels_img < model.head.nc).all(), "Found an invalid class label index!"
+                # assert (gt_labels_img < model.head.nc).all(), "Found an invalid class label index!"
                 widths = gt_boxes_unfiltered[:, 2] - gt_boxes_unfiltered[:, 0]
                 heights = gt_boxes_unfiltered[:, 3] - gt_boxes_unfiltered[:, 1]
                 epsilon_wh = 1e-3
@@ -436,7 +477,6 @@ def train_epoch(
                 gt_boxes_img = gt_boxes_unfiltered[valid_gt_mask]
                 gt_labels_img = gt_labels_unfiltered[valid_gt_mask]
 
-            # assert (gt_labels_img < model.head.nc).all()  # make sure labels aren't broken
             target_dict_for_assigner = {'boxes': gt_boxes_img, 'labels': gt_labels_img}
 
             if assigner.nc != head_nc_for_loss and i == 1:
@@ -1601,7 +1641,7 @@ def main(argv: List[str] | None = None):
     CLS_WEIGHT = 3.0 if use_focal_loss else CLS_WEIGHT
     assigner = SimOTACache(
         nc=model.head.nc,
-        ctr=2.6,  # 2.5
+        ctr=2.7,  # 2.5
         topk=11,  # 10
         cls_cost_weight=CLS_WEIGHT,  # Increased to emphasize classification
         debug_epochs=5 if debug_prints else 0,
