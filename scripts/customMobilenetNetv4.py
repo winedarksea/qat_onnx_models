@@ -182,10 +182,9 @@ class SSM2D(nn.Module):
         self.d_conv = d_conv
 
         # 1. Input Projection
-        self.in_proj = nn.Sequential(
-            nn.Conv2d(in_channels, self.d_inner, kernel_size=1),
-            nn.BatchNorm2d(self.d_inner),
-        )
+        self.in_proj = nn.Conv2d(in_channels, self.d_inner, kernel_size=1)
+        self.norm = nn.BatchNorm2d(self.d_inner)
+
 
         # 2. 2D Selective Scan (implemented as four parallel 1D causal convolutions)
         # We use separate convolutions for each of the 4 directions
@@ -215,7 +214,8 @@ class SSM2D(nn.Module):
     def forward(self, x):
         B, C, H, W = x.shape
     
-        x_proj = F.silu(self.in_proj(x))
+        x_proj = self.in_proj(x)
+        x_proj = F.silu(self.norm(x_proj))
     
         # horizontal scans
         h_fwd = self.conv_h_fwd(x_proj)[..., :W]                        # (B,C,H,W)
@@ -242,9 +242,6 @@ class MNV4_SSHybridBlock(nn.Module):
         assert stride == 1, "SSHybridBlock currently only supports stride 1"
         self.use_residual = in_channels == out_channels
         self.drop_path = DropPath(drop_path_rate) if drop_path_rate > 0. else nn.Identity()
-
-        # Use BatchNorm2d for normalization, which is NPU-friendly
-        self.norm = nn.BatchNorm2d(in_channels)
         
         # The core State Space Model, now fully convolutional
         self.ssm = SSM2D(in_channels=in_channels, **kwargs)
@@ -255,8 +252,7 @@ class MNV4_SSHybridBlock(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (B, C, H, W)
         shortcut = x
-        
-        x = self.norm(x)
+
         x = self.ssm(x)
         x = self.proj_conv(x) # Project if needed
         
