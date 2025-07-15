@@ -384,7 +384,7 @@ class SimOTACache:
             self._debug_stats["k_min_hits"].append((k_min_hits_img, M))
 
         # 7. lightweight debug  -----------------------------------------
-        if self.is_debug_mode and (self._dbg_iter % (2000 * self._dbg_mod) == 0):
+        if self.is_debug_mode and (self._dbg_iter % (3000 * self._dbg_mod) == 0):
             num_fg   = fg_final.sum().item()
             num_cand = fg_cand_mask.sum().item()
             mean_iou = iou_out[fg_final].mean().item() if num_fg else 0
@@ -603,15 +603,29 @@ def train_epoch(
             # 2. Classification loss
             # ------------------------------------------------------------------
             if use_focal_loss:          # warm-up path (plain BCE is fine here)
-                cls_targets_pos = torch.zeros_like(joint_logits_pos)
-                cls_targets_pos[
-                    torch.arange(gt_labels_pos.size(0), device=device),
-                    gt_labels_pos
-                ] = 1.0
-            
-                # mean over positives ⇒ gradients independent of batch size
-                loss_cls = F.binary_cross_entropy_with_logits(
-                               joint_logits_pos, cls_targets_pos, reduction='mean')
+                cls_logits_pos = cls_p_img[pos_indices]
+                gt_labels_pos = gt_labels[pos_indices]
+                # Create one-hot targets for the foreground predictions
+                cls_targets_pos = torch.zeros_like(cls_logits_pos)
+                cls_targets_pos[torch.arange(num_fg_img, device=device), gt_labels_pos] = 1.0
+                # Use torchvision's numerically stable and reliable focal loss.
+                # It's normalized by the number of positive anchors, as is standard.
+                loss_cls = tvops.sigmoid_focal_loss(
+                    cls_logits_pos,
+                    cls_targets_pos,
+                    alpha=0.25,  # Standard value to balance positive/negative examples
+                    gamma=2.0,   # Standard value to focus on hard examples
+                    reduction='sum'
+                ) / loss_norm_factor
+                # 2. Objectness Loss (Binary Cross-Entropy)
+                # Applied to ALL anchors (foreground and background).
+                obj_targets = torch.zeros_like(obj_p_img)
+                # For foreground anchors, the target is their IoU with the matched GT box.
+                # This teaches the model that higher IoU boxes are "more object".
+                obj_targets[fg_mask_img] = gt_ious[fg_mask_img]
+                # Use standard BCE with logits, averaged over all anchors.
+                loss_obj = F.binary_cross_entropy_with_logits(obj_p_img, obj_targets, reduction='mean')
+
                 """
                 alpha_focal, gamma = 0.25, 2.0
                 loss_cls = tvops.sigmoid_focal_loss(
@@ -622,7 +636,7 @@ def train_epoch(
             else:                       # Varifocal Loss proper            
                 progress   = epoch / max_epochs if max_epochs > 0 else 0.0
                 alpha_dyn  = 0.15 + 0.35 * 0.5 * (1 - math.cos(math.pi * progress))
-                print(f"alpha_dyn is {alpha_dyn}")
+                # print(f"alpha_dyn is {alpha_dyn}")
                 vfl = VarifocalLoss(alpha=alpha_dyn, gamma=1.5, reduction='none')
                 
                 # foreground targets and loss
@@ -641,12 +655,14 @@ def train_epoch(
                 
                 # final (already balanced) classification loss
                 loss_cls = loss_fg + loss_bg
+                loss_obj = torch.tensor(0.0, device=device)
             
             # Final sample loss (obj already inside joint_logits)
             current_sample_total_loss = (
                   w_cls_loss * loss_cls
                 + loss_dfl
                 + w_iou * loss_iou
+                + w_iou_final * loss_obj
             )
             
             # for the first sample in the epoch – diagnostics only
@@ -1456,7 +1472,7 @@ def main(argv: List[str] | None = None):
     debug_prints = True
     BACKBONE_FREEZE_EPOCHS = 2 if cfg.epochs < 12 else 3  # 0 to disable
     use_focal_loss = False
-    FOCAL_LOSS_WARMUP_EPOCHS = 5
+    FOCAL_LOSS_WARMUP_EPOCHS = 6
     OBJ_FREEZE_EPOCHS = 0
 
     if cfg.device is None:
@@ -1465,13 +1481,27 @@ def main(argv: List[str] | None = None):
     print(f'[INFO] device = {dev}')
 
     backbone, feat_chs = get_backbone(cfg.arch, ckpt=None, img_size=IMG_SIZE) # Pass img_size
+    if IMG_SIZE < 320:
+        out_ch = 96
+        lat_k = 3
+        cls_conv_depth = 2
+    elif IMG_SIZE < 512:
+        out_ch = 96
+        lat_k = 3
+        cls_conv_depth = 3
+    else:
+        out_ch = 128
+        lat_k = 5
+        cls_conv_depth = 3
     model = PicoDet(
         backbone, 
         feat_chs,
         num_classes=80, 
-        neck_out_ch=128,  # 96
+        neck_out_ch=out_ch,  # 96
         img_size=IMG_SIZE,
         head_reg_max=8 if IMG_SIZE < 320 else (2 * math.ceil(IMG_SIZE / 128) + 3),
+        cls_conv_depth=cls_conv_depth,
+        lat_k=lat_k,
         inplace_act_for_head_neck=not cfg.no_inplace_head_neck # Control from arg
     ).to(dev)
 

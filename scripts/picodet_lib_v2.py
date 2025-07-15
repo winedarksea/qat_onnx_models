@@ -103,10 +103,10 @@ class CSPBlock(nn.Module):
 
 # ───────────────────────────── neck ────────────────────────────────
 class CSPPAN(nn.Module):
-    def __init__(self, in_chs=(40, 112, 160), out_ch=96, inplace_act: bool = False): # out_ch=64 would be faster than 96
+    def __init__(self, in_chs=(40, 112, 160), out_ch=96, lat_k=5, inplace_act: bool = False): # out_ch=64 would be faster than 96
         super().__init__()
         self.reduce = nn.ModuleList([GhostConv(c, out_ch, 1, inplace_act=inplace_act) for c in in_chs])
-        self.lat    = nn.ModuleList([DWConv(out_ch, k=5, inplace_act=inplace_act) for _ in in_chs[:-1]])
+        self.lat    = nn.ModuleList([DWConv(out_ch, k=lat_k, inplace_act=inplace_act) for _ in in_chs[:-1]])
         lst_ly = len(in_chs) - 1
         self.out = nn.ModuleList([
             CSPBlock(out_ch, n=2 if i == lst_ly else 1, m_k = 3 if i == lst_ly else 1, inplace_act=inplace_act) for i in range(len(in_chs))
@@ -180,6 +180,7 @@ class PicoDetHead(nn.Module):
                  score_thresh: float = 0.05, 
                  nms_iou: float = 0.6,
                  img_size: int = 224,
+                 cls_conv_depth: int = 3,  # 2
                  inplace_act: bool = False):
         super().__init__()
         self.nc = num_classes
@@ -189,7 +190,7 @@ class PicoDetHead(nn.Module):
         self.score_th = score_thresh
         self.iou_th = nms_iou
         self.reg_conv_depth = 2
-        self.cls_conv_depth = 3  # 2
+        self.cls_conv_depth = cls_conv_depth
         first_cls_conv_k = 3  # 1
 
         strides_tensor = torch.tensor([8, 16, 32][:num_levels], dtype=torch.float32)
@@ -207,7 +208,7 @@ class PicoDetHead(nn.Module):
                 GhostConv(num_feats, num_feats, k=first_cls_conv_k, inplace_act=inplace_act),
                 *[GhostConv(num_feats, num_feats, inplace_act=inplace_act) for _ in range(self.cls_conv_depth - 1)]
             )
-        self.reg_conv = nn.Sequential(*[GhostConv(num_feats, num_feats, inplace_act=inplace_act) for _ in range(self.reg_conv_depth)])
+        self.reg_conv = nn.Sequential(*[GhostConv(num_feats, num_feats, ratio=3.0, inplace_act=inplace_act) for _ in range(self.reg_conv_depth)])
         self.cls_pred = nn.ModuleList([nn.Conv2d(num_feats, self.nc, 1) for _ in range(self.nl)])
         self.obj_pred = nn.ModuleList([nn.Conv2d(num_feats, 1, 1) for _ in range(self.nl)])
         self.reg_pred = nn.ModuleList(
@@ -366,11 +367,13 @@ class PicoDet(nn.Module):
                  head_max_det: int = 100, # Will be used by ONNX NMS logic
                  head_score_thresh: float = 0.05, # Will be used by ONNX NMS logic
                  head_nms_iou: float = 0.6, # Will be used by ONNX NMS logic
+                 cls_conv_depth: int = 3,
+                 lat_k: int = 5,
                  inplace_act_for_head_neck: bool = False):
         super().__init__()
         self.pre = ResizeNorm(size=(img_size, img_size)) 
         self.backbone = backbone
-        self.neck = CSPPAN(in_chs=feat_chs, out_ch=neck_out_ch, inplace_act=inplace_act_for_head_neck)
+        self.neck = CSPPAN(in_chs=feat_chs, out_ch=neck_out_ch, lat_k=lat_k, inplace_act=inplace_act_for_head_neck)
         num_fpn_levels = len(feat_chs)
         self.debug_count = 0
         
@@ -383,7 +386,8 @@ class PicoDet(nn.Module):
             score_thresh=head_score_thresh,
             nms_iou=head_nms_iou,
             img_size=img_size,
-            inplace_act=inplace_act_for_head_neck
+            cls_conv_depth=cls_conv_depth,
+            inplace_act=inplace_act_for_head_neck,
         )
 
     def forward(self, x: torch.Tensor):
