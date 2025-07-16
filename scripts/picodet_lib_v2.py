@@ -535,7 +535,7 @@ def _get_dynamic_feat_chs(model: nn.Module, img_size: int, device: torch.device)
 def get_backbone(arch: str, ckpt: str | None, img_size: int = 224):
     pretrained = ckpt is None
     temp_device_for_init = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    arch_list = ["ssh_hybrid_s", "ssh_hybrid_s_bl", "ssh_hybrid_m", "ssh_hybrid_l", "conv-s", "conv-m", "conv-l", "conv-xl"]
+    arch_list = ["ssh_hybrid_s", "ssh_hybrid_s_bl", "ssh_hybrid_m", "ssh_hybrid_l", "conv_s", "conv_m", "conv_l", "conv_xl"]
 
     if arch == "mnv3":
         weights = MobileNet_V3_Small_Weights.IMAGENET1K_V1 if pretrained else None
@@ -592,7 +592,7 @@ def get_backbone(arch: str, ckpt: str | None, img_size: int = 224):
         net = MobileNetV4(
             variant='conv_m',
             width_multiplier=1.0,
-            out_features_names=['p2_s4', 'p3_s8', 'p4_s16', 'p5_s32'],
+            out_features_names=['p2_s4', 'p3_s8', 'p4_s16', 'p5_s32'],  # might break without CSPPAN change
             features_only=True,
         )
         feature_info = net.get_feature_info()
@@ -603,6 +603,7 @@ def get_backbone(arch: str, ckpt: str | None, img_size: int = 224):
         net = MobileNetV4(
             variant=arch,
             width_multiplier=1.0,
+            out_features_names=['p3_s8', 'p4_s16', 'p5_s32'],
             features_only=True,
         )
         feature_info = net.get_feature_info()

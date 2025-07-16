@@ -637,7 +637,7 @@ def train_epoch(
                 progress   = epoch / max_epochs if max_epochs > 0 else 0.0
                 alpha_dyn  = 0.15 + 0.35 * 0.5 * (1 - math.cos(math.pi * progress))
                 # print(f"alpha_dyn is {alpha_dyn}")
-                vfl = VarifocalLoss(alpha=alpha_dyn, gamma=1.5, reduction='none')
+                vfl = VarifocalLoss(alpha=alpha_dyn, gamma=1.7, reduction='none')
                 
                 # foreground targets and loss
                 quality_pos = torch.maximum(gt_ious[pos_indices],
@@ -903,13 +903,14 @@ def apply_nms_and_padding_to_raw_outputs_with_debug( # Renamed
 
 @torch.no_grad()
 def quick_val_iou(
-    model: PicoDet, # Assuming PicoDet or a compatible model
+    model: nn.Module, # Use generic nn.Module to indicate it handles different model types
     loader, device,
-    score_thresh: float, # Passed in for this specific evaluation run
-    iou_thresh: float,   # Passed in for this specific evaluation run (NMS IoU)
-    max_detections: int, # Passed in for this specific evaluation run
-    epoch_num: int = -1, # Optional: for logging
-    run_name: str = "N/A", # Optional: for logging if you have multiple eval runs
+    score_thresh: float,
+    iou_thresh: float,
+    max_detections: int,
+    iou_match_thresh: float = 0.5, # Threshold to consider a prediction "correctly localized"
+    epoch_num: int = -1,
+    run_name: str = "N/A",
     debug_prints: bool = True,
 ):
     model.eval()
@@ -917,8 +918,12 @@ def quick_val_iou(
     num_images_with_gt = 0
     num_images_processed = 0
     total_gt_boxes_across_images = 0
-    total_preds_before_nms_filter_across_images = 0 # Anchors above score_thresh (before NMS)
-    total_preds_after_nms_filter_across_images = 0  # Detections after NMS & final filter
+    total_preds_before_nms_filter_across_images = 0
+    total_preds_after_nms_filter_across_images = 0
+
+    # Add counters for classification accuracy
+    total_matched_preds = 0
+    correctly_classified_preds = 0
 
     if debug_prints:
         print(f"\n--- quick_val_iou Start (Epoch: {epoch_num}, Run: {run_name}) ---")
@@ -926,98 +931,76 @@ def quick_val_iou(
 
     for batch_idx, (imgs_batch, tgts_batch) in enumerate(loader):
         raw_pred_boxes_batch, raw_pred_scores_batch = model(imgs_batch.to(device))
-        # raw_pred_boxes_batch: (B, Total_Anchors, 4)
-        # raw_pred_scores_batch: (B, Total_Anchors, NC)
 
-        # DEBUG: Print shapes of raw model outputs for the first batch
         if debug_prints and batch_idx == 0:
             print(f"[Debug Eval Batch 0] raw_pred_boxes_batch shape: {raw_pred_boxes_batch.shape}")
             print(f"[Debug Eval Batch 0] raw_pred_scores_batch shape: {raw_pred_scores_batch.shape}")
-
-            print(f"[DEBUG] batch {batch_idx}")
-            print("  images  :", imgs_batch.shape, imgs_batch.dtype, imgs_batch.min().item(), imgs_batch.max().item())
             bb = tgts_batch[0]["boxes"]
-            print("  boxes   :", bb.shape, "format:", getattr(bb, 'format', 'tensor'), "sample:", bb[:4])
+            print(f"  [DEBUG] batch {batch_idx} images: {imgs_batch.shape}, boxes: {bb.shape}, sample: {bb[:2]}")
 
-        # Apply NMS and padding to raw outputs
-        # This function itself needs to use the passed score_thresh and iou_thresh
-        # It returns padded outputs and also needs to give us info for debugging
         (pred_boxes_batch_padded,
          pred_scores_batch_padded,
          pred_labels_batch_padded,
-         debug_num_preds_before_nms_batch, # List of counts per image in batch
-         debug_num_preds_after_nms_batch   # List of counts per image in batch
-         ) = apply_nms_and_padding_to_raw_outputs_with_debug( # MODIFIED FUNCTION CALL
+         debug_num_preds_before_nms_batch,
+         debug_num_preds_after_nms_batch
+         ) = apply_nms_and_padding_to_raw_outputs_with_debug(
                 raw_pred_boxes_batch, raw_pred_scores_batch,
                 score_thresh, iou_thresh, max_detections
             )
-        
+
         total_preds_before_nms_filter_across_images += sum(debug_num_preds_before_nms_batch)
 
-        for i in range(imgs_batch.size(0)): # Iterate through images in the batch
+        for i in range(imgs_batch.size(0)):
             num_images_processed += 1
             current_img_annots_raw = tgts_batch[i]
-            boxes_xyxy = current_img_annots_raw["boxes"]      # BoundingBoxes
-            if boxes_xyxy.numel():                            # image has GT
-                gt_boxes_tensor = boxes_xyxy.to(device).to(torch.float32)
-                gt_boxes_list = gt_boxes_tensor.tolist()      # for stats / prints
+
+            # Make sure to get both boxes and labels for the ground truth
+            gt_boxes_xyxy = current_img_annots_raw["boxes"]
+            gt_labels = current_img_annots_raw["labels"]
+
+            if gt_boxes_xyxy.numel():
+                gt_boxes_tensor = gt_boxes_xyxy.to(device=device, dtype=torch.float32)
+                gt_labels_tensor = gt_labels.to(device=device)
             else:
                 gt_boxes_tensor = torch.empty((0, 4), device=device)
-                gt_boxes_list   = []
+                gt_labels_tensor = torch.empty((0,), dtype=torch.long, device=device)
 
-            if not gt_boxes_list:
-                if debug_prints and batch_idx == 0 and i < 2: # Log for first few images if no GT
-                    print(f"[Debug Eval Img {num_images_processed-1}] GTs: {len(gt_boxes_list)}. "
-          f"Score Thresh: {score_thresh}.")
-                continue # Skip if no ground truth for this image
+            if gt_boxes_tensor.numel() == 0:
+                continue
 
             num_images_with_gt += 1
-            total_gt_boxes_across_images += len(gt_boxes_list)
-            gt_boxes_tensor = torch.tensor(gt_boxes_list, dtype=torch.float32, device=device)
-            
-            # These are already filtered by score_thresh (inside apply_nms...) and NMSed
-            predicted_boxes_for_img_padded = pred_boxes_batch_padded[i] # Padded to max_detections
+            total_gt_boxes_across_images += gt_boxes_tensor.shape[0]
 
-            # Filter out padded predictions (score == 0 or implicitly label == -1 means padding)
-            # The number of non-padded preds is debug_num_preds_after_nms_batch[i]
             num_actual_dets_this_img = debug_num_preds_after_nms_batch[i]
             total_preds_after_nms_filter_across_images += num_actual_dets_this_img
 
-            actual_predicted_boxes = predicted_boxes_for_img_padded[:num_actual_dets_this_img]
-
-            if debug_prints and batch_idx == 0 and i < 2: # Log for first few images with GT
-                print(f"[Debug Eval Img {num_images_processed-1}] GTs: {len(gt_boxes_list)}. Score Thresh: {score_thresh}.")
+            if debug_prints and batch_idx == 0 and i < 2:
+                print(f"[Debug Eval Img {num_images_processed-1}] GTs: {gt_boxes_tensor.shape[0]}.")
                 print(f"  Num Preds BEFORE NMS (passed score_thresh): {debug_num_preds_before_nms_batch[i]}")
                 print(f"  Num Preds AFTER NMS (final): {num_actual_dets_this_img}")
-                
-                g = model.head.cls_pred[0].weight.grad
-                print('grad mean / std on cls_pred[0]:',
-                      g.abs().mean().item(), g.std().item())    
+                # The problematic debug line that accessed model.head.cls_pred was here and has been removed.
 
-            if actual_predicted_boxes.numel() == 0: # No detections after NMS for this image
-                # image_avg_iou will effectively 0 for this image if we consider max_iou_per_gt
-                # We sum max_iou_per_gt, so if no preds, it contributes 0 to sum for these GTs
-                if batch_idx == 0 and i < 2:
-                    print(f"  No actual predicted boxes after NMS for Img {num_images_processed-1} with GTs.")
+            if num_actual_dets_this_img == 0:
                 continue
 
-            iou_matrix = tvops.box_iou(actual_predicted_boxes, gt_boxes_tensor) # (Num_Preds, Num_GTs)
-            
-            if iou_matrix.numel() == 0: # Should not happen if actual_predicted_boxes and gt_boxes_tensor are non-empty
-                if debug_prints and batch_idx == 0 and i < 2:
-                    print(f"  IoU matrix is empty for Img {num_images_processed-1} despite having preds and GTs.")
-                continue
-                
-            # For each GT box, find the max IoU with any predicted box
-            if iou_matrix.shape[0] > 0 and iou_matrix.shape[1] > 0:
-                max_iou_per_gt, _ = iou_matrix.max(dim=0) # Max IoU for each GT box
-                image_avg_iou_for_matched_gts = max_iou_per_gt.sum().item() # Sum of best IoUs for GTs in this image
-                total_iou_sum += image_avg_iou_for_matched_gts
-                if debug_prints and batch_idx == 0 and i < 2:
-                     print(f"  Img {num_images_processed-1}: Max IoUs per GT: {max_iou_per_gt.cpu().numpy().round(3)}. Sum for image: {image_avg_iou_for_matched_gts:.3f}")
-            # If iou_matrix.shape[0] == 0 (no preds but GTs exist), this block is skipped,
-            # and image_avg_iou_for_matched_gts is effectively 0 for this image's contribution.
-            # This is handled by the actual_predicted_boxes.numel() == 0 check earlier.
+            # Get the actual (unpadded) predictions for this image
+            actual_predicted_boxes = pred_boxes_batch_padded[i, :num_actual_dets_this_img]
+            actual_predicted_labels = pred_labels_batch_padded[i, :num_actual_dets_this_img]
+
+            iou_matrix = tvops.box_iou(actual_predicted_boxes, gt_boxes_tensor)
+
+            if iou_matrix.numel() > 0:
+                max_iou_per_gt, _ = iou_matrix.max(dim=0)
+                total_iou_sum += max_iou_per_gt.sum().item()
+
+                # --- Logic for Classification Accuracy ---
+                max_iou_per_pred, best_gt_indices_for_pred = iou_matrix.max(dim=1)
+                matched_mask = max_iou_per_pred > iou_match_thresh
+                matched_pred_labels = actual_predicted_labels[matched_mask]
+                matched_gt_labels = gt_labels_tensor[best_gt_indices_for_pred[matched_mask]]
+                matches_are_correctly_classified = (matched_pred_labels == matched_gt_labels).sum().item()
+                total_matched_preds += matched_mask.sum().item()
+                correctly_classified_preds += matches_are_correctly_classified
 
     if debug_prints:
         print(f"--- quick_val_iou End (Epoch: {epoch_num}, Run: {run_name}) ---")
@@ -1027,16 +1010,21 @@ def quick_val_iou(
         avg_preds_after_nms = total_preds_after_nms_filter_across_images / num_images_processed if num_images_processed > 0 else 0
         print(f"Avg preds/img (passed score_thresh, before NMS): {avg_preds_before_nms:.2f}")
         print(f"Avg preds/img (after NMS & final filter): {avg_preds_after_nms:.2f}")
-        
-    # The mAP definition usually averages over classes and IoU thresholds.
-    # This quick_val_iou averages the (sum of max_iou_per_gt) over all GT boxes.
-    # It's a proxy for recall-oriented localization quality.
+
     if total_gt_boxes_across_images > 0:
         final_mean_iou = total_iou_sum / total_gt_boxes_across_images
     else:
         final_mean_iou = 0.0
+
+    if total_matched_preds > 0:
+        final_accuracy = correctly_classified_preds / total_matched_preds
+    else:
+        final_accuracy = 0.0
+
     print(f"Final Mean IoU (sum_max_iou_per_gt / total_gt_boxes): {final_mean_iou:.4f}")
-    return final_mean_iou
+    print(f"Final Classification Acc (@{iou_match_thresh} IoU): {final_accuracy:.4f} ({correctly_classified_preds}/{total_matched_preds})")
+
+    return final_mean_iou, final_accuracy
 
 
 class PostprocessorForONNX(nn.Module):
@@ -1464,7 +1452,7 @@ def main(argv: List[str] | None = None):
     pa.add_argument('--device', default=None)
     pa.add_argument('--out', default='picodet_v5_int8.onnx')
     pa.add_argument('--no_inplace_head_neck', default=True, action='store_true', help="Disable inplace activations in head/neck")
-    pa.add_argument('--min_box_size', type=int, default=10, help="Minimum pixel width/height for a GT box to be used in training.")
+    pa.add_argument('--min_box_size', type=int, default=11, help="Minimum pixel width/height for a GT box to be used in training.")
     cfg = pa.parse_args(argv)
 
     TRAIN_SUBSET = None
@@ -1472,7 +1460,7 @@ def main(argv: List[str] | None = None):
     debug_prints = True
     BACKBONE_FREEZE_EPOCHS = 2 if cfg.epochs < 12 else 3  # 0 to disable
     use_focal_loss = False
-    FOCAL_LOSS_WARMUP_EPOCHS = 6
+    FOCAL_LOSS_WARMUP_EPOCHS = 4
     OBJ_FREEZE_EPOCHS = 0
 
     if cfg.device is None:
@@ -1483,11 +1471,11 @@ def main(argv: List[str] | None = None):
     backbone, feat_chs = get_backbone(cfg.arch, ckpt=None, img_size=IMG_SIZE) # Pass img_size
     if IMG_SIZE < 320:
         out_ch = 96
-        lat_k = 3
+        lat_k = 5
         cls_conv_depth = 2
     elif IMG_SIZE < 512:
         out_ch = 96
-        lat_k = 3
+        lat_k = 5
         cls_conv_depth = 3
     else:
         out_ch = 128
@@ -1550,7 +1538,7 @@ def main(argv: List[str] | None = None):
     # Curriculum learning, gradually smaller boxes included
     curriculum_schedule = [
         (10, 24),  # Stage 1: For the first 10 epochs, only use boxes >= 24x24 pixels.
-        (20, 16),   # Stage 2: For the next 20 epochs
+        (25, 16),   # Stage 2: For the next 20 epochs
         (0, cfg.min_box_size)     # Stage 3: For the rest of training, use boxes >= cfg.min_box_size.
                    # (Epoch count of 0 or a large number signifies 'the rest')
     ]
@@ -1673,12 +1661,12 @@ def main(argv: List[str] | None = None):
     scaler = torch.amp.GradScaler(enabled=dev.type == 'cuda')
 
     DYN_K_MIN = 2
-    CLS_WEIGHT = 4.0
+    CLS_WEIGHT = 5.0
     CLS_WEIGHT = 3.0 if use_focal_loss else CLS_WEIGHT
     assigner = SimOTACache(
         nc=model.head.nc,
-        ctr=2.7,  # 2.5
-        topk=11,  # 10
+        ctr=3.0,  # 2.5,   1.5 might be better later for strict bounding
+        topk=10,  # 10
         cls_cost_weight=CLS_WEIGHT,  # Increased to emphasize classification
         debug_epochs=5 if debug_prints else 0,
         dynamic_k_min=DYN_K_MIN,
@@ -1743,6 +1731,8 @@ def main(argv: List[str] | None = None):
                 assigner.cls_cost_weight = CLS_WEIGHT
         else:
             use_focal_loss_for_epoch = use_focal_loss
+        if ep > 150:
+            assigner.dynamic_k_min = 1
             
 
         model.train()
@@ -1762,7 +1752,7 @@ def main(argv: List[str] | None = None):
         )
         # ... (validation) ...
         model.eval()
-        m = quick_val_iou(
+        m, acc = quick_val_iou(
             model, vl_loader, dev,
             score_thresh=model.head.score_th,
             iou_thresh=model.head.iou_th,
@@ -1773,7 +1763,8 @@ def main(argv: List[str] | None = None):
         for param_group in opt.param_groups:
             current_lr = param_group['lr']
 
-        print(f'Epoch {ep + 1}/{cfg.epochs}  loss {l:.3f}  IoU {m:.3f} lr={current_lr:.6f}')
+        # print(f'Epoch {ep + 1}/{cfg.epochs}  loss {l:.3f}  IoU {m:.3f} lr={current_lr:.6f}')
+        print(f'Epoch {ep + 1}/{cfg.epochs}  loss {l:.3f}  IoU {m:.3f}  Acc {acc:.3f}  lr={current_lr:.6f}')
         sch.step()
         if ep % 5 == 0:
             print(f"[INFO] Logit scaler value: {model.head.logit_scale.item():.4f}")
@@ -1782,7 +1773,7 @@ def main(argv: List[str] | None = None):
     print("[INFO] Evaluating FP32 model...")
     model.eval()
     try:
-        iou_05 = quick_val_iou(model, vl_loader, dev,
+        iou_05, acc = quick_val_iou(model, vl_loader, dev,
                                score_thresh=0.05,
                                iou_thresh=model.head.iou_th,
                                max_detections=model.head.max_det,
@@ -1793,7 +1784,7 @@ def main(argv: List[str] | None = None):
         print(f"[INFO] Validation IoU (score_th=0.05): {iou_05:.4f}")
         
         # Run for score_thresh = 0.25
-        iou_25 = quick_val_iou(model, vl_loader, dev,
+        iou_25, acc = quick_val_iou(model, vl_loader, dev,
                                score_thresh=0.25,
                                iou_thresh=model.head.iou_th,
                                max_detections=model.head.max_det,
@@ -1893,23 +1884,12 @@ def main(argv: List[str] | None = None):
         qat_model.eval() # Switch qat_model to eval for validation
 
         try:
-            """
-            current_qat_val_iou = quick_val_iou(
-                qat_model, vl_loader, dev,
-                score_thresh=0.05,
-                iou_thresh=model.head.iou_th,
-                max_detections=model.head.max_det,
-                epoch_num=qep,
-                run_name=f"QAT_ep{qep+1}_score0.05",
-                debug_prints=debug_prints,
-            )
-            """
             eval_compatible_qat_model = ONNXExportablePicoDet(qat_model, PostprocessorForONNX(model.head))
             eval_compatible_qat_model.to(dev).eval() # Ensure it's on device and in eval mode
 
             # Using a consistent score_thresh for tracking QAT progress, e.g., 0.05 or 0.25
             # The one used for final ONNX NMS params can be different.
-            current_qat_val_iou = quick_val_iou(
+            current_qat_val_iou, acc = quick_val_iou(
                                    eval_compatible_qat_model, vl_loader, dev,
                                    score_thresh=0.05, # Consistent validation score_thresh
                                    iou_thresh=model.head.iou_th,
