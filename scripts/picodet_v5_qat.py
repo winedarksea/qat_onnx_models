@@ -1,7 +1,7 @@
 # train_picodet_qat.py – minimal pipeline: COCO ➜ FP32 ➜ QAT ➜ INT8 ➜ ONNX (with NMS)
 # built on pytorch version 2.7
 from __future__ import annotations
-import argparse, random, time, warnings, math, copy
+import argparse, random, time, warnings, math, copy, os
 import functools
 from typing import List, Tuple
 import traceback
@@ -102,9 +102,13 @@ class CocoDetectionV2(CocoDetection):
 def build_transforms(size, train):
     aug = [
         T.ToImage(),                                 # PIL → tv_tensors.Image
-        T.RandomHorizontalFlip(0.25) if train else T.Identity(),
-        T.RandomResizedCrop(size, scale=(0.8, 1.0), antialias=True) if train else T.Resize(size, antialias=True),
-        T.ColorJitter(0.2, 0.2, 0.2, 0.1) if train else T.Identity(),
+        # T.RandomHorizontalFlip(0.25) if train else T.Identity(),
+        # T.RandomResizedCrop(size, scale=(0.8, 1.0), antialias=True) if train else T.Resize(size, antialias=True),
+        # T.ColorJitter(0.1, 0.1, 0.1, 0.1) if train else T.Identity(),
+        T.RandomPhotometricDistort(p=0.2) if train else T.Identity(),
+        T.RandomAdjustSharpness(sharpness_factor=2, p=0.05) if train else T.Identity(),
+        T.RandomAutocontrast(p=0.1) if train else T.Identity(),
+        T.RandomEqualize(p=0.1) if train else T.Identity(),
         T.ToDtype(torch.uint8, scale=True),          # keep uint8, model normalises
     ]
     return T.Compose(aug)
@@ -202,7 +206,34 @@ class SimOTACache:
             "k_min_hits": [],   # Stores (num_hits, total_gt) for dynamic_k hitting the floor
             "k_dist": [],       # Stores the full distribution of dynamic_k values
         }
+        self._classification_debug_stats = {
+            "cls_cost_magnitude": [], # Avg. magnitude of the classification cost term
+            "loc_cost_magnitude": [], # Avg. magnitude of the localization cost term
+            "assignment_switches": [], # How often cls_cost changed the winning anchor
+        }
 
+    # In SimOTACache.print_debug_report (or a new report function)
+    def print_classification_debug_report(self):
+        if not self._classification_debug_stats["cls_cost_magnitude"]:
+            return
+    
+        avg_cls_cost = np.mean(self._classification_debug_stats["cls_cost_magnitude"])
+        avg_loc_cost = np.mean(self._classification_debug_stats["loc_cost_magnitude"])
+        total_switches, total_anchors = map(sum, zip(*self._classification_debug_stats["assignment_switches"]))
+        switch_rate = (total_switches / total_anchors) * 100 if total_anchors > 0 else 0
+    
+        print("\n" + "─" * 20 + f" Classification Debug Report " + "─" * 20)
+        print(f"  Cost Magnitudes: Avg. Cls Cost = {avg_cls_cost:.3f}, Avg. Loc Cost = {avg_loc_cost:.3f}")
+        if avg_loc_cost > avg_cls_cost * 10:
+            print(f"  [ACTION] Loc cost is >> Cls cost. Consider INCREASING `cls_cost_weight` (currently {self.cls_cost_weight}).")
+        print(f"  Assignment Switch Rate: {switch_rate:.2f}%")
+        print("  (Rate at which classification cost changed the assignment from pure IoU)")
+        print("─" * 65 + "\n")
+    
+        # Reset stats
+        for k in self._classification_debug_stats:
+            self._classification_debug_stats[k].clear()
+    
     def print_debug_report(self):
         """Calculates and prints the aggregated statistics, then resets.
         Tuning ctr: Look at the "Avg. Center Radius Hit Rate".
@@ -355,6 +386,19 @@ class SimOTACache:
                 + (~fg_cand_mask.unsqueeze(0)) * large_pen)
 
         assign_gt = cost.argmin(0)                # (A,)
+        
+        if self.is_debug_mode:
+            # Only calculate on the valid candidate anchors to get a meaningful comparison
+            valid_mask = centre_mask.T & fg_cand_mask.unsqueeze(0) # (M, A)
+            if valid_mask.any():
+                self._classification_debug_stats["cls_cost_magnitude"].append(cost_cls[valid_mask].mean().item())
+                self._classification_debug_stats["loc_cost_magnitude"].append(cost_loc[valid_mask].mean().item())
+        
+                # Check how many assignments were "switched" by the classification cost
+                cost_only_loc = cost_loc + (~centre_mask.T) * large_pen + (~fg_cand_mask.unsqueeze(0)) * large_pen
+                assign_gt_only_loc = cost_only_loc.argmin(0)
+                num_switches = (assign_gt != assign_gt_only_loc).sum().item()
+                self._classification_debug_stats["assignment_switches"].append((num_switches, A))
 
         # 5. final fg mask = candidate ∧ in-centre of its chosen GT
         fg_final = torch.zeros(A, dtype=torch.bool, device=device)
@@ -410,7 +454,7 @@ def train_epoch(
         max_epochs: int = 500,
         quality_floor_vfl: float = 0.01,
         w_cls_loss: float = 3.0,
-        w_obj_loss: float = 0.8,  # Moderate increase from 0.5
+        w_obj_loss: float = 2.0,  # Moderate increase from 0.5
         w_iou_initial: float = 4.0, # Slight reduction from 5.0
         w_iou_final: float = 2.0,   # Final weight for IoU loss
         iou_weight_change_epoch: int = None, # Epoch to change IoU weight
@@ -636,6 +680,17 @@ def train_epoch(
             else:                       # Varifocal Loss proper            
                 progress   = epoch / max_epochs if max_epochs > 0 else 0.0
                 alpha_dyn  = 0.15 + 0.35 * 0.5 * (1 - math.cos(math.pi * progress))
+                
+                initial_alpha_bg = 0.4  # Start by favoring foreground slightlys
+                final_alpha_bg = 0.6  # End with background being more important than foreground
+                start_epoch_for_schedule = int(max_epochs * 0.5)
+                
+                if epoch < start_epoch_for_schedule:
+                    alpha_bg_dyn = initial_alpha_bg
+                else:
+                    progress = (epoch - start_epoch_for_schedule) / (max_epochs - start_epoch_for_schedule)
+                    alpha_bg_dyn = initial_alpha_bg + progress * (final_alpha_bg - initial_alpha_bg)
+    
                 # print(f"alpha_dyn is {alpha_dyn}")
                 vfl = VarifocalLoss(alpha=alpha_dyn, gamma=1.7, reduction='none')
                 
@@ -652,23 +707,30 @@ def train_epoch(
                 joint_logits_bg = joint_logits[bg_mask]
                 vfl_t_bg = torch.zeros_like(joint_logits_bg)     # all-zero targets
                 loss_bg = vfl(joint_logits_bg, vfl_t_bg).mean()          # average over BG
-                
-                # final (already balanced) classification loss
-                loss_cls = loss_fg + loss_bg
-                loss_obj = torch.tensor(0.0, device=device)
+
+                # final classification loss
+                loss_cls = (1 - alpha_bg_dyn) * loss_fg + alpha_bg_dyn * loss_bg
+
+                # loss_obj = torch.tensor(0.0, device=device)
+                obj_targets = torch.zeros_like(obj_p_img)
+                obj_targets[fg_mask_img] = gt_ious[fg_mask_img]
+                # 2. Calculate the BCE loss, averaged over ALL anchors in the image.
+                # This strong signal on background anchors is what reduces box overproduction.
+                loss_obj = F.binary_cross_entropy_with_logits(obj_p_img, obj_targets, reduction='mean')
+                w_obj_loss = 0.1  # small for initial testing of adding to VFL
             
             # Final sample loss (obj already inside joint_logits)
             current_sample_total_loss = (
                   w_cls_loss * loss_cls
                 + loss_dfl
                 + w_iou * loss_iou
-                + w_iou_final * loss_obj
+                + w_obj_loss * loss_obj
             )
             
             # for the first sample in the epoch – diagnostics only
             if num_samples_with_loss_in_batch == 0 and total_samples_contributing_to_loss_epoch == 0:
                 loss_cls_print = loss_cls.detach()
-                loss_obj_print = torch.tensor(0.0)
+                loss_obj_print = loss_obj.detach()
                 loss_dfl_print = loss_dfl.detach()
                 loss_iou_print = loss_iou.detach()
 
@@ -678,6 +740,8 @@ def train_epoch(
         if num_samples_with_loss_in_batch > 0:
             averaged_batch_loss = batch_total_loss / num_samples_with_loss_in_batch
             opt.zero_grad(set_to_none=True)
+            if not torch.isfinite(averaged_batch_loss):
+                continue
             scaler.scale(averaged_batch_loss).backward()
             scaler.unscale_(opt)
             ### Norm sizing debug
@@ -702,6 +766,27 @@ def train_epoch(
                   f"cls {loss_cls_print.item() * w_cls_loss:.3f} (w={w_cls_loss})  obj {loss_obj_print.item() * w_obj_loss:.3f} (w={w_obj_loss})  "
                   f"dfl {loss_dfl_print.item():.3f}  iou {loss_iou_print.item() * w_iou:.3f} (w={w_iou})  "
                   f"tot_batch_avg {averaged_batch_loss.item():.3f}")
+             with torch.no_grad():
+                    fg_indices = fg_mask_img.nonzero(as_tuple=False).squeeze(1)
+                    cls_p_fg_img = cls_p_img[fg_indices] # (N_fg, C)
+                    gt_labels_fg = gt_labels[fg_indices] # (N_fg,)
+            
+                    # Get the logit value for the correct class for each FG prediction
+                    correct_class_logits = cls_p_fg_img[torch.arange(num_fg_img), gt_labels_fg]
+            
+                    # Find the highest logit among all *incorrect* classes for each FG prediction
+                    cls_p_fg_img[torch.arange(num_fg_img), gt_labels_fg] = -float('inf') # Mask out correct class
+                    max_incorrect_class_logits, _ = cls_p_fg_img.max(dim=1)
+            
+                    # The "margin" is the difference. We want this to be large and positive.
+                    logit_margin = correct_class_logits - max_incorrect_class_logits
+            
+                    print(f"\n--- [DBG E{epoch} B{i}] Logit Analysis (FG Samples) ---")
+                    print(f"  Avg Logit for Correct Class: {correct_class_logits.mean().item():.3f}")
+                    print(f"  Avg Logit for Top Incorrect Class: {max_incorrect_class_logits.mean().item():.3f}")
+                    print(f"  Avg Margin (Correct - Incorrect): {logit_margin.mean().item():.3f} (Stdev: {logit_margin.std().item():.3f})")
+                    print(f"  % of FG samples with negative margin: {(logit_margin < 0).float().mean().item():.2%}\n")
+
         elif debug_prints and i % 500 == 0 and i > 0 and num_samples_with_loss_in_batch > 0:
             print(f"E{epoch} {i:04d}/{len(loader)} loss {averaged_batch_loss.item():.3f} (batch avg)")
         if debug_prints and (epoch % 10 == 0) and i == 0:
@@ -1020,9 +1105,6 @@ def quick_val_iou(
         final_accuracy = correctly_classified_preds / total_matched_preds
     else:
         final_accuracy = 0.0
-
-    print(f"Final Mean IoU (sum_max_iou_per_gt / total_gt_boxes): {final_mean_iou:.4f}")
-    print(f"Final Classification Acc (@{iou_match_thresh} IoU): {final_accuracy:.4f} ({correctly_classified_preds}/{total_matched_preds})")
 
     return final_mean_iou, final_accuracy
 
@@ -1442,6 +1524,123 @@ def save_intermediate_onnx(qat_model, cfg, model):
     return final_exportable_int8_model, int8_model_with_preprocessor, actual_onnx_input_example, temp_onnx_path
 
 
+def save_checkpoint(model: nn.Module, optimizer: torch.optim.Optimizer, epoch: int, cfg: argparse.Namespace, out_path: str):
+    """
+    Saves a comprehensive checkpoint.
+
+    Args:
+        model: The PyTorch model to save.
+        optimizer: The optimizer state to save.
+        epoch: The current epoch number.
+        cfg: The argparse configuration namespace.
+        out_path: The path to save the checkpoint file.
+    """
+    # 1. Create a configuration dictionary from the model's parameters
+    # This metadata is the key to flexible loading.
+    model_config = {
+        'img_size': model.head.img_size, # Or get from model.pre.size
+        'arch': cfg.arch, # Assumes arch is in your config
+        'feat_chs': model.neck.in_chs,
+        'num_classes': model.head.nc,
+        'neck_out_ch': model.neck.out[0].cv3.out_channels,
+        'head_reg_max': model.head.reg_max,
+        'cls_conv_depth': model.head.cls_conv_depth,
+        'lat_k': model.neck.lat[0].dw.kernel_size[0],
+    }
+
+    # 2. Bundle everything into a checkpoint dictionary
+    checkpoint = {
+        'epoch': epoch,
+        'model_config': model_config,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+    }
+
+    # 3. Save the checkpoint
+    torch.save(checkpoint, out_path)
+    print(f"[SAVE] Checkpoint saved to {out_path} (Epoch: {epoch})")
+
+
+def load_checkpoint(new_model: nn.Module, ckpt_path: str, optimizer: torch.optim.Optimizer | None = None, device: torch.device = 'cpu'):
+    """
+    Loads a checkpoint intelligently, handling configuration mismatches for finetuning.
+
+    Args:
+        new_model: An instance of the model with the desired NEW configuration.
+        ckpt_path: Path to the checkpoint file.
+        optimizer: An optional optimizer to restore its state.
+        device: The device to map the loaded tensors to.
+
+    Returns:
+        The starting epoch for training (epoch from checkpoint + 1).
+    """
+    if not os.path.exists(ckpt_path):
+        print(f"[WARN] Checkpoint file not found at {ckpt_path}. Starting from scratch.")
+        return 0
+
+    print(f"[LOAD] Loading checkpoint from {ckpt_path}...")
+    ckpt = torch.load(ckpt_path, map_location=device)
+
+    # --- Metadata Comparison Logic ---
+    saved_config = ckpt.get('model_config', {})
+    if not saved_config:
+        print("[WARN] No config metadata found in checkpoint. Attempting a simple weight load.")
+        new_model.load_state_dict(ckpt['model_state_dict'])
+        return ckpt.get('epoch', 0) + 1
+
+    # Get the configuration of the new model we are trying to load into
+    new_model_config = {
+        'img_size': new_model.head.img_size,
+        'head_reg_max': new_model.head.reg_max,
+        'neck_out_ch': new_model.neck.out[0].cv3.out_channels,
+        # Add any other critical params you might change
+    }
+
+    # Check for mismatches that necessitate finetuning
+    is_finetuning = (
+        saved_config.get('img_size') != new_model_config['img_size'] or
+        saved_config.get('head_reg_max') != new_model_config['head_reg_max'] or
+        saved_config.get('neck_out_ch') != new_model_config['neck_out_ch']
+    )
+
+    start_epoch = ckpt['epoch'] + 1
+
+    if is_finetuning:
+        print("[INFO] Mismatch detected between saved and new model configurations.")
+        print("         Mode: Finetuning. Loading weights with strict=False.")
+        print(f"         Saved config:   img_size={saved_config.get('img_size')}, reg_max={saved_config.get('head_reg_max')}")
+        print(f"         Current config: img_size={new_model_config['img_size']}, reg_max={new_model_config['head_reg_max']}")
+
+        # When finetuning, load weights with strict=False
+        model_sd = ckpt['model_state_dict']
+        missing_keys, unexpected_keys = new_model.load_state_dict(model_sd, strict=False)
+
+        print("\n--- Weight Loading Report ---")
+        if missing_keys:
+            print("Missing keys (expected for finetuning):")
+            for k in missing_keys: print(f"  - {k}")
+        if unexpected_keys:
+            print("Unexpected keys (expected for finetuning):")
+            for k in unexpected_keys: print(f"  - {k}")
+        print("---------------------------\n")
+
+        # Do NOT load the optimizer state and reset epoch, as we are starting a new training phase
+        print("[INFO] Optimizer state not loaded. Starting finetuning from epoch 0.")
+        return 0 # Start finetuning from epoch 0
+
+    else:
+        # If no mismatch, it's a direct resume of training
+        print("[INFO] Configurations match. Resuming training.")
+        new_model.load_state_dict(ckpt['model_state_dict'], strict=True)
+        if optimizer:
+            print("[INFO] Loading optimizer state.")
+            optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+        else:
+            print("[WARN] No optimizer provided. Optimizer state not loaded.")
+
+        print(f"[INFO] Resuming from epoch {start_epoch}.")
+        return start_epoch
+
 def main(argv: List[str] | None = None):
     pa = argparse.ArgumentParser()
     pa.add_argument('--coco_root', default='coco')
@@ -1474,7 +1673,7 @@ def main(argv: List[str] | None = None):
         lat_k = 5
         cls_conv_depth = 2
     elif IMG_SIZE < 512:
-        out_ch = 96
+        out_ch = 128
         lat_k = 5
         cls_conv_depth = 3
     else:
@@ -1537,8 +1736,11 @@ def main(argv: List[str] | None = None):
 
     # Curriculum learning, gradually smaller boxes included
     curriculum_schedule = [
-        (10, 24),  # Stage 1: For the first 10 epochs, only use boxes >= 24x24 pixels.
-        (25, 16),   # Stage 2: For the next 20 epochs
+        (20, 24),  # Stage 1: For the first 15 epochs, only use boxes >= 24x24 pixels.
+        (2, 22),
+        (2, 20),
+        (2, 18),
+        (20, 16),   # Stage 2: For the next 20 epochs
         (0, cfg.min_box_size)     # Stage 3: For the rest of training, use boxes >= cfg.min_box_size.
                    # (Epoch count of 0 or a large number signifies 'the rest')
     ]
@@ -1582,13 +1784,13 @@ def main(argv: List[str] | None = None):
     id2name = {v: coco_train_raw.coco.loadCats([k])[0]["name"] for k, v in coco_label_map.items()}  # noqa
 
     if True:
-        peak_lr_adamw = 2e-4
+        peak_lr_adamw = 1e-4
         weight_decay_adamw = 0.02
         beta1_adamw = 0.9
         beta2_adamw = 0.999
         eps_adamw = 1e-8
 
-        warmup_epochs_adamw = max(1, cfg.epochs // 10) if cfg.epochs >=5 else 1 # e.g., 1 epoch for 10 total epochs.
+        warmup_epochs_adamw = max(1, cfg.epochs // 8) if cfg.epochs >=5 else 1 # e.g., 1 epoch for 10 total epochs.
         cosine_decay_to_fraction_adamw = 0.01 # Decay to 1% of peak_lr_adamw
 
         # Parameter groups for differential weight decay
@@ -1661,7 +1863,7 @@ def main(argv: List[str] | None = None):
     scaler = torch.amp.GradScaler(enabled=dev.type == 'cuda')
 
     DYN_K_MIN = 2
-    CLS_WEIGHT = 5.0
+    CLS_WEIGHT = 2.5
     CLS_WEIGHT = 3.0 if use_focal_loss else CLS_WEIGHT
     assigner = SimOTACache(
         nc=model.head.nc,
@@ -1671,7 +1873,8 @@ def main(argv: List[str] | None = None):
         debug_epochs=5 if debug_prints else 0,
         dynamic_k_min=DYN_K_MIN,
     )
-
+    if False:
+        start_epoch = load_checkpoint(model, cfg.load_from, opt, dev)  # noqa
 
     original_model_head_nc = model.head.nc
     original_model_head_reg_max = model.head.reg_max
@@ -1679,15 +1882,16 @@ def main(argv: List[str] | None = None):
 
     # ... (FP32 training loop) ...
     for ep in range(cfg.epochs):
-        if ep == 0:
+        if ep < BACKBONE_FREEZE_EPOCHS:
             for p in model.backbone.parameters():
                 p.requires_grad = False
-            print(f"[INFO] Backbone frozen for {BACKBONE_FREEZE_EPOCHS} epochs…")
-        
-        if ep == BACKBONE_FREEZE_EPOCHS:
+            if ep == 0:
+                print(f"[INFO] Backbone frozen for {BACKBONE_FREEZE_EPOCHS} epochs…")
+        else:
             for p in model.backbone.parameters():
                 p.requires_grad = True
-            print("[INFO] Backbone unfrozen – full network now training")
+            if ep == BACKBONE_FREEZE_EPOCHS:
+                print("[INFO] Backbone unfrozen – full network now training")
 
         if ep < OBJ_FREEZE_EPOCHS:
             # This block will execute for epoch 0
@@ -1724,7 +1928,7 @@ def main(argv: List[str] | None = None):
             use_focal_loss_for_epoch = ep < FOCAL_LOSS_WARMUP_EPOCHS
             if use_focal_loss_for_epoch:
                 assigner.dynamic_k_min = 4
-                assigner.cls_cost_weight = 5.0
+                assigner.cls_cost_weight = 1.0
             if ep == FOCAL_LOSS_WARMUP_EPOCHS:
                 print("[INFO] Switching from Focal Loss warmup to Varifocal Loss for subsequent epochs.")
                 assigner.dynamic_k_min = DYN_K_MIN
@@ -1733,7 +1937,6 @@ def main(argv: List[str] | None = None):
             use_focal_loss_for_epoch = use_focal_loss
         if ep > 150:
             assigner.dynamic_k_min = 1
-            
 
         model.train()
         alpha = 0.0  # min(0.9, ep / alpha_warmup_epochs)
@@ -1763,12 +1966,14 @@ def main(argv: List[str] | None = None):
         for param_group in opt.param_groups:
             current_lr = param_group['lr']
 
-        # print(f'Epoch {ep + 1}/{cfg.epochs}  loss {l:.3f}  IoU {m:.3f} lr={current_lr:.6f}')
         print(f'Epoch {ep + 1}/{cfg.epochs}  loss {l:.3f}  IoU {m:.3f}  Acc {acc:.3f}  lr={current_lr:.6f}')
         sch.step()
         if ep % 5 == 0:
             print(f"[INFO] Logit scaler value: {model.head.logit_scale.item():.4f}")
         assigner._dbg_iter = 0   
+        
+        ckpt_path = "picodet.pt"
+        save_checkpoint(model, opt, ep + 1, cfg, ckpt_path)
 
     print("[INFO] Evaluating FP32 model...")
     model.eval()
@@ -1800,15 +2005,12 @@ def main(argv: List[str] | None = None):
     print("[INFO] Exporting FP32 reference ONNX models...")
     fp32_onnx_path, fp32_nms_path = save_fp32_onnx_reference(model, cfg)
     
-    model.train() # Set back for QAT
+    model.train()
 
     # --- QAT Preparation ---
     print("[INFO] Preparing model for QAT...")
     dummy_uint8_input_cpu = torch.randint(0, 256, (1, 3, IMG_SIZE, IMG_SIZE), dtype=torch.uint8, device='cpu')
 
-    # The 'model' contains 'model.pre' (ResizeNorm).
-    # The 'example' for qat_prepare should be the input to 'model' itself.
-    # ResizeNorm is configured to take uint8 input and convert/normalize.
     example_input_for_qat_entire_model = dummy_uint8_input_cpu.cpu()
 
     model.train()
@@ -1898,7 +2100,7 @@ def main(argv: List[str] | None = None):
                                    run_name=f"QAT_ep{qep+1}_score0.05",
                                    debug_prints=debug_prints,
                                 )
-            print(f"[QAT Eval] Epoch {qep + 1}/{qat_epochs} Val IoU (score_th=0.05): {current_qat_val_iou:.4f}")
+            print(f"[QAT Eval] Epoch {qep + 1}/{qat_epochs} Val IoU (score_th=0.05): {current_qat_val_iou:.4f}  Acc {acc:.3f}")
 
             if current_qat_val_iou > best_qat_iou:
                 best_qat_iou = current_qat_val_iou
