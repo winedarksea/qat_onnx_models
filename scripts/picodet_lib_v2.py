@@ -11,20 +11,20 @@ from torchvision.models.feature_extraction import create_feature_extractor
 import timm
 
 try:
-    # folder_to_add = r"/Users/colincatlin/Documents-NoCloud/qat_onnx_models/scripts" 
-    # folder_to_add = r"C:\Users\Colin\qat_onnx_models\scripts"
-    # folder_to_add = r"/home/colin/img_data"
-    folder_to_add = r"/home/colin/qat_onnx_models/scripts"
-    # Check if the path and file exist before trying to add to sys.path and import
-    custom_module_path = os.path.join(folder_to_add, "customMobilenetNetv4.py")
-    if os.path.exists(custom_module_path):
-        if folder_to_add not in sys.path:
-             sys.path.insert(0, folder_to_add)
-        from customMobilenetNetv4 import MobileNetV4ConvSmallPico, MobileNetV4
-        print(f"[INFO] Successfully imported customMobilenetNetv4 from {folder_to_add}")
-    else:
-        print(f"Warning: Did not find customMobilenetNetv4.py at {custom_module_path}. 'mnv4c' backbone will not be available.")
-        MobileNetV4ConvSmallPico = None
+    folder_to_add_pos = [
+        r"/Users/colincatlin/Documents-NoCloud/qat_onnx_models/scripts",  # mac
+        r"C:\Users\Colin\qat_onnx_models\scripts",  # Windows
+        r"/home/colin/qat_onnx_models/scripts",  # Linux 1
+        r"/home/colin/img_data",
+    ]
+    for folder_to_add in folder_to_add_pos:
+        custom_module_path = os.path.join(folder_to_add, "customMobilenetNetv4.py")
+        if os.path.exists(custom_module_path):
+            if folder_to_add not in sys.path:
+                 sys.path.insert(0, folder_to_add)
+            break
+    from customMobilenetNetv4 import MobileNetV4ConvSmallPico, MobileNetV4
+    print(f"[INFO] Successfully imported customMobilenetNetv4 from {folder_to_add}")
 except ImportError as e:
     print(f"Warning: Failed to import customMobilenetNetv4.py ({e}). 'mnv4c' backbone will not be available.")
     MobileNetV4ConvSmallPico = None

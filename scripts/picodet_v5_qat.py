@@ -26,7 +26,7 @@ if False:  # this is just here for a quirk in testing, imports are still availab
     try: 
         from picodet_lib_v2 import (
             PicoDet, get_backbone, VarifocalLoss, dfl_loss,
-            build_dfl_targets, PicoDetHead
+            build_dfl_targets, PicoDetHead, ResizeNorm
         )
     except Exception:
         # when running manually in console, these are already loaded
@@ -101,7 +101,7 @@ class CocoDetectionV2(CocoDetection):
 # ---------- transforms ----------
 def build_transforms(size, train):
     aug = [
-        T.ToImage(),                                 # PIL → tv_tensors.Image
+        T.ToImage(),
         # T.RandomHorizontalFlip(0.25) if train else T.Identity(),
         # T.RandomResizedCrop(size, scale=(0.8, 1.0), antialias=True) if train else T.Resize(size, antialias=True),
         # T.ColorJitter(0.1, 0.1, 0.1, 0.1) if train else T.Identity(),
@@ -109,7 +109,8 @@ def build_transforms(size, train):
         T.RandomAdjustSharpness(sharpness_factor=2, p=0.05) if train else T.Identity(),
         T.RandomAutocontrast(p=0.1) if train else T.Identity(),
         T.RandomEqualize(p=0.1) if train else T.Identity(),
-        T.ToDtype(torch.uint8, scale=True),          # keep uint8, model normalises
+        T.Resize(size, antialias=True),
+        T.ToDtype(torch.uint8, scale=True),  # keep uint8, model normalises
     ]
     return T.Compose(aug)
 
@@ -167,14 +168,6 @@ def collate_and_filter(batch: list, min_box_size: int = 1):
 
     # Proceed with standard collation for the kept samples
     return torch.stack(filtered_imgs, 0), filtered_tgts
-
-def logit_of_product(cls_raw, obj_raw):
-    p = torch.sigmoid(cls_raw) * torch.sigmoid(obj_raw)
-    eps = 1e-7
-    return torch.log(p.clamp_min(eps)) - torch.log1p(-p)
-
-def blend_joint_logit(cls_raw, obj_raw, alpha):
-    return (1 - alpha) * (cls_raw + obj_raw) + alpha * logit_of_product(cls_raw, obj_raw)
 
 # ───────────────────── assigner (SimOTA, cached) ────────────────
 class SimOTACache:
@@ -356,30 +349,29 @@ class SimOTACache:
         idx_class_dim = gt_labels.unsqueeze(1).repeat(1, num_anchors_total) # Shape (M, A)
         logit_cls_gt = cls_logits[idx_anchor_dim, idx_class_dim] # Shape (M, A)
 
-        cost_values_for_cls_term = torch.zeros((M, A), device=device, dtype=cls_logits.dtype)
+        # cost_values_for_cls_term = torch.zeros((M, A), device=device, dtype=cls_logits.dtype)
 
         if self.use_obj_logit and obj_logits is not None:
             # obj_logits is (A,), unsqueeze to (1,A) for broadcasting with (M,A) logit_cls_gt
             obj_logits_expanded = obj_logits.unsqueeze(0) # Shape (1, A)
-            # alpha = self.alpha   # you can store alpha in the class each epoch
-            # joint_logits_gt = blend_joint_logit(logit_cls_gt, obj_logits_expanded, alpha)
-
+    
             # The label assigner's cost MUST match the loss function's logic.
             # Use the scaler from the model's head to compute the joint logit.
             # .detach() is used as this is a no_grad context.
             scaler = model_head.logit_scale.detach()
             joint_logits_gt = logit_cls_gt + scaler * obj_logits_expanded
             prob_joint_gt = joint_logits_gt.sigmoid()       # (M , A)
-            cost_values_for_cls_term = -torch.log(prob_joint_gt + eps)
+            # cost_values_for_cls_term = -torch.log(prob_joint_gt + eps)
         else:
-            # Fallback if obj_logits are not used or not provided (cost based on P(cls_gt) only)
-            prob_cls_gt = logit_cls_gt.sigmoid() # (M, A)
-            cost_values_for_cls_term = -torch.log(prob_cls_gt + eps)
+            raise ValueError("missing obj logit")
         
-        cost_cls = self.cls_cost_weight * cost_values_for_cls_term
-        # ----------------------------------------------------------------------
-        
+        # cost_cls = self.cls_cost_weight * cost_values_for_cls_term  # old
         cost_loc = 1.0 - iou                                # (M, A)
+
+        prob_joint_gt = (logit_cls_gt + scaler * obj_logits_expanded).sigmoid()
+        quality = iou.clamp_min(1e-6)          # (M , A)
+        cost_cls = self.cls_cost_weight * quality * (-torch.log(prob_joint_gt + eps))
+
         large_pen = torch.tensor(1e4, device=device, dtype=cost_loc.dtype) # Ensure dtype matches
         cost = (cost_loc + cost_cls
                 + (~centre_mask.T) * large_pen
@@ -455,6 +447,7 @@ def train_epoch(
         quality_floor_vfl: float = 0.01,
         w_cls_loss: float = 3.0,
         w_obj_loss: float = 2.0,  # Moderate increase from 0.5
+        w_dfl_loss: float = 0.5,
         w_iou_initial: float = 4.0, # Slight reduction from 5.0
         w_iou_final: float = 2.0,   # Final weight for IoU loss
         iou_weight_change_epoch: int = None, # Epoch to change IoU weight
@@ -476,6 +469,8 @@ def train_epoch(
             if debug_prints:
                 print(f"Skipping batch {i} because it became empty after filtering.")
             continue
+        H, W = imgs.shape[-2:]
+        assert H % 32 == 0 and W % 32 == 0, "IMG_SIZE must be multiple of 32"
 
         imgs = imgs.to(device)
         model_outputs = model(imgs)
@@ -528,6 +523,7 @@ def train_epoch(
 
             if debug_prints and epoch == 0 and i == 0:
                 H_img_shape, W_img_shape = imgs[b_idx].shape[-2:]
+                bad_coords_after_filter = False
                 if gt_boxes_img.numel() > 0:
                     widths_filtered = gt_boxes_img[:, 2] - gt_boxes_img[:, 0]
                     heights_filtered = gt_boxes_img[:, 3] - gt_boxes_img[:, 1]
@@ -536,10 +532,10 @@ def train_epoch(
                         (gt_boxes_img[:, 2] > W_img_shape + epsilon_wh) | (gt_boxes_img[:, 3] > H_img_shape + epsilon_wh) |
                         (widths_filtered <= 0) | (heights_filtered <= 0)
                     ).any()
-                    print(f"[DEBUG POST-FILTER] ... bad_coords_after_filter={bad_coords_after_filter.item()}")
                 first_tgt_original_boxes = tgts_batch[b_idx]["boxes"]
                 first_box_original_coords = first_tgt_original_boxes[:1].tolist() if first_tgt_original_boxes.numel() else None
-                print(f"[CHECK] Img shape {imgs[b_idx].shape}, sample {b_idx} first original box: {first_box_original_coords}")
+                if bad_coords_after_filter:
+                    raise ValueError(f"bad coords: [CHECK] Img shape {imgs[b_idx].shape}, sample {b_idx} first original box: {first_box_original_coords}")
 
             # flatten predictions
             cls_p_img = torch.cat([
@@ -681,35 +677,13 @@ def train_epoch(
                 progress   = epoch / max_epochs if max_epochs > 0 else 0.0
                 alpha_dyn  = 0.15 + 0.35 * 0.5 * (1 - math.cos(math.pi * progress))
                 
-                initial_alpha_bg = 0.4  # Start by favoring foreground slightlys
-                final_alpha_bg = 0.6  # End with background being more important than foreground
-                start_epoch_for_schedule = int(max_epochs * 0.5)
-                
-                if epoch < start_epoch_for_schedule:
-                    alpha_bg_dyn = initial_alpha_bg
-                else:
-                    progress = (epoch - start_epoch_for_schedule) / (max_epochs - start_epoch_for_schedule)
-                    alpha_bg_dyn = initial_alpha_bg + progress * (final_alpha_bg - initial_alpha_bg)
-    
-                # print(f"alpha_dyn is {alpha_dyn}")
-                vfl = VarifocalLoss(alpha=alpha_dyn, gamma=1.7, reduction='none')
-                
-                # foreground targets and loss
-                quality_pos = torch.maximum(gt_ious[pos_indices],
-                                                 torch.tensor(quality_floor_vfl, device=device))
-                vfl_t_pos = torch.zeros_like(joint_logits_pos)
-                vfl_t_pos[torch.arange(pos_indices.size(0), device=device),
-                          gt_labels[pos_indices]] = quality_pos
-                loss_fg = vfl(joint_logits_pos, vfl_t_pos).mean()   # average over FG
-                
-                # background targets and loss
-                bg_mask = ~fg_mask_img
-                joint_logits_bg = joint_logits[bg_mask]
-                vfl_t_bg = torch.zeros_like(joint_logits_bg)     # all-zero targets
-                loss_bg = vfl(joint_logits_bg, vfl_t_bg).mean()          # average over BG
-
-                # final classification loss
-                loss_cls = (1 - alpha_bg_dyn) * loss_fg + alpha_bg_dyn * loss_bg
+                targets = torch.zeros_like(joint_logits)
+                targets[pos_indices, gt_labels_pos] = torch.maximum(gt_ious[pos_indices], quality_floor_vfl)
+                # 2. Instantiate VFL and calculate the loss with 'sum' reduction.
+                vfl_calculator = VarifocalLoss(alpha=alpha_dyn, gamma=1.7, reduction='sum')
+                total_unreduced_loss = vfl_calculator(joint_logits, targets)
+                # 3. CRITICAL: Normalize by the number of positive examples.
+                loss_cls = total_unreduced_loss / max(1, num_fg_img)
 
                 # loss_obj = torch.tensor(0.0, device=device)
                 obj_targets = torch.zeros_like(obj_p_img)
@@ -722,7 +696,7 @@ def train_epoch(
             # Final sample loss (obj already inside joint_logits)
             current_sample_total_loss = (
                   w_cls_loss * loss_cls
-                + loss_dfl
+                + w_dfl_loss * loss_dfl
                 + w_iou * loss_iou
                 + w_obj_loss * loss_obj
             )
@@ -764,7 +738,7 @@ def train_epoch(
         if debug_prints and i == 0 and total_samples_contributing_to_loss_epoch > 0 : # Print first batch loss breakdown
              print(f"E{epoch} B0 loss components: "
                   f"cls {loss_cls_print.item() * w_cls_loss:.3f} (w={w_cls_loss})  obj {loss_obj_print.item() * w_obj_loss:.3f} (w={w_obj_loss})  "
-                  f"dfl {loss_dfl_print.item():.3f}  iou {loss_iou_print.item() * w_iou:.3f} (w={w_iou})  "
+                  f"dfl {loss_dfl_print.item() * w_dfl_loss:.3f} (w={w_dfl_loss})  iou {loss_iou_print.item() * w_iou:.3f} (w={w_iou})  "
                   f"tot_batch_avg {averaged_batch_loss.item():.3f}")
              with torch.no_grad():
                     fg_indices = fg_mask_img.nonzero(as_tuple=False).squeeze(1)
@@ -889,6 +863,7 @@ def qat_prepare(model: nn.Module, example_input: torch.Tensor) -> torch.fx.Graph
     # 4. Specify modules to skip quantization
     #    The 'pre' module (ResizeNorm) handles uint8 input and normalization;
     qconfig_mapping = qconfig_mapping.set_module_name('pre', None)
+    qconfig_mapping = qconfig_mapping.set_object_type(ResizeNorm, None)
 
     # 5. Prepare the model for QAT using FX graph mode
     model.cpu().train() # Ensure model is on CPU and in train mode
@@ -1120,8 +1095,6 @@ class PostprocessorForONNX(nn.Module):
         # These will be part of the ONNX graph as constants if not inputs.
         self.register_buffer('strides_buffer', head_ref.strides_buffer.clone().detach(), persistent=False)
         self.register_buffer('dfl_project_buffer', head_ref.dfl_project_buffer.clone().detach(), persistent=False)
-        # Capture the final trained value of the scaler and register it as a buffer.
-        # This makes it a constant in the ONNX graph.
         self.register_buffer('logit_scale', head_ref.logit_scale.clone().detach(), persistent=False)
         for i in range(self.nl):
             anchor_points = getattr(head_ref, f'anchor_points_level_{i}')
@@ -1247,18 +1220,11 @@ class ONNXExportablePicoDet(nn.Module):
         self.core_model = quantized_core_model
         self.postprocessor = head_postprocessor
 
-    def forward(self, x: torch.Tensor): # x is images_uint8
-        # ------------------ CRITICAL BUG FIX ------------------
-        # The core_model (a converted QAT model) will be in eval() mode by default
-        # when export is called. This would make it output only 2 tensors, causing a
-        # mismatch with the postprocessor which expects the 4-tuple training output.
-        # We temporarily set it to train() to get the raw logits, then switch back.
-        # This is a controlled way to resolve the interface mismatch for export purposes.
+    def forward(self, x: torch.Tensor):
         is_training_before = self.core_model.training
         self.core_model.train()
         raw_feature_outputs_tuple = self.core_model(x)
-        self.core_model.training = is_training_before # Restore original mode
-        # -------------------------------------------------
+        self.core_model.training = is_training_before
 
         # The postprocessor takes this tuple and decodes it to the inference outputs
         return self.postprocessor(raw_feature_outputs_tuple)
@@ -1746,13 +1712,10 @@ def main(argv: List[str] | None = None):
     ]
     current_stage_idx = 0
     epochs_in_current_stage = 0
-    print("[INFO] Using curriculum learning for training.")
-
     # Create a dictionary of DataLoaders, one for each stage of the curriculum
     train_loaders = {}
     total_scheduled_epochs = 0
     for i, (num_epochs, min_size) in enumerate(curriculum_schedule):
-        print(f"  - Stage {i+1}: {num_epochs} epochs with min_box_size = {min_size}")
         collate_fn = functools.partial(collate_and_filter, min_box_size=min_size)
         
         # Use the existing train_sampler logic
