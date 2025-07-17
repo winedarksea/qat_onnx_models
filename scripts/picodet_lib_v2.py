@@ -160,14 +160,22 @@ def build_dfl_targets(offsets: torch.Tensor, reg_max: int) -> torch.Tensor:
     one_hot_r = F.one_hot(r, reg_max + 1).float() * w_r.unsqueeze(-1)
     return one_hot_l + one_hot_r  # (N,4,M+1)
 
-def dfl_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    # pred: (N*4, M+1) logits ; target: (N,4,M+1)
-    n, _, m1 = target.shape
-    pred = pred.view(n * 4, m1)
-    target = target.view(n * 4, m1)
-    loss = F.kl_div(F.log_softmax(pred, dim=1), target, reduction='batchmean')
-    return loss
 
+def dfl_loss(pred_logits, target_dist, eps: float = 1e-7):
+    """
+    pred_logits : (N*4, M+1)  raw logits
+    target_dist : (N,4,M+1)   soft distribution from build_dfl_targets
+    """
+    n, _, K = target_dist.shape                          # K = M+1
+    pred = pred_logits.view(n * 4, K)
+    tgt  = target_dist.view(n * 4, K)
+    # 1.  Clamp targets so log(·) is defined and sum ≈ 1
+    tgt = tgt.clamp_min(eps)
+    tgt = tgt / tgt.sum(dim=1, keepdim=True)
+    # 2.  log-probabilities of the prediction
+    logp = F.log_softmax(pred, dim=1)
+    # 3.  KL-divergence, normalised per *box* (not per batch)
+    return F.kl_div(logp, tgt, reduction='batchmean', log_target=False)
 
 
 class PicoDetHead(nn.Module):
@@ -191,6 +199,7 @@ class PicoDetHead(nn.Module):
         self.iou_th = nms_iou
         self.reg_conv_depth = 2
         self.cls_conv_depth = cls_conv_depth
+        self.img_size = img_size
         first_cls_conv_k = 3  # 1
 
         strides_tensor = torch.tensor([8, 16, 32][:num_levels], dtype=torch.float32)
@@ -242,16 +251,15 @@ class PicoDetHead(nn.Module):
         This prevents the network from being over-confidently negative and
         makes it possible for early positive boxes to cross a 0.05 threshold.
         """
-        MULTIPLY_LOGITS = False
         # classification branches
-        cls_prior = 0.02 if MULTIPLY_LOGITS else 0.05
+        cls_prior = 0.05
         cls_bias  = -math.log((1. - cls_prior) / cls_prior)      # –4.595, use -2.19 for multiplicative sigmoid
         for conv in self.cls_pred:
             if conv.bias is not None:
                 nn.init.constant_(conv.bias, cls_bias)
 
         # objectness branches   (neutral ⇒ bias = 0.0)
-        obj_prior = 0.1 if MULTIPLY_LOGITS else 0.1
+        obj_prior = 0.1
         obj_bias = -math.log((1 - obj_prior) / obj_prior)
         for conv in self.obj_pred:
             if conv.bias is not None:
@@ -376,6 +384,7 @@ class PicoDet(nn.Module):
         self.neck = CSPPAN(in_chs=feat_chs, out_ch=neck_out_ch, lat_k=lat_k, inplace_act=inplace_act_for_head_neck)
         num_fpn_levels = len(feat_chs)
         self.debug_count = 0
+        self.img_size = img_size
         
         self.head = PicoDetHead(
             num_classes=num_classes, 

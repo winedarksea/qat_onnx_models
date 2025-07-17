@@ -175,7 +175,7 @@ class SimOTACache:
                  nc: int,
                  ctr: float = 2.5,
                  topk: int = 10,
-                 cls_cost_weight: float = 0.5,
+                 cls_cost_weight: float = 1.0,
                  debug_epochs: int = 0,         # 0 = silent
                  dynamic_k_min: int = 2,
                  ):
@@ -187,7 +187,6 @@ class SimOTACache:
         self.use_obj_logit = True
         self.simota_prefilter = False
         self.dynamic_k_min = dynamic_k_min  # 3, or 1-2
-        self.alpha = 0.0  # additive default
 
 
         # --- State for debugging system ---
@@ -205,7 +204,6 @@ class SimOTACache:
             "assignment_switches": [], # How often cls_cost changed the winning anchor
         }
 
-    # In SimOTACache.print_debug_report (or a new report function)
     def print_classification_debug_report(self):
         if not self._classification_debug_stats["cls_cost_magnitude"]:
             return
@@ -312,6 +310,16 @@ class SimOTACache:
         anchor_candidate_boxes = torch.cat([anchor_centers - s_div_2,
                                             anchor_centers + s_div_2], 1)
         iou = tvops.box_iou(gt_boxes, anchor_candidate_boxes)     # (M,A)
+        if iou.max() <= 0:
+            print("SimOTA: No overlap found between any ground-truth box and candidate anchors")
+            # Return empty/background tensors, matching the function's output signature
+            A = anchor_centers.size(0)
+            device = anchor_centers.device
+            empty_bool = torch.zeros(A, dtype=torch.bool,  device=device)
+            return empty_bool,            \
+                   torch.full((A,), -1,   dtype=torch.long,  device=device), \
+                   torch.zeros((A, 4),    dtype=torch.float32, device=device), \
+                   torch.zeros((A,),      dtype=torch.float32, device=device)
 
         gt_centres = (gt_boxes[:, :2] + gt_boxes[:, 2:]) / 2.0
         dist = (anchor_centers.unsqueeze(1)
@@ -349,28 +357,17 @@ class SimOTACache:
         idx_class_dim = gt_labels.unsqueeze(1).repeat(1, num_anchors_total) # Shape (M, A)
         logit_cls_gt = cls_logits[idx_anchor_dim, idx_class_dim] # Shape (M, A)
 
-        # cost_values_for_cls_term = torch.zeros((M, A), device=device, dtype=cls_logits.dtype)
-
-        if self.use_obj_logit and obj_logits is not None:
-            # obj_logits is (A,), unsqueeze to (1,A) for broadcasting with (M,A) logit_cls_gt
-            obj_logits_expanded = obj_logits.unsqueeze(0) # Shape (1, A)
-    
-            # The label assigner's cost MUST match the loss function's logic.
-            # Use the scaler from the model's head to compute the joint logit.
-            # .detach() is used as this is a no_grad context.
-            scaler = model_head.logit_scale.detach()
-            joint_logits_gt = logit_cls_gt + scaler * obj_logits_expanded
-            prob_joint_gt = joint_logits_gt.sigmoid()       # (M , A)
-            # cost_values_for_cls_term = -torch.log(prob_joint_gt + eps)
-        else:
-            raise ValueError("missing obj logit")
-        
-        # cost_cls = self.cls_cost_weight * cost_values_for_cls_term  # old
         cost_loc = 1.0 - iou                                # (M, A)
 
-        prob_joint_gt = (logit_cls_gt + scaler * obj_logits_expanded).sigmoid()
-        quality = iou.clamp_min(1e-6)          # (M , A)
-        cost_cls = self.cls_cost_weight * quality * (-torch.log(prob_joint_gt + eps))
+        obj_logits_expanded = obj_logits.unsqueeze(0) # Shape (1, A)
+        scaler = model_head.logit_scale.detach()
+        # prob_joint_gt = (logit_cls_gt + scaler * obj_logits_expanded).sigmoid()
+        # quality = iou.clamp_min(1e-6)          # (M , A)
+        # cost_cls = self.cls_cost_weight * quality * (-torch.log(prob_joint_gt + eps))
+        joint_logits = logit_cls_gt + scaler * obj_logits_expanded 
+        cost_cls = self.cls_cost_weight * torch.nn.functional.binary_cross_entropy_with_logits(
+              joint_logits, torch.ones_like(joint_logits), reduction='none'
+        )
 
         large_pen = torch.tensor(1e4, device=device, dtype=cost_loc.dtype) # Ensure dtype matches
         cost = (cost_loc + cost_cls
@@ -431,6 +428,7 @@ class SimOTACache:
                 print("  ⚠️  >20 % FG IoU < 0.05 – verify anchor order / scales")
 
             self.print_debug_report()
+            self.print_classification_debug_report()
         self._dbg_iter += 1
         # ----------------------------------------------------------------
 
@@ -446,13 +444,12 @@ def train_epoch(
         max_epochs: int = 500,
         quality_floor_vfl: float = 0.01,
         w_cls_loss: float = 3.0,
-        w_obj_loss: float = 2.0,  # Moderate increase from 0.5
+        w_obj_loss: float = 0.5,
         w_dfl_loss: float = 0.5,
         w_iou_initial: float = 4.0, # Slight reduction from 5.0
         w_iou_final: float = 2.0,   # Final weight for IoU loss
         iou_weight_change_epoch: int = None, # Epoch to change IoU weight
         use_focal_loss: bool = False,
-        alpha: float = 0.0,
         debug_prints: bool = True,
 ):
     model.train()
@@ -462,6 +459,18 @@ def train_epoch(
     if iou_weight_change_epoch is None:
         iou_weight_change_epoch = int(max_epochs * 0.4)
     w_iou = w_iou_initial if epoch < iou_weight_change_epoch else w_iou_final
+
+    # alpha dynamic (foreground/background balance) for VFL loss
+    total_steps = max_epochs * len(loader)
+    warmup_steps = total_steps // 5
+    alpha_max    = 0.75
+    alpha_min    = 0.25  # favor foreground early
+    def alpha_schedule(step):
+        if step < warmup_steps:                 # linear warm-up
+            return alpha_min + (alpha_max-alpha_min) * step / warmup_steps
+        # cosine decay to emphasise hard negs in late training
+        t = (step - warmup_steps) / (total_steps - warmup_steps)
+        return alpha_max * 0.5 * (1 + math.cos(math.pi*t))
 
     for i, (imgs, tgts_batch) in enumerate(loader):
         # Handle the case where the entire batch was filtered out
@@ -615,7 +624,7 @@ def train_epoch(
             ], dim=1) / strides_fg_img
             ltrb_offsets = ltrb_offsets.clamp_(0, head_reg_max_for_loss)
             dfl_target_dist = build_dfl_targets(ltrb_offsets, head_reg_max_for_loss)
-            loss_dfl = dfl_loss(reg_p_fg_img, dfl_target_dist)
+            loss_dfl = dfl_loss(reg_p_fg_img, dfl_target_dist)  #  / num_fg_img
 
             pred_ltrb_pixels_fg_img = pred_ltrb_offsets_fg_img * strides_fg_img
             pred_boxes_fg_img = torch.stack((
@@ -624,7 +633,7 @@ def train_epoch(
                 anchor_centers_fg_img[:, 0] + pred_ltrb_pixels_fg_img[:, 2],
                 anchor_centers_fg_img[:, 1] + pred_ltrb_pixels_fg_img[:, 3]
             ), dim=1)
-            loss_iou = tvops.complete_box_iou_loss(pred_boxes_fg_img, box_targets_fg_img, reduction='sum') / num_fg_img
+            loss_iou = tvops.complete_box_iou_loss(pred_boxes_fg_img, box_targets_fg_img, reduction=' sum') / num_fg_img
 
             ########
             # Joint logits: always the same expression
@@ -635,8 +644,7 @@ def train_epoch(
             
             if pos_indices.numel() == 0:          # nothing to learn from this image
                 continue
-            
-            joint_logits_pos = joint_logits[pos_indices]          # (N_fg , C)
+
             gt_labels_pos    = gt_labels[pos_indices]             # (N_fg ,)
             
             # ------------------------------------------------------------------
@@ -674,11 +682,14 @@ def train_epoch(
                 """
             
             else:                       # Varifocal Loss proper            
-                progress   = epoch / max_epochs if max_epochs > 0 else 0.0
-                alpha_dyn  = 0.15 + 0.35 * 0.5 * (1 - math.cos(math.pi * progress))
-                
+                # progress   = epoch / max_epochs if max_epochs > 0 else 0.0
+                # alpha_dyn  = 0.15 + 0.35 * 0.5 * (1 - math.cos(math.pi * progress))
+                alpha_dyn = alpha_schedule(epoch * len(loader) + i)
+                if debug_prints and i == 0 and b_idx == 0:
+                    print(f"alpha_dyn is {alpha_dyn:2f}")
+
                 targets = torch.zeros_like(joint_logits)
-                targets[pos_indices, gt_labels_pos] = torch.maximum(gt_ious[pos_indices], quality_floor_vfl)
+                targets[pos_indices, gt_labels_pos] = torch.maximum(gt_ious[pos_indices], quality_floor_vfl)  # python float ok on newer torch
                 # 2. Instantiate VFL and calculate the loss with 'sum' reduction.
                 vfl_calculator = VarifocalLoss(alpha=alpha_dyn, gamma=1.7, reduction='sum')
                 total_unreduced_loss = vfl_calculator(joint_logits, targets)
@@ -700,6 +711,9 @@ def train_epoch(
                 + w_iou * loss_iou
                 + w_obj_loss * loss_obj
             )
+            if not torch.isfinite(current_sample_total_loss):
+                print(f"current_sample_total_loss is not finite: {current_sample_total_loss}")
+                current_sample_total_loss = 10.0  # larger than normal error
             
             # for the first sample in the epoch – diagnostics only
             if num_samples_with_loss_in_batch == 0 and total_samples_contributing_to_loss_epoch == 0:
@@ -714,24 +728,25 @@ def train_epoch(
         if num_samples_with_loss_in_batch > 0:
             averaged_batch_loss = batch_total_loss / num_samples_with_loss_in_batch
             opt.zero_grad(set_to_none=True)
-            if not torch.isfinite(averaged_batch_loss):
+            if not torch.isfinite(averaged_batch_loss) or averaged_batch_loss.isnan():
                 continue
             scaler.scale(averaged_batch_loss).backward()
             scaler.unscale_(opt)
-            ### Norm sizing debug
-            total_norm = 0.0
-            for p in model.parameters():
-                if p.grad is not None:
-                    param_norm = p.grad.detach().data.norm(2)
-                    total_norm += param_norm.item() ** 2
-            total_norm = total_norm ** 0.5
-            if i % 1000 == 0: # Print every 100 batches
+
+            if i % 3000 == 0:
+                ### Norm sizing debug
+                total_norm = 0.0
+                for p in model.parameters():
+                    if p.grad is not None:
+                        param_norm = p.grad.detach().data.norm(2)
+                        total_norm += param_norm.item() ** 2
+                total_norm = total_norm ** 0.5
                 print(f"Batch {i}, Total Grad Norm: {total_norm:.4f}")
             gradient_norm = 6.0  # 1.0 to 10.0 common, max gradient observed in debug was around 6
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=gradient_norm)
             scaler.step(opt); scaler.update()
             with torch.no_grad():
-                model.head.logit_scale.clamp_(0.0, 3.0) # Clamp between 0.0 and 3.0
+                model.head.logit_scale.clamp_(-1.0, 3.0)
             tot_loss_accum += averaged_batch_loss.item() * num_samples_with_loss_in_batch
             total_samples_contributing_to_loss_epoch += num_samples_with_loss_in_batch
 
@@ -1611,7 +1626,7 @@ def main(argv: List[str] | None = None):
     pa = argparse.ArgumentParser()
     pa.add_argument('--coco_root', default='coco')
     pa.add_argument('--arch', default='mnv4c', choices=['mnv3', 'mnv4s', 'mnv4', 'mnv4c'])
-    pa.add_argument('--epochs', type=int, default=20) 
+    pa.add_argument('--epochs', type=int, default=1) 
     pa.add_argument('--batch', type=int, default=16)
     pa.add_argument('--workers', type=int, default=0)
     pa.add_argument('--device', default=None)
@@ -1625,8 +1640,7 @@ def main(argv: List[str] | None = None):
     debug_prints = True
     BACKBONE_FREEZE_EPOCHS = 2 if cfg.epochs < 12 else 3  # 0 to disable
     use_focal_loss = False
-    FOCAL_LOSS_WARMUP_EPOCHS = 4
-    OBJ_FREEZE_EPOCHS = 0
+    FOCAL_LOSS_WARMUP_EPOCHS = 2
 
     if cfg.device is None:
         cfg.device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -1856,22 +1870,6 @@ def main(argv: List[str] | None = None):
             if ep == BACKBONE_FREEZE_EPOCHS:
                 print("[INFO] Backbone unfrozen – full network now training")
 
-        if ep < OBJ_FREEZE_EPOCHS:
-            # This block will execute for epoch 0
-            if ep == 0:  # Print the message only once
-                print(f"[INFO] Epoch {ep}: Freezing objectness prediction head (obj_pred)...")
-            
-            # The target is model.head.obj_pred, which is an nn.ModuleList
-            for module in model.head.obj_pred:
-                for param in module.parameters():
-                    param.requires_grad = False
-        elif ep == OBJ_FREEZE_EPOCHS:
-            # This block will execute only once
-            print(f"[INFO] Epoch {ep}: Unfreezing objectness prediction head (obj_pred)...")
-            for module in model.head.obj_pred:
-                for param in module.parameters():
-                    param.requires_grad = True
-
         # Check if we need to advance to the next stage in the curriculum
         if current_stage_idx < len(curriculum_schedule) - 1:
             stage_duration, _ = curriculum_schedule[current_stage_idx]
@@ -1891,19 +1889,18 @@ def main(argv: List[str] | None = None):
             use_focal_loss_for_epoch = ep < FOCAL_LOSS_WARMUP_EPOCHS
             if use_focal_loss_for_epoch:
                 assigner.dynamic_k_min = 4
-                assigner.cls_cost_weight = 1.0
+                assigner.cls_cost_weight = 1.5
             if ep == FOCAL_LOSS_WARMUP_EPOCHS:
                 print("[INFO] Switching from Focal Loss warmup to Varifocal Loss for subsequent epochs.")
                 assigner.dynamic_k_min = DYN_K_MIN
                 assigner.cls_cost_weight = CLS_WEIGHT
         else:
             use_focal_loss_for_epoch = use_focal_loss
+
         if ep > 150:
             assigner.dynamic_k_min = 1
 
         model.train()
-        alpha = 0.0  # min(0.9, ep / alpha_warmup_epochs)
-        assigner.alpha = alpha
         l = train_epoch(
             model, tr_loader, opt, scaler, assigner, dev, ep, coco_label_map,
             head_nc_for_loss=original_model_head_nc,
@@ -1912,7 +1909,6 @@ def main(argv: List[str] | None = None):
             max_epochs=cfg.epochs, # Pass total epochs for VFL alpha scheduling
             quality_floor_vfl=0.02,  # try sometime 0.15
             debug_prints=debug_prints,
-            alpha=alpha,
             use_focal_loss=use_focal_loss_for_epoch,
             w_cls_loss=CLS_WEIGHT,
         )
@@ -1931,8 +1927,7 @@ def main(argv: List[str] | None = None):
 
         print(f'Epoch {ep + 1}/{cfg.epochs}  loss {l:.3f}  IoU {m:.3f}  Acc {acc:.3f}  lr={current_lr:.6f}')
         sch.step()
-        if ep % 5 == 0:
-            print(f"[INFO] Logit scaler value: {model.head.logit_scale.item():.4f}")
+        print(f"[INFO] Logit scaler value: {model.head.logit_scale.item():.4f}")
         assigner._dbg_iter = 0   
         
         ckpt_path = "picodet.pt"
@@ -2033,7 +2028,6 @@ def main(argv: List[str] | None = None):
             quality_floor_vfl=0.02,
             iou_weight_change_epoch=2,
             debug_prints=False,
-            alpha=0.0,
             w_cls_loss=CLS_WEIGHT,
             use_focal_loss=use_focal_loss,
         )
