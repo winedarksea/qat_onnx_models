@@ -105,6 +105,7 @@ class CSPBlock(nn.Module):
 class CSPPAN(nn.Module):
     def __init__(self, in_chs=(40, 112, 160), out_ch=96, lat_k=5, inplace_act: bool = False): # out_ch=64 would be faster than 96
         super().__init__()
+        self.in_chs = in_chs
         self.reduce = nn.ModuleList([GhostConv(c, out_ch, 1, inplace_act=inplace_act) for c in in_chs])
         self.lat    = nn.ModuleList([DWConv(out_ch, k=lat_k, inplace_act=inplace_act) for _ in in_chs[:-1]])
         lst_ly = len(in_chs) - 1

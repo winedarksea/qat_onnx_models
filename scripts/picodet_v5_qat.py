@@ -217,8 +217,7 @@ class SimOTACache:
         print(f"  Cost Magnitudes: Avg. Cls Cost = {avg_cls_cost:.3f}, Avg. Loc Cost = {avg_loc_cost:.3f}")
         if avg_loc_cost > avg_cls_cost * 10:
             print(f"  [ACTION] Loc cost is >> Cls cost. Consider INCREASING `cls_cost_weight` (currently {self.cls_cost_weight}).")
-        print(f"  Assignment Switch Rate: {switch_rate:.2f}%")
-        print("  (Rate at which classification cost changed the assignment from pure IoU)")
+        print(f"  Assignment Switch Rate: {switch_rate:.2f}% (Rate classification cost changed the assignment from IoU)")
         print("─" * 65 + "\n")
     
         # Reset stats
@@ -633,7 +632,7 @@ def train_epoch(
                 anchor_centers_fg_img[:, 0] + pred_ltrb_pixels_fg_img[:, 2],
                 anchor_centers_fg_img[:, 1] + pred_ltrb_pixels_fg_img[:, 3]
             ), dim=1)
-            loss_iou = tvops.complete_box_iou_loss(pred_boxes_fg_img, box_targets_fg_img, reduction=' sum') / num_fg_img
+            loss_iou = tvops.complete_box_iou_loss(pred_boxes_fg_img, box_targets_fg_img, reduction='sum') / num_fg_img
 
             ########
             # Joint logits: always the same expression
@@ -689,7 +688,8 @@ def train_epoch(
                     print(f"alpha_dyn is {alpha_dyn:2f}")
 
                 targets = torch.zeros_like(joint_logits)
-                targets[pos_indices, gt_labels_pos] = torch.maximum(gt_ious[pos_indices], quality_floor_vfl)  # python float ok on newer torch
+                floor_tensor = torch.tensor(quality_floor_vfl, dtype=gt_ious.dtype, device=gt_ious.device)
+                targets[pos_indices, gt_labels_pos] = torch.maximum(gt_ious[pos_indices], floor_tensor)
                 # 2. Instantiate VFL and calculate the loss with 'sum' reduction.
                 vfl_calculator = VarifocalLoss(alpha=alpha_dyn, gamma=1.7, reduction='sum')
                 total_unreduced_loss = vfl_calculator(joint_logits, targets)
@@ -1626,7 +1626,7 @@ def main(argv: List[str] | None = None):
     pa = argparse.ArgumentParser()
     pa.add_argument('--coco_root', default='coco')
     pa.add_argument('--arch', default='mnv4c', choices=['mnv3', 'mnv4s', 'mnv4', 'mnv4c'])
-    pa.add_argument('--epochs', type=int, default=1) 
+    pa.add_argument('--epochs', type=int, default=20) 
     pa.add_argument('--batch', type=int, default=16)
     pa.add_argument('--workers', type=int, default=0)
     pa.add_argument('--device', default=None)
