@@ -53,13 +53,13 @@ class GhostConv(nn.Module):
 
         self.primary = nn.Sequential(
             nn.Conv2d(c_in, init_ch, k, s, k // 2, bias=False),
-            nn.BatchNorm2d(init_ch), nn.ReLU6(inplace=inplace_act)
+            nn.BatchNorm2d(init_ch), nn.ReLU6(inplace=inplace_act)  # ReLU6, HardSwish
         )
         if self.cheap_ch > 0:
             self.cheap = nn.Sequential(
                 nn.Conv2d(init_ch, self.cheap_ch, dw_size, 1, dw_size // 2,
                           groups=init_ch, bias=False),
-                nn.BatchNorm2d(self.cheap_ch), nn.ReLU6(inplace=inplace_act)
+                nn.BatchNorm2d(self.cheap_ch), nn.ReLU6(inplace=inplace_act)  # ReLU6, HardSwish
             )
         else:
             self.cheap = None
@@ -85,7 +85,7 @@ class DWConv(nn.Module):
         super().__init__()
         self.dw = nn.Conv2d(c, c, k, 1, k // 2, groups=c, bias=False)
         self.bn = nn.BatchNorm2d(c)
-        self.act = nn.ReLU6(inplace=inplace_act)
+        self.act = nn.ReLU6(inplace=inplace_act)  # ReLU6, HardSwish
 
     def forward(self, x): return self.act(self.bn(self.dw(x)))
 
@@ -220,7 +220,7 @@ class PicoDetHead(nn.Module):
             )
         self.reg_conv = nn.Sequential(*[GhostConv(num_feats, num_feats, ratio=3.0, inplace_act=inplace_act) for _ in range(self.reg_conv_depth)])
         self.cls_pred = nn.ModuleList([nn.Conv2d(num_feats, self.nc, 1) for _ in range(self.nl)])
-        self.obj_pred = nn.ModuleList([nn.Conv2d(num_feats, 1, 1) for _ in range(self.nl)])
+        # self.obj_pred = nn.ModuleList([nn.Conv2d(num_feats, 1, 1) for _ in range(self.nl)])
         self.reg_pred = nn.ModuleList(
             [nn.Conv2d(num_feats, 4 * (self.reg_max + 1), 1) for _ in range(self.nl)]
         )
@@ -228,7 +228,7 @@ class PicoDetHead(nn.Module):
         # Initialized to 1.0 to match the original additive behavior at the start.
         self.logit_scale = nn.Parameter(torch.ones(1), requires_grad=True)
         self._initialize_biases()
-        
+
         for i in range(self.nl):
             s = self.strides_buffer[i].item()
             H_level = math.ceil(img_size / s)
@@ -260,11 +260,11 @@ class PicoDetHead(nn.Module):
                 nn.init.constant_(conv.bias, cls_bias)
 
         # objectness branches   (neutral ⇒ bias = 0.0)
-        obj_prior = 0.1
-        obj_bias = -math.log((1 - obj_prior) / obj_prior)
-        for conv in self.obj_pred:
-            if conv.bias is not None:
-                nn.init.constant_(conv.bias, obj_bias)
+        # obj_prior = 0.1
+        # obj_bias = -math.log((1 - obj_prior) / obj_prior)
+        # for conv in self.obj_pred:
+        #     if conv.bias is not None:
+        #         nn.init.constant_(conv.bias, obj_bias)
 
     def _dfl_to_ltrb_inference(self, x_reg_logits_3d: torch.Tensor) -> torch.Tensor:
         b, n_anchors_img, _ = x_reg_logits_3d.shape
@@ -298,7 +298,7 @@ class PicoDetHead(nn.Module):
 
     def _decode_predictions_for_level(
         self,
-        cls_logit: torch.Tensor, obj_logit: torch.Tensor, reg_logit: torch.Tensor,
+        cls_logit: torch.Tensor, reg_logit: torch.Tensor,  # obj_logit: torch.Tensor, 
         level_idx: int
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         B, _, H_feat, W_feat = cls_logit.shape
@@ -313,7 +313,7 @@ class PicoDetHead(nn.Module):
         anchor_centers = (torch.stack((xv, yv), dim=2).view(-1, 2) + 0.5) * stride
 
         cls_logit_perm = cls_logit.permute(0,2,3,1).reshape(B, H_feat*W_feat, self.nc)
-        obj_logit_perm = obj_logit.permute(0,2,3,1).reshape(B, H_feat*W_feat, 1)
+        # obj_logit_perm = obj_logit.permute(0,2,3,1).reshape(B, H_feat*W_feat, 1)
         reg_logit_perm = reg_logit.permute(0,2,3,1).reshape(B, H_feat*W_feat, 4*(self.reg_max+1))
 
         ltrb = self._dfl_to_ltrb_inference(reg_logit_perm) * stride
@@ -325,23 +325,20 @@ class PicoDetHead(nn.Module):
         boxes = torch.stack([x1,y1,x2,y2], dim=-1)
 
         # Use the learned scaler during inference to combine logits.
-        scores = (cls_logit_perm + self.logit_scale * obj_logit_perm).sigmoid()
-        # scores = (cls_logit_perm + obj_logit_perm).sigmoid()
-        # scores = cls_logit_perm.sigmoid() * obj_logit_perm.sigmoid()
-        # alpha = min(1.0, epoch / warmup_epochs)
-        # scores = ((1 - alpha) * (cls_logit_perm + obj_logit_perm).sigmoid() + alpha * (cls_logit_perm.sigmoid() * obj_logit_perm.sigmoid()))
+        # scores = (cls_logit_perm + self.logit_scale * obj_logit_perm).sigmoid()
+        scores = cls_logit_perm.sigmoid() * self.logit_scale
         return boxes, scores
 
     def forward(self, neck_feature_maps: Tuple[torch.Tensor, ...]):
         raw_cls_logits_levels: List[torch.Tensor] = []
-        raw_obj_logits_levels: List[torch.Tensor] = []
+        # raw_obj_logits_levels: List[torch.Tensor] = []
         raw_reg_logits_levels: List[torch.Tensor] = []
 
         for i, f_map_level in enumerate(neck_feature_maps):
             cls_common_feat = self.cls_conv(f_map_level)
             reg_common_feat = self.reg_conv(f_map_level)
             raw_cls_logits_levels.append(self.cls_pred[i](cls_common_feat))
-            raw_obj_logits_levels.append(self.obj_pred[i](cls_common_feat))
+            # raw_obj_logits_levels.append(self.obj_pred[i](cls_common_feat))
             raw_reg_logits_levels.append(self.reg_pred[i](reg_common_feat))
 
 
@@ -350,7 +347,7 @@ class PicoDetHead(nn.Module):
 
             return (
                 tuple(raw_cls_logits_levels),
-                tuple(raw_obj_logits_levels),
+                # tuple(raw_obj_logits_levels),
                 tuple(raw_reg_logits_levels),
                 tuple(strides_outputs_list)
             )
@@ -358,8 +355,10 @@ class PicoDetHead(nn.Module):
             decoded_boxes_all_levels: List[torch.Tensor] = []
             decoded_scores_all_levels: List[torch.Tensor] = []
             for i in range(self.nl):
-                cls_l, obj_l, reg_l = raw_cls_logits_levels[i], raw_obj_logits_levels[i], raw_reg_logits_levels[i]
-                boxes_level, scores_level = self._decode_predictions_for_level(cls_l, obj_l, reg_l, i)
+                # cls_l, obj_l, reg_l = raw_cls_logits_levels[i], raw_obj_logits_levels[i], raw_reg_logits_levels[i]
+                # boxes_level, scores_level = self._decode_predictions_for_level(cls_l, obj_l, reg_l, i)
+                cls_l, reg_l = raw_cls_logits_levels[i], raw_reg_logits_levels[i]
+                boxes_level, scores_level = self._decode_predictions_for_level(cls_l, reg_l, i)
                 decoded_boxes_all_levels.append(boxes_level)
                 decoded_scores_all_levels.append(scores_level)
             batched_all_boxes = torch.cat(decoded_boxes_all_levels, dim=1)
@@ -569,7 +568,7 @@ def get_backbone(arch: str, ckpt: str | None, img_size: int = 224):
             return_nodes = {
                 'features.3': 'C3',  # Stride 8
                 'features.6': 'C4',  # Stride 16
-                'features.12': 'C5', # Stride 32 (output of the last ConvBNReLU in the 'features' sequence)
+                'features.12': 'C5', # Stride 32 (output of the last ConvBN in the 'features' sequence)
             }
         
         print(f"[INFO] Using return_nodes for {arch}: {return_nodes}")

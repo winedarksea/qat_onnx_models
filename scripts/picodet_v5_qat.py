@@ -34,7 +34,7 @@ if False:  # this is just here for a quirk in testing, imports are still availab
 
 warnings.filterwarnings('ignore', category=UserWarning)
 SEED = 42; random.seed(SEED); torch.manual_seed(SEED)
-IMG_SIZE = 256  # also subset for speed, 224, PicoDet’s anchors assume stride-divisible sizes. Divisible by 32
+IMG_SIZE = 256  # PicoDet’s anchors assume stride-divisible sizes. Divisible by 32
 
 # ───────────────────── data & transforms ───────────────────────
 # COCO’s official 80-class list (order matters!)
@@ -184,7 +184,6 @@ class SimOTACache:
         self.k = topk
         self.cls_cost_weight = cls_cost_weight
         self.cache = {}               # anchor centres per (H,W,stride,device)
-        self.use_obj_logit = True
         self.simota_prefilter = False
         self.dynamic_k_min = dynamic_k_min  # 3, or 1-2
 
@@ -213,11 +212,15 @@ class SimOTACache:
         total_switches, total_anchors = map(sum, zip(*self._classification_debug_stats["assignment_switches"]))
         switch_rate = (total_switches / total_anchors) * 100 if total_anchors > 0 else 0
     
-        print("\n" + "─" * 20 + f" Classification Debug Report " + "─" * 20)
+        print("\n" + "─" * 20 + " Classification Debug Report " + "─" * 20)
         print(f"  Cost Magnitudes: Avg. Cls Cost = {avg_cls_cost:.3f}, Avg. Loc Cost = {avg_loc_cost:.3f}")
         if avg_loc_cost > avg_cls_cost * 10:
             print(f"  [ACTION] Loc cost is >> Cls cost. Consider INCREASING `cls_cost_weight` (currently {self.cls_cost_weight}).")
         print(f"  Assignment Switch Rate: {switch_rate:.2f}% (Rate classification cost changed the assignment from IoU)")
+        if switch_rate < 0.02:
+            print("May need to increase cls_cost_weight")
+        elif switch_rate > 0.20:
+            print("May need to decrease cls_cost_weight")
         print("─" * 65 + "\n")
     
         # Reset stats
@@ -275,7 +278,7 @@ class SimOTACache:
                  device: torch.device,  # Use a consistent device key string in order to avoid a cache miss
                  tgt: dict,              # {"boxes":(M,4), "labels":(M,)}
                  cls_logits: torch.Tensor, # Raw class logits (A, C) from model
-                 obj_logits: torch.Tensor | None = None,
+                 # obj_logits: torch.Tensor | None = None,
                  model_head = None,
                  ):
 
@@ -356,22 +359,23 @@ class SimOTACache:
         idx_class_dim = gt_labels.unsqueeze(1).repeat(1, num_anchors_total) # Shape (M, A)
         logit_cls_gt = cls_logits[idx_anchor_dim, idx_class_dim] # Shape (M, A)
 
-        cost_loc = 1.0 - iou                                # (M, A)
-
-        obj_logits_expanded = obj_logits.unsqueeze(0) # Shape (1, A)
-        scaler = model_head.logit_scale.detach()
-        # prob_joint_gt = (logit_cls_gt + scaler * obj_logits_expanded).sigmoid()
-        # quality = iou.clamp_min(1e-6)          # (M , A)
-        # cost_cls = self.cls_cost_weight * quality * (-torch.log(prob_joint_gt + eps))
-        joint_logits = logit_cls_gt + scaler * obj_logits_expanded 
-        cost_cls = self.cls_cost_weight * torch.nn.functional.binary_cross_entropy_with_logits(
-              joint_logits, torch.ones_like(joint_logits), reduction='none'
+        giou = tvops.generalized_box_iou(gt_boxes, anchor_candidate_boxes) # (M,A)
+        cost_loc = 6.0 * (1.0 - giou)
+        # -- VFL-style cost --------------------------------------
+        cls_prob = logit_cls_gt.sigmoid().clamp(1e-6, 1.0 - 1e-6)
+        # Use the square of the standard IoU as a powerful quality weight
+        quality_weight = iou ** 2
+        cost_cls = self.cls_cost_weight * quality_weight * F.binary_cross_entropy(
+            cls_prob, torch.ones_like(cls_prob), reduction='none'
         )
-
-        large_pen = torch.tensor(1e4, device=device, dtype=cost_loc.dtype) # Ensure dtype matches
-        cost = (cost_loc + cost_cls
-                + (~centre_mask.T) * large_pen
-                + (~fg_cand_mask.unsqueeze(0)) * large_pen)
+        # Combine costs with a large penalty for invalid anchors
+        large_pen = torch.tensor(1e4, device=device, dtype=cost_loc.dtype)
+        cost = (
+            cost_loc
+          + cost_cls
+          + (~centre_mask.T) * large_pen
+          + (~fg_cand_mask.unsqueeze(0)) * large_pen
+        )
 
         assign_gt = cost.argmin(0)                # (A,)
         
@@ -416,7 +420,7 @@ class SimOTACache:
             self._debug_stats["k_min_hits"].append((k_min_hits_img, M))
 
         # 7. lightweight debug  -----------------------------------------
-        if self.is_debug_mode and (self._dbg_iter % (3000 * self._dbg_mod) == 0):
+        if self.is_debug_mode and (self._dbg_iter % (2000 * self._dbg_mod) == 0):
             num_fg   = fg_final.sum().item()
             num_cand = fg_cand_mask.sum().item()
             mean_iou = iou_out[fg_final].mean().item() if num_fg else 0
@@ -433,6 +437,7 @@ class SimOTACache:
 
         return fg_final, gt_lbl_out, gt_box_out, iou_out
 
+
 # ───────────────────── train / val loops ────────────────────────
 def train_epoch(
         model: nn.Module, loader, opt, scaler, assigner: SimOTACache,
@@ -440,12 +445,12 @@ def train_epoch(
         head_nc_for_loss: int,
         head_reg_max_for_loss: int,
         dfl_project_buffer_for_decode: torch.Tensor,
-        max_epochs: int = 500,
+        max_epochs: int = 300,
         quality_floor_vfl: float = 0.01,
         w_cls_loss: float = 3.0,
         w_obj_loss: float = 0.5,
         w_dfl_loss: float = 0.5,
-        w_iou_initial: float = 4.0, # Slight reduction from 5.0
+        w_iou_initial: float = 4.0,
         w_iou_final: float = 2.0,   # Final weight for IoU loss
         iou_weight_change_epoch: int = None, # Epoch to change IoU weight
         use_focal_loss: bool = False,
@@ -458,18 +463,6 @@ def train_epoch(
     if iou_weight_change_epoch is None:
         iou_weight_change_epoch = int(max_epochs * 0.4)
     w_iou = w_iou_initial if epoch < iou_weight_change_epoch else w_iou_final
-
-    # alpha dynamic (foreground/background balance) for VFL loss
-    total_steps = max_epochs * len(loader)
-    warmup_steps = total_steps // 5
-    alpha_max    = 0.75
-    alpha_min    = 0.25  # favor foreground early
-    def alpha_schedule(step):
-        if step < warmup_steps:                 # linear warm-up
-            return alpha_min + (alpha_max-alpha_min) * step / warmup_steps
-        # cosine decay to emphasise hard negs in late training
-        t = (step - warmup_steps) / (total_steps - warmup_steps)
-        return alpha_max * 0.5 * (1 + math.cos(math.pi*t))
 
     for i, (imgs, tgts_batch) in enumerate(loader):
         # Handle the case where the entire batch was filtered out
@@ -485,11 +478,12 @@ def train_epoch(
 
         if not model.training:
              raise RuntimeError("train_epoch called with model not in training mode.")
-        if len(model_outputs) != 4:
+        if len(model_outputs) != 3:  # 4 for objectness
             raise ValueError(
-                f"Expected 4 outputs from model in training mode (preds_cls, preds_obj, preds_reg, strides), got {len(model_outputs)}"
+                f"Expected 4 outputs from model in training mode (preds_cls, #preds_obj, preds_reg, strides), got {len(model_outputs)}"
             )
-        cls_preds_levels, obj_preds_levels, reg_preds_levels, strides_per_level_tensors = model_outputs
+        # cls_preds_levels, obj_preds_levels, reg_preds_levels, strides_per_level_tensors = model_outputs
+        cls_preds_levels, reg_preds_levels, strides_per_level_tensors = model_outputs
 
         bs = imgs.size(0)
         fmap_shapes = []
@@ -550,10 +544,10 @@ def train_epoch(
                 lvl[b_idx].permute(1, 2, 0).reshape(-1, head_nc_for_loss)
                 for lvl in cls_preds_levels
             ], dim=0)                                     # (A, C)
-            obj_p_img = torch.cat([
-                lvl[b_idx].permute(1, 2, 0).reshape(-1)
-                for lvl in obj_preds_levels
-            ], dim=0)                                     # (A,)
+            # obj_p_img = torch.cat([
+            #     lvl[b_idx].permute(1, 2, 0).reshape(-1)
+            #     for lvl in obj_preds_levels
+            # ], dim=0)                                     # (A,)
             reg_p_img = torch.cat([
                 lvl[b_idx].permute(1,2,0).reshape(-1, 4*(head_reg_max_for_loss+1))
                 for lvl in reg_preds_levels
@@ -562,7 +556,7 @@ def train_epoch(
             fg_mask_img, gt_labels, gt_boxes, gt_ious = assigner(
                     fmap_shapes, device, target_dict_for_assigner,
                     cls_logits=cls_p_img, # Raw class logits
-                    obj_logits=obj_p_img, # Raw objectness logits (or None)
+                    # obj_logits=obj_p_img,
                     model_head=model.head,
             )
             reg_p_fg_img = reg_p_img[fg_mask_img]
@@ -636,7 +630,8 @@ def train_epoch(
 
             ########
             # Joint logits: always the same expression
-            joint_logits = cls_p_img + model.head.logit_scale * obj_p_img.unsqueeze(1)
+            # joint_logits = cls_p_img + model.head.logit_scale * obj_p_img.unsqueeze(1)
+            joint_logits = cls_p_img
             
             # foreground indices for this image
             pos_indices = fg_mask_img.nonzero(as_tuple=False).squeeze(1)  # (N_fg,)
@@ -649,6 +644,7 @@ def train_epoch(
             # ------------------------------------------------------------------
             # 2. Classification loss
             # ------------------------------------------------------------------
+            loss_obj = torch.tensor(0.0)
             if use_focal_loss:          # warm-up path (plain BCE is fine here)
                 cls_logits_pos = cls_p_img[pos_indices]
                 gt_labels_pos = gt_labels[pos_indices]
@@ -666,12 +662,12 @@ def train_epoch(
                 ) / loss_norm_factor
                 # 2. Objectness Loss (Binary Cross-Entropy)
                 # Applied to ALL anchors (foreground and background).
-                obj_targets = torch.zeros_like(obj_p_img)
+                # obj_targets = torch.zeros_like(obj_p_img)
                 # For foreground anchors, the target is their IoU with the matched GT box.
                 # This teaches the model that higher IoU boxes are "more object".
-                obj_targets[fg_mask_img] = gt_ious[fg_mask_img]
+                # obj_targets[fg_mask_img] = gt_ious[fg_mask_img]
                 # Use standard BCE with logits, averaged over all anchors.
-                loss_obj = F.binary_cross_entropy_with_logits(obj_p_img, obj_targets, reduction='mean')
+                # loss_obj = F.binary_cross_entropy_with_logits(obj_p_img, obj_targets, reduction='mean')
 
                 """
                 alpha_focal, gamma = 0.25, 2.0
@@ -680,28 +676,24 @@ def train_epoch(
                 ) / loss_norm_factor    
                 """
             
-            else:                       # Varifocal Loss proper            
-                # progress   = epoch / max_epochs if max_epochs > 0 else 0.0
-                # alpha_dyn  = 0.15 + 0.35 * 0.5 * (1 - math.cos(math.pi * progress))
-                alpha_dyn = alpha_schedule(epoch * len(loader) + i)
-                if debug_prints and i == 0 and b_idx == 0:
-                    print(f"alpha_dyn is {alpha_dyn:2f}")
+            else:  # Varifocal Loss proper
+                alpha_dyn = 0.75
+                gamma = 2.0
 
                 targets = torch.zeros_like(joint_logits)
-                floor_tensor = torch.tensor(quality_floor_vfl, dtype=gt_ious.dtype, device=gt_ious.device)
-                targets[pos_indices, gt_labels_pos] = torch.maximum(gt_ious[pos_indices], floor_tensor)
+                # floor_tensor = torch.tensor(quality_floor_vfl, dtype=gt_ious.dtype, device=gt_ious.device)
                 # 2. Instantiate VFL and calculate the loss with 'sum' reduction.
-                vfl_calculator = VarifocalLoss(alpha=alpha_dyn, gamma=1.7, reduction='sum')
+                vfl_calculator = VarifocalLoss(alpha=alpha_dyn, gamma=gamma, reduction='sum')
                 total_unreduced_loss = vfl_calculator(joint_logits, targets)
                 # 3. CRITICAL: Normalize by the number of positive examples.
                 loss_cls = total_unreduced_loss / max(1, num_fg_img)
 
                 # loss_obj = torch.tensor(0.0, device=device)
-                obj_targets = torch.zeros_like(obj_p_img)
-                obj_targets[fg_mask_img] = gt_ious[fg_mask_img]
+                # obj_targets = torch.zeros_like(obj_p_img)
+                # obj_targets[fg_mask_img] = gt_ious[fg_mask_img]
                 # 2. Calculate the BCE loss, averaged over ALL anchors in the image.
                 # This strong signal on background anchors is what reduces box overproduction.
-                loss_obj = F.binary_cross_entropy_with_logits(obj_p_img, obj_targets, reduction='mean')
+                # loss_obj = F.binary_cross_entropy_with_logits(obj_p_img, obj_targets, reduction='mean')
                 w_obj_loss = 0.1  # small for initial testing of adding to VFL
             
             # Final sample loss (obj already inside joint_logits)
@@ -785,24 +777,25 @@ def train_epoch(
                     cls_logits_all = torch.cat(
                         [lvl.detach().permute(0, 2, 3, 1).reshape(-1, head_nc_for_loss)
                          for lvl in cls_preds_levels], dim=0)                # [A_total , C]
-                    obj_logits_all = torch.cat(
-                        [lvl.detach().permute(0, 2, 3, 1).reshape(-1, 1)
-                         for lvl in obj_preds_levels], dim=0)                # [A_total , 1]
+                    # obj_logits_all = torch.cat(
+                    #     [lvl.detach().permute(0, 2, 3, 1).reshape(-1, 1)
+                    #      for lvl in obj_preds_levels], dim=0)                # [A_total , 1]
             
                     # Classification confidence analysis
                     cls_probs = cls_logits_all.sigmoid()
-                    obj_probs = obj_logits_all.sigmoid()
-                    joint_conf = (cls_logits_all + obj_logits_all).sigmoid().flatten()
+                    # obj_probs = obj_logits_all.sigmoid()
+                    # joint_conf = (cls_logits_all + obj_logits_all).sigmoid().flatten()
+                    joint_conf = cls_logits_all.sigmoid().flatten()
                     
                     # Per-class prediction distribution
                     max_cls_probs, max_cls_indices = cls_probs.max(dim=1)
                     print(f"\n[DBG] Epoch {epoch} Classification Analysis:")
                     print(f"  Cls logits range: [{cls_logits_all.min().item():.3f}, {cls_logits_all.max().item():.3f}]")
-                    print(f"  Obj logits range: [{obj_logits_all.min().item():.3f}, {obj_logits_all.max().item():.3f}]")
+                    # print(f"  Obj logits range: [{obj_logits_all.min().item():.3f}, {obj_logits_all.max().item():.3f}]")
                     print(f"  Joint conf range: [{joint_conf.min().item():.3f}, {joint_conf.max().item():.3f}]")
                     
                     # Class distribution
-                    print(f"  Top predicted classes:")
+                    print("  Top predicted classes:")
                     for class_id in range(min(5, head_nc_for_loss)):
                         count = (max_cls_indices == class_id).sum().item()
                         avg_conf = cls_probs[:, class_id].mean().item()
@@ -1110,7 +1103,7 @@ class PostprocessorForONNX(nn.Module):
         # These will be part of the ONNX graph as constants if not inputs.
         self.register_buffer('strides_buffer', head_ref.strides_buffer.clone().detach(), persistent=False)
         self.register_buffer('dfl_project_buffer', head_ref.dfl_project_buffer.clone().detach(), persistent=False)
-        self.register_buffer('logit_scale', head_ref.logit_scale.clone().detach(), persistent=False)
+        # self.register_buffer('logit_scale', head_ref.logit_scale.clone().detach(), persistent=False)
         for i in range(self.nl):
             anchor_points = getattr(head_ref, f'anchor_points_level_{i}')
             self.register_buffer(f'anchor_points_level_{i}', anchor_points.clone().detach(), persistent=False)
@@ -1135,7 +1128,7 @@ class PostprocessorForONNX(nn.Module):
     def _decode_predictions_for_level_onnx(
             self,
             cls_logit: torch.Tensor,  # (B, NC, H_feat, W_feat)
-            obj_logit: torch.Tensor,  # (B, 1,  H_feat, W_feat)
+            # obj_logit: torch.Tensor,  # (B, 1,  H_feat, W_feat)
             reg_logit: torch.Tensor,  # (B, 4*(reg_max+1), H_feat, W_feat)
             level_idx: int
         ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -1157,7 +1150,7 @@ class PostprocessorForONNX(nn.Module):
         # (B, C, H, W) -> (B, H, W, C) -> (B, H*W, C)
         # For ONNX, ensure reshape uses -1 carefully if B or H*W is dynamic.
         cls_logit_perm = cls_logit.permute(0, 2, 3, 1).contiguous().view(B, num_anchors_level, self.nc)
-        obj_logit_perm = obj_logit.permute(0, 2, 3, 1).contiguous().view(B, num_anchors_level, 1)
+        # obj_logit_perm = obj_logit.permute(0, 2, 3, 1).contiguous().view(B, num_anchors_level, 1)
         reg_logit_perm = reg_logit.permute(0, 2, 3, 1).contiguous().view(B, num_anchors_level, 4 * (self.reg_max + 1))
 
         ltrb_offsets = self._dfl_to_ltrb_inference_onnx(reg_logit_perm)
@@ -1173,37 +1166,34 @@ class PostprocessorForONNX(nn.Module):
         y2 = ap_expanded[..., 1] + ltrb_offsets_scaled[..., 3]
         boxes_xyxy_level = torch.stack([x1, y1, x2, y2], dim=-1) # Shape (B, num_anchors_level, 4)
 
-        # For ONNX, sigmoid should be torch.sigmoid
-        # scores_level = torch.sigmoid(cls_logit_perm) * torch.sigmoid(obj_logit_perm)
-        # scores_level = torch.sigmoid(cls_logit_perm + obj_logit_perm)
-        # Use the baked-in scaler value for ONNX post-processing.
-        scores_level = torch.sigmoid(cls_logit_perm + self.logit_scale * obj_logit_perm)
+        # scores_level = torch.sigmoid(cls_logit_perm + self.logit_scale * obj_logit_perm)
+        scores_level = torch.sigmoid(cls_logit_perm)
 
         return boxes_xyxy_level, scores_level
 
     def forward(self, raw_model_outputs_nested_tuple: Tuple[Tuple[torch.Tensor, ...], ...]):
-        if not isinstance(raw_model_outputs_nested_tuple, tuple) or len(raw_model_outputs_nested_tuple) < 3:
+        if not isinstance(raw_model_outputs_nested_tuple, tuple) or len(raw_model_outputs_nested_tuple) < 2:
             raise ValueError(
                 f"PostprocessorForONNX expected a nested tuple with at least 3 inner tuples, "
                 f"got type {type(raw_model_outputs_nested_tuple)} with length {len(raw_model_outputs_nested_tuple) if isinstance(raw_model_outputs_nested_tuple, tuple) else 'N/A'}"
             )
 
         raw_cls_logits_levels_tuple = raw_model_outputs_nested_tuple[0]
-        raw_obj_logits_levels_tuple = raw_model_outputs_nested_tuple[1]
-        raw_reg_logits_levels_tuple = raw_model_outputs_nested_tuple[2]
+        # raw_obj_logits_levels_tuple = raw_model_outputs_nested_tuple[1]  # below as [2]
+        raw_reg_logits_levels_tuple = raw_model_outputs_nested_tuple[1]
 
         if not (isinstance(raw_cls_logits_levels_tuple, tuple) and
-                  isinstance(raw_obj_logits_levels_tuple, tuple) and
+                  # isinstance(raw_obj_logits_levels_tuple, tuple) and
                   isinstance(raw_reg_logits_levels_tuple, tuple)):
             raise ValueError("Inner elements of the input to PostprocessorForONNX are not tuples as expected.")
 
         if not (len(raw_cls_logits_levels_tuple) == self.nl and
-                len(raw_obj_logits_levels_tuple) == self.nl and
+                # len(raw_obj_logits_levels_tuple) == self.nl and
                 len(raw_reg_logits_levels_tuple) == self.nl):
             raise ValueError(
                 f"PostprocessorForONNX: Inner tuples do not have the expected length ({self.nl}). "
                 f"Got lengths: cls={len(raw_cls_logits_levels_tuple)}, "
-                f"obj={len(raw_obj_logits_levels_tuple)}, "
+                # f"obj={len(raw_obj_logits_levels_tuple)}, "
                 f"reg={len(raw_reg_logits_levels_tuple)}"
             )
 
@@ -1212,12 +1202,11 @@ class PostprocessorForONNX(nn.Module):
 
         for i in range(self.nl):
             cls_l = raw_cls_logits_levels_tuple[i]
-            obj_l = raw_obj_logits_levels_tuple[i]
+            # obj_l = raw_obj_logits_levels_tuple[i]
             reg_l = raw_reg_logits_levels_tuple[i]
 
-            boxes_level, scores_level = self._decode_predictions_for_level_onnx(
-                cls_l, obj_l, reg_l, i
-            )
+            # boxes_level, scores_level = self._decode_predictions_for_level_onnx(cls_l, obj_l, reg_l, i)
+            boxes_level, scores_level = self._decode_predictions_for_level_onnx(cls_l, reg_l, i)
             decoded_boxes_all_levels_list.append(boxes_level)
             decoded_scores_all_levels_list.append(scores_level)
 
@@ -1437,7 +1426,7 @@ def save_fp32_onnx_reference(model, cfg):
             'raw_boxes':    {0: 'batch', 1: 'anchors'},
             'raw_scores':   {0: 'batch', 1: 'anchors'}
         },
-        opset_version=18,
+        opset_version=19,  # 14 for hard-swish
         keep_initializers_as_inputs=False,
         do_constant_folding=True,
     )
@@ -1627,7 +1616,7 @@ def main(argv: List[str] | None = None):
     pa.add_argument('--coco_root', default='coco')
     pa.add_argument('--arch', default='mnv4c', choices=['mnv3', 'mnv4s', 'mnv4', 'mnv4c'])
     pa.add_argument('--epochs', type=int, default=20) 
-    pa.add_argument('--batch', type=int, default=16)
+    pa.add_argument('--batch', type=int, default=64)
     pa.add_argument('--workers', type=int, default=0)
     pa.add_argument('--device', default=None)
     pa.add_argument('--out', default='picodet_v5_int8.onnx')
@@ -1640,7 +1629,7 @@ def main(argv: List[str] | None = None):
     debug_prints = True
     BACKBONE_FREEZE_EPOCHS = 2 if cfg.epochs < 12 else 3  # 0 to disable
     use_focal_loss = False
-    FOCAL_LOSS_WARMUP_EPOCHS = 2
+    FOCAL_LOSS_WARMUP_EPOCHS = 1
 
     if cfg.device is None:
         cfg.device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -1653,7 +1642,7 @@ def main(argv: List[str] | None = None):
         lat_k = 5
         cls_conv_depth = 2
     elif IMG_SIZE < 512:
-        out_ch = 128
+        out_ch = 96
         lat_k = 5
         cls_conv_depth = 3
     else:
@@ -1844,7 +1833,7 @@ def main(argv: List[str] | None = None):
     CLS_WEIGHT = 3.0 if use_focal_loss else CLS_WEIGHT
     assigner = SimOTACache(
         nc=model.head.nc,
-        ctr=3.0,  # 2.5,   1.5 might be better later for strict bounding
+        ctr=4.0,  # 2.5,   1.5 might be better later for strict bounding
         topk=10,  # 10
         cls_cost_weight=CLS_WEIGHT,  # Increased to emphasize classification
         debug_epochs=5 if debug_prints else 0,
@@ -1887,17 +1876,32 @@ def main(argv: List[str] | None = None):
         ##########
         if FOCAL_LOSS_WARMUP_EPOCHS is not None:
             use_focal_loss_for_epoch = ep < FOCAL_LOSS_WARMUP_EPOCHS
-            if use_focal_loss_for_epoch:
-                assigner.dynamic_k_min = 4
-                assigner.cls_cost_weight = 1.5
             if ep == FOCAL_LOSS_WARMUP_EPOCHS:
                 print("[INFO] Switching from Focal Loss warmup to Varifocal Loss for subsequent epochs.")
-                assigner.dynamic_k_min = DYN_K_MIN
-                assigner.cls_cost_weight = CLS_WEIGHT
         else:
             use_focal_loss_for_epoch = use_focal_loss
-
-        if ep > 150:
+        if ep < 2:
+            assigner.dynamic_k_min = 4
+            assigner.cls_cost_weight = 0.1
+            CLS_WEIGHT = 0.1
+        elif ep < 4:
+            assigner.dynamic_k_min = 4
+            assigner.cls_cost_weight = 0.2
+            CLS_WEIGHT = 0.4
+        elif ep < 6:
+            assigner.dynamic_k_min = 3
+            assigner.cls_cost_weight = 1.0
+            CLS_WEIGHT = 2.0
+        elif ep < 8:
+            assigner.dynamic_k_min = 2
+            assigner.cls_cost_weight = 1.5
+            CLS_WEIGHT = 4.0
+        elif ep < 10:
+            CLS_WEIGHT = 6.0
+        elif ep == 15:
+            assigner.cls_cost_weight = 2.5
+            CLS_WEIGHT = 8.0
+        elif ep > 150:
             assigner.dynamic_k_min = 1
 
         model.train()
@@ -1914,14 +1918,17 @@ def main(argv: List[str] | None = None):
         )
         # ... (validation) ...
         model.eval()
-        m, acc = quick_val_iou(
-            model, vl_loader, dev,
-            score_thresh=model.head.score_th,
-            iou_thresh=model.head.iou_th,
-            max_detections=model.head.max_det,
-            epoch_num=ep, run_name="in epoch",
-            debug_prints=debug_prints,
-        )
+        try:
+            m, acc = quick_val_iou(
+                model, vl_loader, dev,
+                score_thresh=model.head.score_th,
+                iou_thresh=model.head.iou_th,
+                max_detections=model.head.max_det,
+                epoch_num=ep, run_name="in epoch",
+                debug_prints=debug_prints,
+            )
+        except Exception as e:
+            print(repr(e))
         for param_group in opt.param_groups:
             current_lr = param_group['lr']
 
