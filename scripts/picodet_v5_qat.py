@@ -186,7 +186,7 @@ class SimOTACache:
         self.cache = {}               # anchor centres per (H,W,stride,device)
         self.simota_prefilter = False
         self.dynamic_k_min = dynamic_k_min  # 3, or 1-2
-
+        self.power = 1.0 
 
         # --- State for debugging system ---
         self._dbg_mod  = debug_epochs
@@ -218,9 +218,9 @@ class SimOTACache:
             print(f"  [ACTION] Loc cost is >> Cls cost. Consider INCREASING `cls_cost_weight` (currently {self.cls_cost_weight}).")
         print(f"  Assignment Switch Rate: {switch_rate:.2f}% (Rate classification cost changed the assignment from IoU)")
         if switch_rate < 0.02:
-            print("May need to increase cls_cost_weight")
+            print("  May need to increase cls_cost_weight")
         elif switch_rate > 0.20:
-            print("May need to decrease cls_cost_weight")
+            print("  May need to decrease cls_cost_weight")
         print("─" * 65 + "\n")
     
         # Reset stats
@@ -364,7 +364,7 @@ class SimOTACache:
         # -- VFL-style cost --------------------------------------
         cls_prob = logit_cls_gt.sigmoid().clamp(1e-6, 1.0 - 1e-6)
         # Use the square of the standard IoU as a powerful quality weight
-        quality_weight = iou ** 2
+        quality_weight = iou.pow(self.power)
         cost_cls = self.cls_cost_weight * quality_weight * F.binary_cross_entropy(
             cls_prob, torch.ones_like(cls_prob), reduction='none'
         )
@@ -433,6 +433,7 @@ class SimOTACache:
             self.print_debug_report()
             self.print_classification_debug_report()
         self._dbg_iter += 1
+        self.mean_fg_iou = iou_out[fg_final].mean().item() if fg_final.any() else 0.0
         # ----------------------------------------------------------------
 
         return fg_final, gt_lbl_out, gt_box_out, iou_out
@@ -449,7 +450,7 @@ def train_epoch(
         quality_floor_vfl: float = 0.01,
         w_cls_loss: float = 3.0,
         w_obj_loss: float = 0.5,
-        w_dfl_loss: float = 0.5,
+        w_dfl_loss: float = 0.25,
         w_iou_initial: float = 4.0,
         w_iou_final: float = 2.0,   # Final weight for IoU loss
         iou_weight_change_epoch: int = None, # Epoch to change IoU weight
@@ -463,6 +464,7 @@ def train_epoch(
     if iou_weight_change_epoch is None:
         iou_weight_change_epoch = int(max_epochs * 0.4)
     w_iou = w_iou_initial if epoch < iou_weight_change_epoch else w_iou_final
+    skips = 0
 
     for i, (imgs, tgts_batch) in enumerate(loader):
         # Handle the case where the entire batch was filtered out
@@ -565,8 +567,9 @@ def train_epoch(
             num_fg_img = fg_mask_img.sum().item()
             loss_norm_factor = float(num_fg_img)
             if num_fg_img == 0:
-                # if debug_prints:
-                #     print(f"[DEBUG] Epoch {epoch}, Batch {i}, Image {b_idx} — No foreground samples.")
+                skips += 1
+                if skips == 100:
+                    print("Large number of skipped batches, likely there is a bug")
                 continue
 
             ##########
@@ -681,6 +684,10 @@ def train_epoch(
                 gamma = 2.0
 
                 targets = torch.zeros_like(joint_logits)
+                if pos_indices.numel() > 0:                       # foreground rows only
+                    gt_labels_pos = gt_labels[pos_indices]
+                    gt_ious_pos = gt_ious[pos_indices].clamp_min(1e-6)
+                    targets[pos_indices, gt_labels_pos] = gt_ious_pos
                 # floor_tensor = torch.tensor(quality_floor_vfl, dtype=gt_ious.dtype, device=gt_ious.device)
                 # 2. Instantiate VFL and calculate the loss with 'sum' reduction.
                 vfl_calculator = VarifocalLoss(alpha=alpha_dyn, gamma=gamma, reduction='sum')
@@ -737,8 +744,8 @@ def train_epoch(
             gradient_norm = 6.0  # 1.0 to 10.0 common, max gradient observed in debug was around 6
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=gradient_norm)
             scaler.step(opt); scaler.update()
-            with torch.no_grad():
-                model.head.logit_scale.clamp_(-1.0, 3.0)
+            # with torch.no_grad():
+            #     model.head.logit_scale.clamp_(-1.0, 3.0)
             tot_loss_accum += averaged_batch_loss.item() * num_samples_with_loss_in_batch
             total_samples_contributing_to_loss_epoch += num_samples_with_loss_in_batch
 
@@ -1882,11 +1889,11 @@ def main(argv: List[str] | None = None):
             use_focal_loss_for_epoch = use_focal_loss
         if ep < 2:
             assigner.dynamic_k_min = 4
-            assigner.cls_cost_weight = 0.1
-            CLS_WEIGHT = 0.1
+            assigner.cls_cost_weight = 0.3
+            CLS_WEIGHT = 0.3
         elif ep < 4:
             assigner.dynamic_k_min = 4
-            assigner.cls_cost_weight = 0.2
+            assigner.cls_cost_weight = 0.4
             CLS_WEIGHT = 0.4
         elif ep < 6:
             assigner.dynamic_k_min = 3
@@ -1903,6 +1910,14 @@ def main(argv: List[str] | None = None):
             CLS_WEIGHT = 8.0
         elif ep > 150:
             assigner.dynamic_k_min = 1
+
+        if assigner.mean_fg_iou < 0.10:
+            assigner.power = 0.0
+        elif assigner.mean_fg_iou < 0.25:
+            assigner.power = 1.0
+        else:
+            assigner.power = min(2.0, assigner.power + 0.25)
+            print(f"epoch {ep} and assigner IoU weighting power is {assigner.power}")
 
         model.train()
         l = train_epoch(
@@ -1934,7 +1949,7 @@ def main(argv: List[str] | None = None):
 
         print(f'Epoch {ep + 1}/{cfg.epochs}  loss {l:.3f}  IoU {m:.3f}  Acc {acc:.3f}  lr={current_lr:.6f}')
         sch.step()
-        print(f"[INFO] Logit scaler value: {model.head.logit_scale.item():.4f}")
+        # print(f"[INFO] Logit scaler value: {model.head.logit_scale.item():.4f}")
         assigner._dbg_iter = 0   
         
         ckpt_path = "picodet.pt"
@@ -1995,10 +2010,10 @@ def main(argv: List[str] | None = None):
         buf = getattr(orig_head, f'anchor_points_level_{i}')
         qat_head.register_buffer(f'anchor_points_level_{i}', buf, persistent=False)
     qat_head.register_buffer('dfl_project_buffer', orig_head.dfl_project_buffer, persistent=False)
-    qat_head.register_parameter(
-        'logit_scale',
-        nn.Parameter(orig_head.logit_scale.detach().clone(), requires_grad=True)
-    )
+    # qat_head.register_parameter(
+    #     'logit_scale',
+    #     nn.Parameter(orig_head.logit_scale.detach().clone(), requires_grad=True)
+    # )
     qat_model = qat_model.to(dev)
     print("[INFO] QAT model prepared and moved to device.")
 

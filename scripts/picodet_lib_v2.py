@@ -226,7 +226,7 @@ class PicoDetHead(nn.Module):
         )
         
         # Initialized to 1.0 to match the original additive behavior at the start.
-        self.logit_scale = nn.Parameter(torch.ones(1), requires_grad=True)
+        # self.logit_scale = nn.Parameter(torch.ones(1), requires_grad=True)
         self._initialize_biases()
 
         for i in range(self.nl):
@@ -243,28 +243,25 @@ class PicoDetHead(nn.Module):
             # _anchor_points_centers_list.append(anchor_points_center) # Not strictly needed if directly registering
             self.register_buffer(f'anchor_points_level_{i}', anchor_points_center, persistent=False)
 
-    def _initialize_biases(self) -> None:
-        """
-        Initialise conv-biases so that:
-          • class-scores start with the common “p = 0.01” prior  (≈ –4.595)
-          • objectness scores start at 0.0  (p = 0.5) so that
-            the *joint* score  sigmoid(cls + obj)  also starts at 0.01
-        This prevents the network from being over-confidently negative and
-        makes it possible for early positive boxes to cross a 0.05 threshold.
-        """
-        # classification branches
+    def _initialize_biases(self):
+    
+        # ---- class branch (unchanged) ----
         cls_prior = 0.05
-        cls_bias  = -math.log((1. - cls_prior) / cls_prior)      # –4.595, use -2.19 for multiplicative sigmoid
+        cls_bias  = -math.log((1-cls_prior)/cls_prior)
         for conv in self.cls_pred:
-            if conv.bias is not None:
-                nn.init.constant_(conv.bias, cls_bias)
-
-        # objectness branches   (neutral ⇒ bias = 0.0)
-        # obj_prior = 0.1
-        # obj_bias = -math.log((1 - obj_prior) / obj_prior)
-        # for conv in self.obj_pred:
-        #     if conv.bias is not None:
-        #         nn.init.constant_(conv.bias, obj_bias)
+            nn.init.constant_(conv.bias, cls_bias)
+    
+        # ---- regression branch ----
+        peak_prob = 0.90
+        delta = math.log((peak_prob / (1 - peak_prob)) * self.reg_max)
+    
+        pattern = torch.zeros(4 * (self.reg_max + 1), device=self.cls_pred[0].weight.device)
+        for i in range(4):                       # l, t, r, b
+            pattern[i * (self.reg_max + 1)] = delta
+    
+        for conv in self.reg_pred:
+            nn.init.zeros_(conv.weight)
+            conv.bias.data.copy_(pattern)
 
     def _dfl_to_ltrb_inference(self, x_reg_logits_3d: torch.Tensor) -> torch.Tensor:
         b, n_anchors_img, _ = x_reg_logits_3d.shape
@@ -326,7 +323,7 @@ class PicoDetHead(nn.Module):
 
         # Use the learned scaler during inference to combine logits.
         # scores = (cls_logit_perm + self.logit_scale * obj_logit_perm).sigmoid()
-        scores = cls_logit_perm.sigmoid() * self.logit_scale
+        scores = cls_logit_perm.sigmoid()
         return boxes, scores
 
     def forward(self, neck_feature_maps: Tuple[torch.Tensor, ...]):

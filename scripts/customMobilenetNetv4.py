@@ -1,31 +1,75 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import List, Tuple, Optional, Type, Union, Dict
+from typing import List, Tuple, Optional, Type, Union, Dict, Final
 
 try:
     from timm.models.layers import DropPath
 except ImportError:
     # Fallback DropPath if timm is not available
+    def drop_path(
+        x: torch.Tensor,
+        drop_prob: float = 0.,
+        training: bool = False,
+        scale_by_keep: bool = True,
+    ) -> torch.Tensor:
+        """
+        DropPath / stochastic‑depth (per‑sample) as a functional op.
+    
+        Parameters
+        ----------
+        x : Tensor
+            Arbitrary N‑D tensor with shape (B, …).
+        drop_prob : float, optional
+            Probability of dropping the *entire* residual path.
+        training : bool, optional
+            Apply only when True.
+        scale_by_keep : bool, optional
+            If True, divide kept samples by `keep_prob` to preserve expectation.
+    
+        Returns
+        -------
+        Tensor
+            Tensor with the same shape/dtype/device as `x`.
+        """
+        if drop_prob == 0. or not training:
+            return x
+    
+        if not 0. <= drop_prob <= 1.:
+            raise ValueError("drop_prob must be in [0, 1]")
+    
+        keep_prob: Final[float] = 1.0 - drop_prob
+        # broadcast mask over all non‑batch dims
+        mask = torch.rand(
+            (x.shape[0],) + (1,) * (x.ndim - 1),
+            dtype=x.dtype,
+            device=x.device
+        ).floor_().add_(keep_prob).floor_()      # faster than bernoulli_
+    
+        if scale_by_keep and keep_prob > 0:
+            mask.div_(keep_prob)
+    
+        return x * mask
+
     class DropPath(nn.Module):
-        """Drop paths (Stochastic Depth) per sample (when applied in main path of residual blocks)."""
+        """Drop paths (Stochastic Depth) per sample. 100 % compatible with timm."""
         def __init__(self, drop_prob: float = 0., scale_by_keep: bool = True):
-            super(DropPath, self).__init__()
-            self.drop_prob = drop_prob
+            super().__init__()
+            if not 0. <= drop_prob <= 1.:
+                raise ValueError("drop_prob must be in [0, 1]")
+            self.drop_prob = float(drop_prob)
             self.scale_by_keep = scale_by_keep
-
-        def forward(self, x):
-            if self.drop_prob == 0. or not self.training:
-                return x
-            keep_prob = 1 - self.drop_prob
-            shape = (x.shape[0],) + (1,) * (x.ndim - 1)
-            random_tensor = x.new_empty(shape).bernoulli_(keep_prob)
-            if keep_prob > 0.0 and self.scale_by_keep:
-                random_tensor.div_(keep_prob)
-            return x * random_tensor
-
+    
+        def forward(self, x: torch.Tensor) -> torch.Tensor:  # type: ignore[override]
+            return drop_path(
+                x,
+                self.drop_prob,
+                self.training,
+                self.scale_by_keep,
+            )
+    
         def extra_repr(self) -> str:
-            return f'drop_prob={round(self.drop_prob,3):0.3f}'
+            return f"p={self.drop_prob:.3f}, scale_by_keep={self.scale_by_keep}"
 
 
 def _make_divisible(v: float, divisor: int, min_value: Optional[int] = None) -> int:
