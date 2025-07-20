@@ -253,7 +253,7 @@ class PicoDetHead(nn.Module):
     
         # ---- regression branch ----
         peak_prob = 0.90
-        delta = math.log((peak_prob / (1 - peak_prob)) * self.reg_max)
+        delta = math.log((peak_prob / (1 - peak_prob)))
     
         pattern = torch.zeros(4 * (self.reg_max + 1), device=self.cls_pred[0].weight.device)
         for i in range(4):                       # l, t, r, b

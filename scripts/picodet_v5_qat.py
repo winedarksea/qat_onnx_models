@@ -102,13 +102,13 @@ class CocoDetectionV2(CocoDetection):
 def build_transforms(size, train):
     aug = [
         T.ToImage(),
-        T.RandomHorizontalFlip(0.1) if train else T.Identity(),
+        T.RandomHorizontalFlip(0.15) if train else T.Identity(),
         T.RandomPhotometricDistort(p=0.2) if train else T.Identity(),
         T.RandomAdjustSharpness(sharpness_factor=2, p=0.05) if train else T.Identity(),
         T.RandomAutocontrast(p=0.1) if train else T.Identity(),
         T.RandomEqualize(p=0.1) if train else T.Identity(),
-        # T.Resize(size, antialias=True),
-        T.RandomResizedCrop(size, scale=(0.9, 1.0), antialias=True) if train else T.Resize(size, antialias=True),
+        T.Resize(size, antialias=True),
+        # T.RandomResizedCrop(size, scale=(0.9, 1.05), antialias=True) if train else T.Resize(size, antialias=True),
         T.ToDtype(torch.uint8, scale=True),  # keep uint8, model normalises
     ]
     return T.Compose(aug)
@@ -430,8 +430,6 @@ class SimOTACache:
             if num_fg and (iou_out[fg_final] < 0.05).float().mean() > 0.2:
                 print("  ⚠️  >20 % FG IoU < 0.05 – verify anchor order / scales")
 
-            self.print_debug_report()
-            self.print_classification_debug_report()
         self._dbg_iter += 1
         self.mean_fg_iou = iou_out[fg_final].mean().item() if fg_final.any() else 0.0
         # ----------------------------------------------------------------
@@ -458,13 +456,15 @@ def train_epoch(
         debug_prints: bool = True,
 ):
     model.train()
-    _, tot_loss_accum = time.time(), 0.
-    total_samples_contributing_to_loss_epoch = 0
     # Dynamic IoU loss weight
     if iou_weight_change_epoch is None:
         iou_weight_change_epoch = int(max_epochs * 0.4)
     w_iou = w_iou_initial if epoch < iou_weight_change_epoch else w_iou_final
+    # ─── containers for epoch‑wide diagnostics ──────────────────────────
+    total_samples_contributing_to_loss_epoch = 0
+    fg_total, img_total = 0, 0
     skips = 0
+    _, tot_loss_accum = time.time(), 0.
 
     for i, (imgs, tgts_batch) in enumerate(loader):
         # Handle the case where the entire batch was filtered out
@@ -565,10 +565,12 @@ def train_epoch(
             box_targets_fg_img = gt_boxes[fg_mask_img]
 
             num_fg_img = fg_mask_img.sum().item()
+            fg_total += num_fg_img
+            img_total += 1
             loss_norm_factor = float(num_fg_img)
             if num_fg_img == 0:
                 skips += 1
-                if skips == 100:
+                if skips == 400:
                     print("Large number of skipped batches, likely there is a bug")
                 continue
 
@@ -828,10 +830,14 @@ def train_epoch(
 
     if total_samples_contributing_to_loss_epoch > 0:
         avg_epoch_loss_per_sample = tot_loss_accum / total_samples_contributing_to_loss_epoch
-        return avg_epoch_loss_per_sample
+        epoch_diag = {
+            "fg_per_img": fg_total / max(img_total, 1),
+            "centre_hit":  np.mean(assigner._debug_stats["ctr_hit_rate"])
+        }
+        return avg_epoch_loss_per_sample, epoch_diag
     else:
         print(f"E{epoch} No samples contributed to loss this epoch.")
-        return 0.0
+        return 0.0, {}
 
 
 # ───────────────────── QAT helpers ───────────────────────────────
@@ -1097,6 +1103,53 @@ def quick_val_iou(
         final_accuracy = 0.0
 
     return final_mean_iou, final_accuracy
+
+@torch.no_grad()
+def run_epoch_validation(model: nn.Module, loader, device, epoch_num: int, head_ref: PicoDetHead):
+    """
+    Runs a comprehensive validation for an epoch, testing at multiple score thresholds.
+
+    Args:
+        model: The model to evaluate.
+        loader: The validation DataLoader.
+        device: The device to run on.
+        epoch_num: The current epoch number for logging.
+        head_ref: A reference to the model's head to get NMS parameters.
+
+    Returns:
+        A dictionary containing key metrics for the epoch.
+    """
+    model.eval()
+    
+    # Define the score thresholds you want to track
+    score_thresholds_to_track = [0.05, 0.25, 0.50]
+    
+    epoch_summary = {}
+
+    print(f"\n--- Running Validation for Epoch {epoch_num} ---")
+    for score_th in score_thresholds_to_track:
+        run_name = f"val_ep{epoch_num}_score{score_th}"
+        
+        # We set debug_prints=False to keep the console clean during this automated run
+        iou, acc = quick_val_iou(
+            model, loader, device,
+            score_thresh=score_th,
+            iou_thresh=head_ref.iou_th,
+            max_detections=head_ref.max_det,
+            epoch_num=epoch_num, 
+            run_name=run_name,
+            debug_prints=False, # Keep logs clean
+        )
+        
+        # Use a descriptive key for the summary dictionary
+        key_iou = f"iou_at_{int(score_th*100)}".replace('.', '')
+        key_acc = f"acc_at_{int(score_th*100)}".replace('.', '')
+        
+        epoch_summary[key_iou] = iou
+        epoch_summary[key_acc] = acc
+        print(f"  [Score > {score_th:.2f}] --> Mean IoU: {iou:.4f}, Accuracy: {acc:.4f}")
+        
+    return epoch_summary
 
 
 class PostprocessorForONNX(nn.Module):
@@ -1618,11 +1671,12 @@ def load_checkpoint(new_model: nn.Module, ckpt_path: str, optimizer: torch.optim
         print(f"[INFO] Resuming from epoch {start_epoch}.")
         return start_epoch
 
+
 def main(argv: List[str] | None = None):
     pa = argparse.ArgumentParser()
     pa.add_argument('--coco_root', default='coco')
     pa.add_argument('--arch', default='mnv4c', choices=['mnv3', 'mnv4s', 'mnv4', 'mnv4c'])
-    pa.add_argument('--epochs', type=int, default=20) 
+    pa.add_argument('--epochs', type=int, default=25) 
     pa.add_argument('--batch', type=int, default=64)
     pa.add_argument('--workers', type=int, default=0)
     pa.add_argument('--device', default=None)
@@ -1647,7 +1701,7 @@ def main(argv: List[str] | None = None):
     if IMG_SIZE < 320:
         out_ch = 96
         lat_k = 5
-        cls_conv_depth = 2
+        cls_conv_depth = 3
     elif IMG_SIZE < 512:
         out_ch = 96
         lat_k = 5
@@ -1662,7 +1716,7 @@ def main(argv: List[str] | None = None):
         num_classes=80, 
         neck_out_ch=out_ch,  # 96
         img_size=IMG_SIZE,
-        head_reg_max=8 if IMG_SIZE < 320 else (2 * math.ceil(IMG_SIZE / 128) + 3),
+        head_reg_max=8 if IMG_SIZE < 320 else int((2 * math.ceil(IMG_SIZE / 128) + 3)),
         cls_conv_depth=cls_conv_depth,
         lat_k=lat_k,
         inplace_act_for_head_neck=not cfg.no_inplace_head_neck # Control from arg
@@ -1763,7 +1817,12 @@ def main(argv: List[str] | None = None):
         beta2_adamw = 0.999
         eps_adamw = 1e-8
 
-        warmup_epochs_adamw = max(1, cfg.epochs // 8) if cfg.epochs >=5 else 1 # e.g., 1 epoch for 10 total epochs.
+        if cfg.epochs < 5:
+            warmup_epochs_adamw = 1
+        elif cfg.epochs <= 30:
+            warmup_epochs_adamw = max(1, cfg.epochs // 4)
+        else:
+            warmup_epochs_adamw = 6
         cosine_decay_to_fraction_adamw = 0.01 # Decay to 1% of peak_lr_adamw
 
         # Parameter groups for differential weight decay
@@ -1835,16 +1894,13 @@ def main(argv: List[str] | None = None):
         )
     scaler = torch.amp.GradScaler(enabled=dev.type == 'cuda')
 
-    DYN_K_MIN = 2
-    CLS_WEIGHT = 2.5
-    CLS_WEIGHT = 3.0 if use_focal_loss else CLS_WEIGHT
     assigner = SimOTACache(
         nc=model.head.nc,
         ctr=4.0,  # 2.5,   1.5 might be better later for strict bounding
         topk=10,  # 10
-        cls_cost_weight=CLS_WEIGHT,  # Increased to emphasize classification
+        cls_cost_weight=3.0,  # Increased to emphasize classification
         debug_epochs=5 if debug_prints else 0,
-        dynamic_k_min=DYN_K_MIN,
+        dynamic_k_min=2,
     )
     if False:
         start_epoch = load_checkpoint(model, cfg.load_from, opt, dev)  # noqa
@@ -1852,6 +1908,7 @@ def main(argv: List[str] | None = None):
     original_model_head_nc = model.head.nc
     original_model_head_reg_max = model.head.reg_max
     original_dfl_project_buffer = model.head.dfl_project_buffer
+    training_history = {}
 
     # ... (FP32 training loop) ...
     for ep in range(cfg.epochs):
@@ -1888,30 +1945,35 @@ def main(argv: List[str] | None = None):
         else:
             use_focal_loss_for_epoch = use_focal_loss
         if ep < 2:
+            assigner.k = 12
             assigner.dynamic_k_min = 4
             assigner.cls_cost_weight = 2.0
+            assigner.r = 5.0
             CLS_WEIGHT = 0.4
         elif ep < 4:
             assigner.dynamic_k_min = 4
-            assigner.cls_cost_weight = 4.0
+            assigner.cls_cost_weight = 2.0
             CLS_WEIGHT = 1.0
         elif ep < 6:
+            assigner.r = 4.0
+            assigner.k = 10
             assigner.dynamic_k_min = 3
-            assigner.cls_cost_weight = 6.0
+            assigner.cls_cost_weight = 4.0
             CLS_WEIGHT = 2.0
         elif ep < 8:
             assigner.dynamic_k_min = 2
-            assigner.cls_cost_weight = 6.0
+            assigner.cls_cost_weight = 4.0
             CLS_WEIGHT = 4.0
         elif ep < 10:
             CLS_WEIGHT = 6.0
         elif ep == 15:
-            assigner.cls_cost_weight = 6.0
+            assigner.cls_cost_weight = 4.0
             CLS_WEIGHT = 6.0
         elif ep > 100:
             assigner.dynamic_k_min = 1
+            assigner.r = 2.5
 
-        if assigner.mean_fg_iou < 0.10:
+        if assigner.mean_fg_iou < 0.10 or ep < 2:
             assigner.power = 0.0
         elif assigner.mean_fg_iou < 0.25:
             assigner.power = min(1.0, assigner.power + 0.20)
@@ -1921,7 +1983,7 @@ def main(argv: List[str] | None = None):
             print(f"epoch {ep} and assigner IoU weighting power is {assigner.power}")
 
         model.train()
-        l = train_epoch(
+        l, diag = train_epoch(
             model, tr_loader, opt, scaler, assigner, dev, ep, coco_label_map,
             head_nc_for_loss=original_model_head_nc,
             head_reg_max_for_loss=original_model_head_reg_max,
@@ -1932,23 +1994,23 @@ def main(argv: List[str] | None = None):
             use_focal_loss=use_focal_loss_for_epoch,
             w_cls_loss=CLS_WEIGHT,
         )
-        # ... (validation) ...
         model.eval()
         try:
-            m, acc = quick_val_iou(
-                model, vl_loader, dev,
-                score_thresh=model.head.score_th,
-                iou_thresh=model.head.iou_th,
-                max_detections=model.head.max_det,
-                epoch_num=ep, run_name="in epoch",
-                debug_prints=debug_prints,
-            )
+            epoch_metrics = run_epoch_validation(model, vl_loader, dev, ep + 1, model.head)
+            epoch_metrics['train_loss'] = l if l is not None else -1.0
+            epoch_metrics.update(diag)
+            training_history[ep + 1] = epoch_metrics
+            current_lr = opt.param_groups[0]['lr']
+            iou_05 = epoch_metrics.get('iou_at_05', 0.0)
+            iou_25 = epoch_metrics.get('iou_at_25', 0.0)
+            print(f"Epoch {ep + 1}/{cfg.epochs} | Loss: {l:.4f} | IoU@.05: {iou_05:.3f} | IoU@.25: {iou_25:.3f} | LR: {current_lr:.6f}\n")
+            print("─" * 25 + f" SimOTA Report for Epoch {ep + 1} " + "─" * 25)
+            assigner.print_debug_report()
+            assigner.print_classification_debug_report()
+            print("─" * (75 + len(str(ep + 1))) + "\n")
         except Exception as e:
             print(repr(e))
-        for param_group in opt.param_groups:
-            current_lr = param_group['lr']
 
-        print(f'Epoch {ep + 1}/{cfg.epochs}  loss {l:.3f}  IoU {m:.3f}  Acc {acc:.3f}  lr={current_lr:.6f}')
         sch.step()
         # print(f"[INFO] Logit scaler value: {model.head.logit_scale.item():.4f}")
         assigner._dbg_iter = 0   
@@ -2042,7 +2104,7 @@ def main(argv: List[str] | None = None):
         current_lr_qat = opt_q.param_groups[0]['lr']
         print(f"[QAT] Starting Epoch {qep + 1}/{qat_epochs} with LR {current_lr_qat:.7f}")
 
-        lq = train_epoch(
+        lq, diag = train_epoch(
             qat_model, tr_loader, opt_q, scaler_q, assigner, dev, qep, coco_label_map,
             head_nc_for_loss=original_model_head_nc,
             head_reg_max_for_loss=original_model_head_reg_max,
@@ -2205,7 +2267,88 @@ def main(argv: List[str] | None = None):
         iou_thresh=float(model.head.iou_th),  # 0.6
         max_det=int(model.head.max_det),  # 100
     )
+    return training_history
 
+
+import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
+
+def plot_training_history(history: dict, title: str = 'Training Progress'):
+    """
+    Plots the key metrics from a training‑history dictionary.
+
+    Each epoch entry is expected to contain (at minimum)
+    ------------------------------------------------------
+      • train_loss
+      • iou_at_05, iou_at_25
+      • acc_at_05, acc_at_25
+      • fg_per_img               (number of FG anchors per image)
+      • centre_hit               (ratio 0‑1: how many GT boxes got ≥1 centre‑radius hit)
+    """
+    # ---------- gather ----------
+    epochs = sorted(history)
+    if not epochs:
+        print("History is empty, cannot plot."); return
+
+    as_list = lambda k: [history[e].get(k, float('nan')) for e in epochs]
+
+    train_loss   = as_list('train_loss')
+    iou_05, iou_25 = as_list('iou_at_05'), as_list('iou_at_25')
+    acc_05, acc_25 = as_list('acc_at_05'), as_list('acc_at_25')
+    fg_per_img   = as_list('fg_per_img')
+    centre_hit   = as_list('centre_hit')
+
+    # ---------- layout ----------
+    fig, (ax1, ax2, ax3) = plt.subplots(
+        nrows=3, ncols=1, figsize=(12, 12), sharex=True,
+        gridspec_kw={'height_ratios': [1.1, 1.2, 1.0]}
+    )
+    fig.suptitle(title, fontsize=16)
+
+    # ── 1 · Loss ──────────────────────────────────────────────
+    ax1.plot(epochs, train_loss, 'o-', color='tomato', label='Training Loss')
+    ax1.set_ylabel('Loss')
+    ax1.set_title('Training Loss')
+    ax1.grid(ls='--', alpha=.6)
+    ax1.set_ylim(bottom=0 if all(l >= 0 for l in train_loss) else None)
+    ax1.legend()
+
+    # ── 2 · Val IoU / Acc ────────────────────────────────────
+    ax2.plot(epochs, iou_05, 's--',  color='dodgerblue', label='IoU@0.05')
+    ax2.plot(epochs, iou_25, '^-',   color='navy',       label='IoU@0.25')
+    ax2.plot(epochs, acc_05, 's--',  color='limegreen',  label='Acc@0.05')
+    ax2.plot(epochs, acc_25, '^-',   color='darkgreen',  label='Acc@0.25')
+    ax2.set_ylabel('Metric (0‑1)')
+    ax2.set_title('Validation IoU & Accuracy')
+    ax2.set_ylim(0, 1)
+    ax2.grid(ls='--', alpha=.6)
+    ax2.legend(loc='lower right')
+
+    # ── 3 · Assigner diagnostics ─────────────────────────────
+    #   left‑axis : FG / img   (bar)
+    #   right‑axis: centre‑hit ratio (line)
+    bars = ax3.bar(epochs, fg_per_img, width=.6, color='slategray',
+                   alpha=.35, label='FG / img')
+    ax3.set_ylabel('FG per image')
+    ax3.set_title('SimOTA diagnostics')
+
+    ax3_t = ax3.twinx()
+    ax3_t.plot(epochs, centre_hit, 'o-', color='orange', label='Centre‑hit ratio')
+    ax3_t.set_ylabel('Centre‑hit')
+    ax3_t.set_ylim(0, 1)
+
+    # combine legends from both axes
+    handles, labels = ax3.get_legend_handles_labels()
+    h2, l2 = ax3_t.get_legend_handles_labels()
+    ax3_t.legend(handles + h2, labels + l2, loc='upper right')
+
+    # ── global tweaks ────────────────────────────────────────
+    ax3.set_xlabel('Epoch')
+    for ax in (ax2, ax3): ax.xaxis.set_major_locator(mticker.MaxNLocator(integer=True))
+    plt.minorticks_on()
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    plt.show()
 
 if __name__ == '__main__':
-    main()
+    final_history = main()
+    plot_training_history(final_history, title="PicoDet Training Progress")
