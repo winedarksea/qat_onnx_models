@@ -102,14 +102,13 @@ class CocoDetectionV2(CocoDetection):
 def build_transforms(size, train):
     aug = [
         T.ToImage(),
-        # T.RandomHorizontalFlip(0.25) if train else T.Identity(),
-        # T.RandomResizedCrop(size, scale=(0.8, 1.0), antialias=True) if train else T.Resize(size, antialias=True),
-        # T.ColorJitter(0.1, 0.1, 0.1, 0.1) if train else T.Identity(),
+        T.RandomHorizontalFlip(0.1) if train else T.Identity(),
         T.RandomPhotometricDistort(p=0.2) if train else T.Identity(),
         T.RandomAdjustSharpness(sharpness_factor=2, p=0.05) if train else T.Identity(),
         T.RandomAutocontrast(p=0.1) if train else T.Identity(),
         T.RandomEqualize(p=0.1) if train else T.Identity(),
-        T.Resize(size, antialias=True),
+        # T.Resize(size, antialias=True),
+        T.RandomResizedCrop(size, scale=(0.9, 1.0), antialias=True) if train else T.Resize(size, antialias=True),
         T.ToDtype(torch.uint8, scale=True),  # keep uint8, model normalises
     ]
     return T.Compose(aug)
@@ -186,7 +185,8 @@ class SimOTACache:
         self.cache = {}               # anchor centres per (H,W,stride,device)
         self.simota_prefilter = False
         self.dynamic_k_min = dynamic_k_min  # 3, or 1-2
-        self.power = 1.0 
+        self.power = 0.0 
+        self.mean_fg_iou = 0.0
 
         # --- State for debugging system ---
         self._dbg_mod  = debug_epochs
@@ -217,9 +217,9 @@ class SimOTACache:
         if avg_loc_cost > avg_cls_cost * 10:
             print(f"  [ACTION] Loc cost is >> Cls cost. Consider INCREASING `cls_cost_weight` (currently {self.cls_cost_weight}).")
         print(f"  Assignment Switch Rate: {switch_rate:.2f}% (Rate classification cost changed the assignment from IoU)")
-        if switch_rate < 0.02:
+        if switch_rate < 2:
             print("  May need to increase cls_cost_weight")
-        elif switch_rate > 0.20:
+        elif switch_rate > 20:
             print("  May need to decrease cls_cost_weight")
         print("─" * 65 + "\n")
     
@@ -450,7 +450,7 @@ def train_epoch(
         quality_floor_vfl: float = 0.01,
         w_cls_loss: float = 3.0,
         w_obj_loss: float = 0.5,
-        w_dfl_loss: float = 0.25,
+        w_dfl_loss: float = 0.3,
         w_iou_initial: float = 4.0,
         w_iou_final: float = 2.0,   # Final weight for IoU loss
         iou_weight_change_epoch: int = None, # Epoch to change IoU weight
@@ -1889,32 +1889,33 @@ def main(argv: List[str] | None = None):
             use_focal_loss_for_epoch = use_focal_loss
         if ep < 2:
             assigner.dynamic_k_min = 4
-            assigner.cls_cost_weight = 0.3
-            CLS_WEIGHT = 0.3
+            assigner.cls_cost_weight = 2.0
+            CLS_WEIGHT = 0.4
         elif ep < 4:
             assigner.dynamic_k_min = 4
-            assigner.cls_cost_weight = 0.4
-            CLS_WEIGHT = 0.4
+            assigner.cls_cost_weight = 4.0
+            CLS_WEIGHT = 1.0
         elif ep < 6:
             assigner.dynamic_k_min = 3
-            assigner.cls_cost_weight = 1.0
+            assigner.cls_cost_weight = 6.0
             CLS_WEIGHT = 2.0
         elif ep < 8:
             assigner.dynamic_k_min = 2
-            assigner.cls_cost_weight = 1.5
+            assigner.cls_cost_weight = 6.0
             CLS_WEIGHT = 4.0
         elif ep < 10:
             CLS_WEIGHT = 6.0
         elif ep == 15:
-            assigner.cls_cost_weight = 2.5
-            CLS_WEIGHT = 8.0
-        elif ep > 150:
+            assigner.cls_cost_weight = 6.0
+            CLS_WEIGHT = 6.0
+        elif ep > 100:
             assigner.dynamic_k_min = 1
 
         if assigner.mean_fg_iou < 0.10:
             assigner.power = 0.0
         elif assigner.mean_fg_iou < 0.25:
-            assigner.power = 1.0
+            assigner.power = min(1.0, assigner.power + 0.20)
+            print(f"epoch {ep} and assigner IoU weighting power is {assigner.power}")
         else:
             assigner.power = min(2.0, assigner.power + 0.25)
             print(f"epoch {ep} and assigner IoU weighting power is {assigner.power}")
