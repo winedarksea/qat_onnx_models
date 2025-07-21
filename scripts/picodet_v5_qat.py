@@ -212,7 +212,7 @@ class SimOTACache:
         total_switches, total_anchors = map(sum, zip(*self._classification_debug_stats["assignment_switches"]))
         switch_rate = (total_switches / total_anchors) * 100 if total_anchors > 0 else 0
     
-        print("\n" + "─" * 20 + " Classification Debug Report " + "─" * 20)
+        print("\n" + "─" * 10 + " Classification Debug Report " + "─" * 10)
         print(f"  Cost Magnitudes: Avg. Cls Cost = {avg_cls_cost:.3f}, Avg. Loc Cost = {avg_loc_cost:.3f}")
         if avg_loc_cost > avg_cls_cost * 10:
             print(f"  [ACTION] Loc cost is >> Cls cost. Consider INCREASING `cls_cost_weight` (currently {self.cls_cost_weight}).")
@@ -221,7 +221,7 @@ class SimOTACache:
             print("  May need to increase cls_cost_weight")
         elif switch_rate > 20:
             print("  May need to decrease cls_cost_weight")
-        print("─" * 65 + "\n")
+        print("─" * 40 + "\n")
     
         # Reset stats
         for k in self._classification_debug_stats:
@@ -262,11 +262,11 @@ class SimOTACache:
         k_q75 = torch.quantile(all_k_vals, 0.75).item()
 
         # --- Print the formatted report ---
-        print("\n" + "─" * 25 + f" SimOTA Report (iter {self._dbg_iter}) " + "─" * 25)
+        print("\n" + "─" * 10 + f" SimOTA Report (iter {self._dbg_iter}) " + "─" * 10)
         print(f"  [ctr={self.r:.1f}] Avg. Center Radius Hit Rate: {avg_ctr_hit_rate:.2%}")
         print(f"  [dynamic_k_min={self.dynamic_k_min}] % of GTs using min_k: {percent_gt_at_min_k:.1f}%")
         print(f"  Dynamic 'k' Stats: mean={k_mean:.2f}, std={k_std:.2f}, median={k_median:.1f}, q25-q75=[{k_q25:.1f}-{k_q75:.1f}]")
-        print("─" * 75 + "\n")
+        print("─" * 40 + "\n")
 
         # --- Reset stats for the next interval ---
         for k in self._debug_stats:
@@ -1652,7 +1652,7 @@ def load_checkpoint(new_model: nn.Module, ckpt_path: str, optimizer: torch.optim
         if unexpected_keys:
             print("Unexpected keys (expected for finetuning):")
             for k in unexpected_keys: print(f"  - {k}")
-        print("---------------------------\n")
+        print("----------------\n")
 
         # Do NOT load the optimizer state and reset epoch, as we are starting a new training phase
         print("[INFO] Optimizer state not loaded. Starting finetuning from epoch 0.")
@@ -1690,7 +1690,7 @@ def main(argv: List[str] | None = None):
     debug_prints = True
     BACKBONE_FREEZE_EPOCHS = 2 if cfg.epochs < 12 else 3  # 0 to disable
     use_focal_loss = False
-    FOCAL_LOSS_WARMUP_EPOCHS = 1
+    FOCAL_LOSS_WARMUP_EPOCHS = 10
 
     if cfg.device is None:
         cfg.device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -1951,7 +1951,7 @@ def main(argv: List[str] | None = None):
             assigner.r = 5.0
             CLS_WEIGHT = 0.4
         elif ep < 4:
-            assigner.dynamic_k_min = 4
+            assigner.dynamic_k_min = 3
             assigner.cls_cost_weight = 2.0
             CLS_WEIGHT = 1.0
         elif ep < 6:
@@ -1973,9 +1973,9 @@ def main(argv: List[str] | None = None):
             assigner.dynamic_k_min = 1
             assigner.r = 2.5
 
-        if assigner.mean_fg_iou < 0.10 or ep < 2:
+        if assigner.mean_fg_iou < 0.35 or ep < 5:
             assigner.power = 0.0
-        elif assigner.mean_fg_iou < 0.25:
+        elif assigner.mean_fg_iou < 0.45:
             assigner.power = min(1.0, assigner.power + 0.20)
             print(f"epoch {ep} and assigner IoU weighting power is {assigner.power}")
         else:
@@ -2001,13 +2001,15 @@ def main(argv: List[str] | None = None):
             epoch_metrics.update(diag)
             training_history[ep + 1] = epoch_metrics
             current_lr = opt.param_groups[0]['lr']
-            iou_05 = epoch_metrics.get('iou_at_05', 0.0)
+            iou_05 = epoch_metrics.get('iou_at_5', 0.0)
             iou_25 = epoch_metrics.get('iou_at_25', 0.0)
             print(f"Epoch {ep + 1}/{cfg.epochs} | Loss: {l:.4f} | IoU@.05: {iou_05:.3f} | IoU@.25: {iou_25:.3f} | LR: {current_lr:.6f}\n")
             print("─" * 25 + f" SimOTA Report for Epoch {ep + 1} " + "─" * 25)
             assigner.print_debug_report()
             assigner.print_classification_debug_report()
             print("─" * (75 + len(str(ep + 1))) + "\n")
+            if ep == 10:
+                plot_training_history(training_history, title="PicoDet Training Progress EP10")
         except Exception as e:
             print(repr(e))
 
@@ -2278,7 +2280,7 @@ def plot_training_history(history: dict, title: str = 'Training Progress'):
     Plots the key metrics from a training‑history dictionary.
 
     Each epoch entry is expected to contain (at minimum)
-    ------------------------------------------------------
+    ------------------
       • train_loss
       • iou_at_05, iou_at_25
       • acc_at_05, acc_at_25
