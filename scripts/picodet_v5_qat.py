@@ -683,26 +683,26 @@ def train_epoch(
             
             else:  # Varifocal Loss proper
                 alpha_dyn = 0.75
-                gamma = 2.0
-
+                gamma_vfl = 2.0
+                q_floor   = 0.05
+                q_gamma   = 0.5  # sqrt lift of low IoUs
+                
                 targets = torch.zeros_like(joint_logits)
-                if pos_indices.numel() > 0:                       # foreground rows only
+                
+                if pos_indices.numel() > 0:
                     gt_labels_pos = gt_labels[pos_indices]
-                    gt_ious_pos = gt_ious[pos_indices].clamp_min(1e-6)
-                    targets[pos_indices, gt_labels_pos] = gt_ious_pos
-                # floor_tensor = torch.tensor(quality_floor_vfl, dtype=gt_ious.dtype, device=gt_ious.device)
-                # 2. Instantiate VFL and calculate the loss with 'sum' reduction.
-                vfl_calculator = VarifocalLoss(alpha=alpha_dyn, gamma=gamma, reduction='sum')
-                total_unreduced_loss = vfl_calculator(joint_logits, targets)
-                # 3. CRITICAL: Normalize by the number of positive examples.
-                loss_cls = total_unreduced_loss / max(1, num_fg_img)
-
-                # loss_obj = torch.tensor(0.0, device=device)
-                # obj_targets = torch.zeros_like(obj_p_img)
-                # obj_targets[fg_mask_img] = gt_ious[fg_mask_img]
-                # 2. Calculate the BCE loss, averaged over ALL anchors in the image.
-                # This strong signal on background anchors is what reduces box overproduction.
-                # loss_obj = F.binary_cross_entropy_with_logits(obj_p_img, obj_targets, reduction='mean')
+                
+                    with torch.no_grad():
+                        # predicted boxes & matched GT for the *foreground* anchors
+                        iou_pred = tvops.box_iou(pred_boxes_fg_img, box_targets_fg_img).diag()
+                
+                        # shape quality
+                        quality = iou_pred.clamp_min(q_floor).pow(q_gamma)
+                
+                    targets[pos_indices, gt_labels_pos] = quality
+                
+                vfl_calculator = VarifocalLoss(alpha=alpha_dyn, gamma=gamma_vfl, reduction='sum')
+                loss_cls = vfl_calculator(joint_logits, targets) / max(1, num_fg_img)
                 w_obj_loss = 0.1  # small for initial testing of adding to VFL
             
             # Final sample loss (obj already inside joint_logits)
@@ -1950,25 +1950,21 @@ def main(argv: List[str] | None = None):
             assigner.cls_cost_weight = 2.0
             assigner.r = 5.0
             CLS_WEIGHT = 0.4
-        elif ep < 4:
-            assigner.dynamic_k_min = 3
-            assigner.cls_cost_weight = 2.0
-            CLS_WEIGHT = 1.0
         elif ep < 6:
             assigner.r = 4.0
             assigner.k = 10
             assigner.dynamic_k_min = 3
             assigner.cls_cost_weight = 4.0
-            CLS_WEIGHT = 2.0
+            CLS_WEIGHT = 1.0
         elif ep < 8:
             assigner.dynamic_k_min = 2
             assigner.cls_cost_weight = 4.0
-            CLS_WEIGHT = 4.0
+            CLS_WEIGHT = 2.0
         elif ep < 10:
-            CLS_WEIGHT = 6.0
+            CLS_WEIGHT = 3.0
         elif ep == 15:
             assigner.cls_cost_weight = 4.0
-            CLS_WEIGHT = 6.0
+            CLS_WEIGHT = 3.0
         elif ep > 100:
             assigner.dynamic_k_min = 1
             assigner.r = 2.5
@@ -2295,8 +2291,8 @@ def plot_training_history(history: dict, title: str = 'Training Progress'):
     as_list = lambda k: [history[e].get(k, float('nan')) for e in epochs]
 
     train_loss   = as_list('train_loss')
-    iou_05, iou_25 = as_list('iou_at_05'), as_list('iou_at_25')
-    acc_05, acc_25 = as_list('acc_at_05'), as_list('acc_at_25')
+    iou_05, iou_25 = as_list('iou_at_5'), as_list('iou_at_25')
+    acc_05, acc_25 = as_list('acc_at_5'), as_list('acc_at_25')
     fg_per_img   = as_list('fg_per_img')
     centre_hit   = as_list('centre_hit')
 
