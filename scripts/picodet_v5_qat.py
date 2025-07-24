@@ -1996,6 +1996,7 @@ def main(argv: List[str] | None = None):
             assigner.dynamic_k_min = 1
             assigner.r = 2.5
             CLS_WEIGHT = 4.0
+            assigner.cls_cost_weight = 5.0
         if assigner.mean_fg_iou < 0.35 or ep < 5:
             assigner.power = 0.0
         elif assigner.mean_fg_iou < 0.45:
