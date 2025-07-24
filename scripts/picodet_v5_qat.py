@@ -448,7 +448,7 @@ def train_epoch(
         quality_floor_vfl: float = 0.01,
         w_cls_loss: float = 3.0,
         w_obj_loss: float = 0.5,
-        w_dfl_loss: float = 0.3,
+        w_dfl_loss: float = 0.5,
         w_iou_initial: float = 4.0,
         w_iou_final: float = 2.0,   # Final weight for IoU loss
         iou_weight_change_epoch: int = None, # Epoch to change IoU weight
@@ -554,6 +554,19 @@ def train_epoch(
                 lvl[b_idx].permute(1,2,0).reshape(-1, 4*(head_reg_max_for_loss+1))
                 for lvl in reg_preds_levels
             ], dim=0)
+            if i == 0 and b_idx in [0, 1]   :
+                print("\n--- COORDINATE SYSTEM SANITY CHECK ---")
+                gt_sample = gt_boxes_img[0] if gt_boxes_img.numel() > 0 else "N/A no GT"
+                gt_max = gt_boxes_img.max().item() if gt_boxes_img.numel() > 0 else "N/A no GT"
+                
+                # Recreate the anchor list used by the assigner
+                anchors = torch.cat([getattr(model.head, f'anchor_points_level_{i}') for i in range(model.head.nl)], 0)
+                
+                print(f"Image Size: {list(imgs.shape[-2:])}")
+                print(f"Ground-Truth Box Sample: {gt_sample}")
+                print(f"Ground-Truth Box Max Value: {gt_max}")
+                print(f"Anchor Center Max Value: {anchors.max().item()}")
+                print("--- END CHECK ---\n")
 
             fg_mask_img, gt_labels, gt_boxes, gt_ious = assigner(
                     fmap_shapes, device, target_dict_for_assigner,
@@ -572,6 +585,19 @@ def train_epoch(
                 skips += 1
                 if skips == 400:
                     print("Large number of skipped batches, likely there is a bug")
+                    
+                    print("\n--- COORDINATE SYSTEM SANITY CHECK ---")
+                    gt_sample = gt_boxes_img[0] if gt_boxes_img.numel() > 0 else "N/A no GT"
+                    gt_max = gt_boxes_img.max().item() if gt_boxes_img.numel() > 0 else "N/A no GT"
+                    
+                    # Recreate the anchor list used by the assigner
+                    anchors = torch.cat([getattr(model.head, f'anchor_points_level_{i}') for i in range(model.head.nl)], 0)
+                    
+                    print(f"Image Size: {list(imgs.shape[-2:])}")
+                    print(f"Ground-Truth Box Sample: {gt_sample}")
+                    print(f"Ground-Truth Box Max Value: {gt_max}")
+                    print(f"Anchor Center Max Value: {anchors.max().item()}")
+                    print("--- END CHECK ---\n")
                 continue
 
             ##########
@@ -1946,29 +1972,30 @@ def main(argv: List[str] | None = None):
             use_focal_loss_for_epoch = use_focal_loss
         if ep < 2:
             assigner.k = 12
-            assigner.dynamic_k_min = 4
+            assigner.dynamic_k_min = 5
             assigner.cls_cost_weight = 2.0
             assigner.r = 5.0
             CLS_WEIGHT = 0.4
         elif ep < 6:
-            assigner.r = 4.0
+            assigner.r = 4.5
             assigner.k = 10
-            assigner.dynamic_k_min = 3
-            assigner.cls_cost_weight = 4.0
+            assigner.dynamic_k_min = 4
+            assigner.cls_cost_weight = 3.0
             CLS_WEIGHT = 1.0
         elif ep < 8:
+            assigner.r = 4.0
             assigner.dynamic_k_min = 2
             assigner.cls_cost_weight = 4.0
             CLS_WEIGHT = 2.0
         elif ep < 10:
-            CLS_WEIGHT = 3.0
+            CLS_WEIGHT = 2.5
         elif ep == 15:
             assigner.cls_cost_weight = 4.0
             CLS_WEIGHT = 3.0
         elif ep > 100:
             assigner.dynamic_k_min = 1
             assigner.r = 2.5
-
+            CLS_WEIGHT = 4.0
         if assigner.mean_fg_iou < 0.35 or ep < 5:
             assigner.power = 0.0
         elif assigner.mean_fg_iou < 0.45:

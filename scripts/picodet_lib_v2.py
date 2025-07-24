@@ -370,8 +370,8 @@ class PicoDet(nn.Module):
                  img_size: int = 224,
                  head_reg_max: int = 8,  # suggestion: 256 px → 7/8, 320 px → 11, 640 px → 15 or 16
                  head_max_det: int = 100, # Will be used by ONNX NMS logic
-                 head_score_thresh: float = 0.05, # Will be used by ONNX NMS logic
-                 head_nms_iou: float = 0.6, # Will be used by ONNX NMS logic
+                 head_score_thresh: float = 0.08, # Will be used by ONNX NMS logic
+                 head_nms_iou: float = 0.55, # Will be used by ONNX NMS logic
                  cls_conv_depth: int = 3,
                  lat_k: int = 5,
                  inplace_act_for_head_neck: bool = False):
