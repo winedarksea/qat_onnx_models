@@ -102,13 +102,13 @@ class CocoDetectionV2(CocoDetection):
 def build_transforms(size, train):
     aug = [
         T.ToImage(),
-        T.RandomHorizontalFlip(0.15) if train else T.Identity(),
+        T.RandomHorizontalFlip(0.25) if train else T.Identity(),
         T.RandomPhotometricDistort(p=0.2) if train else T.Identity(),
         T.RandomAdjustSharpness(sharpness_factor=2, p=0.05) if train else T.Identity(),
         T.RandomAutocontrast(p=0.1) if train else T.Identity(),
         T.RandomEqualize(p=0.1) if train else T.Identity(),
-        T.Resize(size, antialias=True),
-        # T.RandomResizedCrop(size, scale=(0.9, 1.05), antialias=True) if train else T.Resize(size, antialias=True),
+        # T.Resize(size, antialias=True),
+        T.RandomResizedCrop(size, scale=(0.8, 1.05), antialias=True) if train else T.Resize(size, antialias=True),
         T.ToDtype(torch.uint8, scale=True),  # keep uint8, model normalises
     ]
     return T.Compose(aug)
@@ -1742,7 +1742,7 @@ def main(argv: List[str] | None = None):
         num_classes=80, 
         neck_out_ch=out_ch,  # 96
         img_size=IMG_SIZE,
-        head_reg_max=8 if IMG_SIZE < 320 else int((2 * math.ceil(IMG_SIZE / 128) + 3)),
+        head_reg_max=9 if IMG_SIZE < 320 else int((2 * math.ceil(IMG_SIZE / 128) + 3)),
         cls_conv_depth=cls_conv_depth,
         lat_k=lat_k,
         inplace_act_for_head_neck=not cfg.no_inplace_head_neck # Control from arg
@@ -2028,7 +2028,7 @@ def main(argv: List[str] | None = None):
             iou_05 = epoch_metrics.get('iou_at_5', 0.0)
             iou_25 = epoch_metrics.get('iou_at_25', 0.0)
             print(f"Epoch {ep + 1}/{cfg.epochs} | Loss: {l:.4f} | IoU@.05: {iou_05:.3f} | IoU@.25: {iou_25:.3f} | LR: {current_lr:.6f}\n")
-            print("─" * 25 + f" SimOTA Report for Epoch {ep + 1} " + "─" * 25)
+            print("─" * 15 + f" SimOTA Report for Epoch {ep + 1} " + "─" * 15)
             assigner.print_debug_report()
             assigner.print_classification_debug_report()
             print("─" * (75 + len(str(ep + 1))) + "\n")
