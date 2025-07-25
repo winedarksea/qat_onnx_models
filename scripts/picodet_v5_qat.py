@@ -594,7 +594,7 @@ def train_epoch(
         head_reg_max_for_loss: int,
         dfl_project_buffer_for_decode: torch.Tensor,
         max_epochs: int = 300,
-        quality_floor_vfl: float = 0.01,
+        quality_floor_vfl: float = 0.05,
         w_cls_loss: float = 3.0,
         w_obj_loss: float = 0.5,
         w_dfl_loss: float = 0.5,
@@ -604,6 +604,7 @@ def train_epoch(
         use_focal_loss: bool = False,
         debug_prints: bool = True,
         gamma_loss = 2.0,
+        q_gamma = 0.5,  # sqrt lift of low IoUs
 ):
     model.train()
     # Dynamic IoU loss weight
@@ -859,8 +860,6 @@ def train_epoch(
             
             else:  # Varifocal Loss proper
                 alpha_dyn = 0.75
-                q_floor   = 0.05
-                q_gamma   = 0.5  # sqrt lift of low IoUs
                 
                 targets = torch.zeros_like(joint_logits)
                 
@@ -872,7 +871,7 @@ def train_epoch(
                         iou_pred = tvops.box_iou(pred_boxes_fg_img, box_targets_fg_img).diag()
                 
                         # shape quality
-                        quality = iou_pred.clamp_min(q_floor).pow(q_gamma)
+                        quality = iou_pred.clamp_min(quality_floor_vfl).pow(q_gamma)
                 
                     targets[pos_indices, gt_labels_pos] = quality
                 
@@ -1886,6 +1885,8 @@ def main(argv: List[str] | None = None):
         lat_k = 5
         cls_conv_depth = 3
     gamma_loss = 2.0
+    quality_floor_vfl = 0.05
+    q_gamma = 0.5
     model = PicoDet(
         backbone, 
         feat_chs,
@@ -2142,8 +2143,12 @@ def main(argv: List[str] | None = None):
         elif ep == 15:
             assigner.cls_cost_weight = 4.0
             CLS_WEIGHT = 3.0
+        elif ep == 20:
+            quality_floor_vfl = 0.005
         elif ep == 50:
             assigner.dynamic_k_min = 1
+        elif ep == 52:
+            q_gamma = 1.0
         elif ep == 60:
             assigner.r = 3.0
         elif ep == 70:
@@ -2171,11 +2176,12 @@ def main(argv: List[str] | None = None):
             head_reg_max_for_loss=original_model_head_reg_max,
             dfl_project_buffer_for_decode=original_dfl_project_buffer,
             max_epochs=cfg.epochs, # Pass total epochs for VFL alpha scheduling
-            quality_floor_vfl=0.02,  # try sometime 0.15
+            quality_floor_vfl=quality_floor_vfl,  # try sometime 0.15
             debug_prints=debug_prints,
             use_focal_loss=use_focal_loss_for_epoch,
             w_cls_loss=CLS_WEIGHT,
             gamma_loss=gamma_loss,
+            q_gamma=q_gamma,
         )
         model.eval()
         try:
@@ -2295,11 +2301,12 @@ def main(argv: List[str] | None = None):
             head_reg_max_for_loss=original_model_head_reg_max,
             dfl_project_buffer_for_decode=original_dfl_project_buffer,
             max_epochs=qat_epochs, # For VFL alpha scheduling (relative to QAT duration)
-            quality_floor_vfl=0.02,
+            quality_floor_vfl=quality_floor_vfl,
             iou_weight_change_epoch=2,
             debug_prints=False,
             w_cls_loss=CLS_WEIGHT,
             use_focal_loss=use_focal_loss,
+            q_gamma=q_gamma,
         )
         scheduler_q.step() # Step the QAT LR scheduler
 
