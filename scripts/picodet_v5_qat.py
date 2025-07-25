@@ -113,6 +113,155 @@ def build_transforms(size, train):
     ]
     return T.Compose(aug)
 
+
+def _make_valid_mask(xyxy, H, W,
+                     min_wh      = 6,
+                     max_cover   = 0.90,
+                     ar_min      = 0.10,
+                     ar_max      = 10.0,
+                     allow_neg   = False):
+    """
+    Return a Bool mask identifying annotation boxes that pass all sanity checks.
+    xyxy : (N,4) tensor, float
+    H,W  : image height/width   (after v2 transforms _before_ ResizeNorm)
+    """
+
+    x1,y1,x2,y2 = xyxy.T
+    w  = x2 - x1
+    h  = y2 - y1
+    ar = w / (h + 1e-6)
+
+    # 1. positive dims
+    pos_wh = (w > 0) & (h > 0) if allow_neg else torch.ones_like(w, dtype=torch.bool)
+
+    # 2. reasonable size
+    big = (w * h) > max_cover * H * W         # covers nearly full canvas
+    tiny = (w < min_wh) | (h < min_wh)
+
+    # 3. aspect ratio
+    weird = (ar < ar_min) | (ar > ar_max)
+
+    # 4. inside canvas
+    inside = (x1 >= -1) & (y1 >= -1) & (x2 <= W+1) & (y2 <= H+1)
+
+    return pos_wh & inside & ~tiny & ~big & ~weird
+
+
+def collate_and_filter_more(
+    batch: List[Tuple[torch.Tensor, dict]],
+    *,
+    min_box_size: int = 6,
+    keep_original_negatives: bool = True,
+    drop_became_empty: bool = True,
+    # logging / debugging
+    log_every: int = 2000,      # << fairly low verbosity by default
+    max_stats_lines: int = 10,  # stop printing after this many messages
+) -> Tuple[torch.Tensor, List[dict]] | Tuple[None, None]:
+    """
+    A collate_fn that:
+      • sanitises boxes,
+      • ALWAYS keeps images that started with 0 GT boxes (true negatives),
+      • optionally drops images that had GT but lost all boxes after filtering,
+      • returns (None, None) if literally nothing is left (very rare).
+
+    Args
+    ----
+    min_box_size : int
+        Minimum side (in *current* image pixels) for a GT box to be kept.
+    keep_original_negatives : bool
+        If True, images that *arrived* with 0 GTs are kept as negatives.
+    drop_became_empty : bool
+        If True, images that had boxes but all were filtered out are dropped.
+        Set False if you also want to keep them as hard negatives.
+    log_every : int
+        Print running stats every N batches.
+    max_stats_lines : int
+        Stop printing stats after this many lines (keeps logs tidy).
+
+    Returns
+    -------
+    (images, targets) or (None, None) if nothing survived.
+    """
+
+    imgs, tgts = zip(*batch)
+
+    # persistent running stats
+    if not hasattr(collate_and_filter, "stats"):
+        collate_and_filter.stats = {
+            "batches": 0,
+            "boxes_in": 0,
+            "boxes_out": 0,
+            "imgs_in": 0,
+            "imgs_out": 0,
+            "printed": 0,
+            "kept_neg": 0,
+            "dropped_empty": 0,
+        }
+    S = collate_and_filter.stats
+
+    good_imgs: List[torch.Tensor] = []
+    good_tgts: List[dict] = []
+
+    for img, tgt in zip(imgs, tgts):
+        H, W = img.shape[-2:]
+        boxes_in = tgt["boxes"]
+        n_in = int(boxes_in.shape[0])
+        started_negative = n_in == 0
+
+        # Always count input stats
+        S["imgs_in"] += 1
+        S["boxes_in"] += n_in
+
+        if n_in > 0:
+            xyxy = boxes_in.clone().to(torch.float32)
+            mask = _make_valid_mask(
+                xyxy, H, W,
+                min_wh=min_box_size,
+                allow_neg=False
+            )
+            if mask.sum() > 0:
+                tgt["boxes"] = boxes_in[mask]
+                tgt["labels"] = tgt["labels"][mask]
+            else:
+                tgt["boxes"] = boxes_in.new_zeros((0, 4))
+                tgt["labels"] = tgt["labels"].new_zeros((0,), dtype=torch.long)
+
+        n_out = int(tgt["boxes"].shape[0])
+
+        keep = True
+        if started_negative and keep_original_negatives:
+            # keep true negatives
+            S["kept_neg"] += 1
+            keep = True
+        elif n_out == 0 and n_in > 0 and drop_became_empty:
+            # had GT but became empty → drop (configurable)
+            S["dropped_empty"] += 1
+            keep = False
+
+        if keep:
+            good_imgs.append(img)
+            good_tgts.append(tgt)
+            S["imgs_out"] += 1
+            S["boxes_out"] += n_out
+
+    S["batches"] += 1
+    if log_every > 0 and (S["batches"] % log_every == 0) and (S["printed"] < max_stats_lines):
+        kept_pct = 100.0 * S["boxes_out"] / max(1, S["boxes_in"])
+        print(
+            f"[SanityFilter] b={S['batches']:>6} | "
+            f"boxes kept {kept_pct:5.1f}% ({S['boxes_out']}/{S['boxes_in']}) | "
+            f"imgs kept {S['imgs_out']}/{S['imgs_in']} | "
+            f"true-neg kept {S['kept_neg']} | "
+            f'dropped-empty {S["dropped_empty"]}'
+        )
+        S["printed"] += 1
+
+    if not good_imgs:   # pathological but possible
+        return None, None
+
+    return torch.stack(good_imgs, 0), good_tgts
+
+
 # ---------- collate ----------
 def collate_v2(batch):
     imgs, tgts = zip(*batch)
@@ -454,6 +603,7 @@ def train_epoch(
         iou_weight_change_epoch: int = None, # Epoch to change IoU weight
         use_focal_loss: bool = False,
         debug_prints: bool = True,
+        gamma_loss = 2.0,
 ):
     model.train()
     # Dynamic IoU loss weight
@@ -688,7 +838,7 @@ def train_epoch(
                     cls_logits_pos,
                     cls_targets_pos,
                     alpha=0.25,  # Standard value to balance positive/negative examples
-                    gamma=2.0,   # Standard value to focus on hard examples
+                    gamma=gamma_loss,   # Standard value to focus on hard examples
                     reduction='sum'
                 ) / loss_norm_factor
                 # 2. Objectness Loss (Binary Cross-Entropy)
@@ -709,7 +859,6 @@ def train_epoch(
             
             else:  # Varifocal Loss proper
                 alpha_dyn = 0.75
-                gamma_vfl = 2.0
                 q_floor   = 0.05
                 q_gamma   = 0.5  # sqrt lift of low IoUs
                 
@@ -727,7 +876,7 @@ def train_epoch(
                 
                     targets[pos_indices, gt_labels_pos] = quality
                 
-                vfl_calculator = VarifocalLoss(alpha=alpha_dyn, gamma=gamma_vfl, reduction='sum')
+                vfl_calculator = VarifocalLoss(alpha=alpha_dyn, gamma=gamma_loss, reduction='sum')
                 loss_cls = vfl_calculator(joint_logits, targets) / max(1, num_fg_img)
                 w_obj_loss = 0.1  # small for initial testing of adding to VFL
             
@@ -1736,6 +1885,7 @@ def main(argv: List[str] | None = None):
         out_ch = 128
         lat_k = 5
         cls_conv_depth = 3
+    gamma_loss = 2.0
     model = PicoDet(
         backbone, 
         feat_chs,
@@ -1785,7 +1935,7 @@ def main(argv: List[str] | None = None):
     if cfg.min_box_size is not None and cfg.min_box_size > 1:
         print(f"[INFO] Filtering enabled: Dropping GT boxes smaller than {cfg.min_box_size}x{cfg.min_box_size} pixels.")
         # Use functools.partial to create a collate_fn with our argument "baked in"
-        custom_collate_fn = functools.partial(collate_and_filter, min_box_size=cfg.min_box_size)
+        custom_collate_fn = functools.partial(collate_and_filter_more, min_box_size=cfg.min_box_size)
     else:
         print("[INFO] GT box filtering disabled.")
         custom_collate_fn = collate_v2
@@ -1806,7 +1956,7 @@ def main(argv: List[str] | None = None):
     train_loaders = {}
     total_scheduled_epochs = 0
     for i, (num_epochs, min_size) in enumerate(curriculum_schedule):
-        collate_fn = functools.partial(collate_and_filter, min_box_size=min_size)
+        collate_fn = functools.partial(collate_and_filter_more, min_box_size=min_size)
         
         # Use the existing train_sampler logic
         train_loaders[i] = DataLoader(
@@ -1992,11 +2142,19 @@ def main(argv: List[str] | None = None):
         elif ep == 15:
             assigner.cls_cost_weight = 4.0
             CLS_WEIGHT = 3.0
+        elif ep == 50:
+            assigner.dynamic_k_min = 1
+        elif ep == 60:
+            assigner.r = 3.0
+        elif ep == 70:
+            gamma_loss = 2.5
+        elif ep == 80:
+            assigner.cls_cost_weight = 5.0
         elif ep > 100:
             assigner.dynamic_k_min = 1
             assigner.r = 2.5
             CLS_WEIGHT = 4.0
-            assigner.cls_cost_weight = 5.0
+
         if assigner.mean_fg_iou < 0.35 or ep < 5:
             assigner.power = 0.0
         elif assigner.mean_fg_iou < 0.45:
@@ -2017,6 +2175,7 @@ def main(argv: List[str] | None = None):
             debug_prints=debug_prints,
             use_focal_loss=use_focal_loss_for_epoch,
             w_cls_loss=CLS_WEIGHT,
+            gamma_loss=gamma_loss,
         )
         model.eval()
         try:
