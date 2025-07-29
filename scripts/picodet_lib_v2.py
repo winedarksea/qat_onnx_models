@@ -218,7 +218,7 @@ class PicoDetHead(nn.Module):
                 GhostConv(num_feats, num_feats, k=first_cls_conv_k, inplace_act=inplace_act),
                 *[GhostConv(num_feats, num_feats, inplace_act=inplace_act) for _ in range(self.cls_conv_depth - 1)]
             )
-        self.reg_conv = nn.Sequential(*[GhostConv(num_feats, num_feats, ratio=3.0, inplace_act=inplace_act) for _ in range(self.reg_conv_depth)])
+        self.reg_conv = nn.Sequential(*[GhostConv(num_feats, num_feats, ratio=2.0, inplace_act=inplace_act) for _ in range(self.reg_conv_depth)])
         self.cls_pred = nn.ModuleList([nn.Conv2d(num_feats, self.nc, 1) for _ in range(self.nl)])
         # self.obj_pred = nn.ModuleList([nn.Conv2d(num_feats, 1, 1) for _ in range(self.nl)])
         self.reg_pred = nn.ModuleList(

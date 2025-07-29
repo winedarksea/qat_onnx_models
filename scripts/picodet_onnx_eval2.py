@@ -23,6 +23,7 @@ from pycocotools.cocoeval import COCOeval
 
 # --- Constants and helpers from train_picodet_qat.py (or adapted) ---
 IMG_SIZE = 256 # Should be consistent with the trained model
+COCO_EVAL_SCORE_THRESH = 0.05
 
 CANONICAL_COCO80_IDS: list[int] = [
      1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 13, 14, 15, 16, 17,
@@ -270,6 +271,8 @@ def evaluate_onnx_model(onnx_model_path: str, coco_root_dir: str, batch_size: in
             # 1. Store results for COCOeval (scaled to original image dimensions)
             for box_pred, score_pred, label_pred_cont in zip(img_boxes_pred_imgsize, img_scores_pred, img_labels_pred_cont):
                 x1, y1, x2, y2 = box_pred
+                if score_pred < COCO_EVAL_SCORE_THRESH:
+                    continue 
                 scaled_x1 = np.clip(x1 * scale_x, 0, orig_w)
                 scaled_y1 = np.clip(y1 * scale_y, 0, orig_h)
                 scaled_x2 = np.clip(x2 * scale_x, 0, orig_w)
@@ -407,8 +410,8 @@ if __name__ == "__main__":
                         help="Device for ONNX Runtime ('cpu' or 'cuda').")
     parser.add_argument("--score_thresh_plot", type=float, default=0.02, help="Score threshold for plotting detections.")
     parser.add_argument("--num_plot_samples", type=int, default=5, help="Number of sample images to plot.")
-    parser.add_argument("--basic_acc_score_thresh", type=float, default=0.02, help="Score threshold for basic accuracy calculation.")
-    parser.add_argument("--basic_acc_iou_thresh", type=float, default=0.1, help="IoU threshold for basic accuracy calculation.")
+    parser.add_argument("--basic_acc_score_thresh", type=float, default=0.15, help="Score threshold for basic accuracy calculation.")
+    parser.add_argument("--basic_acc_iou_thresh", type=float, default=0.10, help="IoU threshold for basic accuracy calculation.")
 
 
     args = parser.parse_args()

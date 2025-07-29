@@ -108,7 +108,7 @@ def build_transforms(size, train):
         T.RandomAutocontrast(p=0.1) if train else T.Identity(),
         T.RandomEqualize(p=0.1) if train else T.Identity(),
         # T.Resize(size, antialias=True),
-        T.RandomResizedCrop(size, scale=(0.8, 1.05), antialias=True) if train else T.Resize(size, antialias=True),
+        T.RandomResizedCrop(size, scale=(0.75, 1.05), antialias=True) if train else T.Resize(size, antialias=True),
         T.ToDtype(torch.uint8, scale=True),  # keep uint8, model normalises
     ]
     return T.Compose(aug)
@@ -599,7 +599,7 @@ def train_epoch(
         w_obj_loss: float = 0.5,
         w_dfl_loss: float = 0.5,
         w_iou_initial: float = 4.0,
-        w_iou_final: float = 2.0,   # Final weight for IoU loss
+        w_iou_final: float = 3.0,   # Final weight for IoU loss
         iou_weight_change_epoch: int = None, # Epoch to change IoU weight
         use_focal_loss: bool = False,
         debug_prints: bool = True,
@@ -609,7 +609,7 @@ def train_epoch(
     model.train()
     # Dynamic IoU loss weight
     if iou_weight_change_epoch is None:
-        iou_weight_change_epoch = int(max_epochs * 0.4)
+        iou_weight_change_epoch = int(max_epochs * 0.5)
     w_iou = w_iou_initial if epoch < iou_weight_change_epoch else w_iou_final
     # ─── containers for epoch‑wide diagnostics ──────────────────────────
     total_samples_contributing_to_loss_epoch = 0
@@ -735,7 +735,7 @@ def train_epoch(
             if num_fg_img == 0:
                 skips += 1
                 if skips == 400:
-                    print("Large number of skipped batches, likely there is a bug")
+                    print("Large number of skipped batches, POssibly there is a bug")
                     
                     print("\n--- COORDINATE SYSTEM SANITY CHECK ---")
                     gt_sample = gt_boxes_img[0] if gt_boxes_img.numel() > 0 else "N/A no GT"
@@ -1881,9 +1881,12 @@ def main(argv: List[str] | None = None):
         lat_k = 5
         cls_conv_depth = 3
     else:
-        out_ch = 128
+        # for out_ch choose a number divisible by 6 (ghost conv ratio 2 and 3), 8
+        # large out_ch can often take a smaller conv_depth
+        out_ch = 120  # 144
         lat_k = 5
         cls_conv_depth = 3
+        # assigner ctr often needs to be larger with larger images as well
     gamma_loss = 2.0
     quality_floor_vfl = 0.05
     q_gamma = 0.5
@@ -2119,25 +2122,30 @@ def main(argv: List[str] | None = None):
             use_focal_loss_for_epoch = ep < FOCAL_LOSS_WARMUP_EPOCHS
             if ep == FOCAL_LOSS_WARMUP_EPOCHS:
                 print("[INFO] Switching from Focal Loss warmup to Varifocal Loss for subsequent epochs.")
+                quality_floor_vfl = quality_floor_vfl * 3
+            elif ep == (FOCAL_LOSS_WARMUP_EPOCHS + 1):
+                quality_floor_vfl = quality_floor_vfl / 3
         else:
             use_focal_loss_for_epoch = use_focal_loss
         if ep < 2:
             assigner.k = 12
             assigner.dynamic_k_min = 5
             assigner.cls_cost_weight = 2.0
-            assigner.r = 5.0
+            assigner.r = 5.25
             CLS_WEIGHT = 0.4
+        elif ep < 4:
+            pass
         elif ep < 6:
+            assigner.dynamic_k_min = 4
             assigner.r = 4.5
             assigner.k = 10
-            assigner.dynamic_k_min = 4
             assigner.cls_cost_weight = 3.0
             CLS_WEIGHT = 1.0
         elif ep < 8:
             assigner.r = 4.0
             assigner.dynamic_k_min = 2
             assigner.cls_cost_weight = 4.0
-            CLS_WEIGHT = 2.0
+            CLS_WEIGHT = 1.8
         elif ep < 10:
             CLS_WEIGHT = 2.5
         elif ep == 15:
@@ -2147,14 +2155,15 @@ def main(argv: List[str] | None = None):
             quality_floor_vfl = 0.005
         elif ep == 50:
             assigner.dynamic_k_min = 1
-        elif ep == 52:
-            q_gamma = 1.0
+        elif ep == 55:
+            pass
+            # q_gamma = 1.0
         elif ep == 60:
             assigner.r = 3.0
         elif ep == 70:
-            gamma_loss = 2.5
+            gamma_loss = 2.25
         elif ep == 80:
-            assigner.cls_cost_weight = 5.0
+            assigner.cls_cost_weight = 4.0
         elif ep > 100:
             assigner.dynamic_k_min = 1
             assigner.r = 2.5
@@ -2544,3 +2553,17 @@ def plot_training_history(history: dict, title: str = 'Training Progress'):
 if __name__ == '__main__':
     final_history = main()
     plot_training_history(final_history, title="PicoDet Training Progress")
+
+    temp_onnx_path = "picodet_v5_int8_temp_no_nms.onnx"
+
+    score_th = 0.5
+    iou_th = 0.3
+    max_det = 100
+    out_dest = f'picodet_v5_int8_{str(score_th).replace(".", "_")}_{str(iou_th).replace(".", "_")}_{max_det}.onnx'
+    append_nms_to_onnx(
+        in_path=temp_onnx_path,
+        out_path=out_dest,
+        score_thresh=float(score_th), # 0.05
+        iou_thresh=float(iou_th),  # 0.6
+        max_det=max_det,  # 100
+    )
