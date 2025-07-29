@@ -15,7 +15,6 @@ import onnxruntime
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
-from PIL import Image
 from tqdm import tqdm
 
 from pycocotools.coco import COCO as PyCOCO_COCO # Renamed to avoid class name collision
@@ -353,7 +352,7 @@ def evaluate_onnx_model(onnx_model_path: str, coco_root_dir: str, batch_size: in
 
     print("Evaluation loop finished.")
     avg_inference_time_ms = total_inference_time_ms / num_processed_images if num_processed_images > 0 else 0
-    print(f"\n--- Metrics ---")
+    print("\n--- Metrics ---")
     print(f"Average inference time per image: {avg_inference_time_ms:.2f} ms ({1000/avg_inference_time_ms if avg_inference_time_ms > 0 else 0:.2f} FPS)")
 
     if not all_coco_results:

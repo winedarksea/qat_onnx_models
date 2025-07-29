@@ -115,10 +115,10 @@ def build_transforms(size, train):
 
 
 def _make_valid_mask(xyxy, H, W,
-                     min_wh      = 6,
+                     min_wh      = 8,
                      max_cover   = 0.90,
-                     ar_min      = 0.10,
-                     ar_max      = 10.0,
+                     ar_min      = 0.05,
+                     ar_max      = 20.0,
                      allow_neg   = False):
     """
     Return a Bool mask identifying annotation boxes that pass all sanity checks.
@@ -598,8 +598,7 @@ def train_epoch(
         w_cls_loss: float = 3.0,
         w_obj_loss: float = 0.5,
         w_dfl_loss: float = 0.5,
-        w_iou_initial: float = 4.0,
-        w_iou_final: float = 3.0,   # Final weight for IoU loss
+        w_iou_loss: float = 4.0,
         iou_weight_change_epoch: int = None, # Epoch to change IoU weight
         use_focal_loss: bool = False,
         debug_prints: bool = True,
@@ -607,10 +606,6 @@ def train_epoch(
         q_gamma = 0.5,  # sqrt lift of low IoUs
 ):
     model.train()
-    # Dynamic IoU loss weight
-    if iou_weight_change_epoch is None:
-        iou_weight_change_epoch = int(max_epochs * 0.5)
-    w_iou = w_iou_initial if epoch < iou_weight_change_epoch else w_iou_final
     # ─── containers for epoch‑wide diagnostics ──────────────────────────
     total_samples_contributing_to_loss_epoch = 0
     fg_total, img_total = 0, 0
@@ -883,7 +878,7 @@ def train_epoch(
             current_sample_total_loss = (
                   w_cls_loss * loss_cls
                 + w_dfl_loss * loss_dfl
-                + w_iou * loss_iou
+                + w_iou_loss * loss_iou
                 + w_obj_loss * loss_obj
             )
             if not torch.isfinite(current_sample_total_loss):
@@ -928,7 +923,7 @@ def train_epoch(
         if debug_prints and i == 0 and total_samples_contributing_to_loss_epoch > 0 : # Print first batch loss breakdown
              print(f"E{epoch} B0 loss components: "
                   f"cls {loss_cls_print.item() * w_cls_loss:.3f} (w={w_cls_loss})  obj {loss_obj_print.item() * w_obj_loss:.3f} (w={w_obj_loss})  "
-                  f"dfl {loss_dfl_print.item() * w_dfl_loss:.3f} (w={w_dfl_loss})  iou {loss_iou_print.item() * w_iou:.3f} (w={w_iou})  "
+                  f"dfl {loss_dfl_print.item() * w_dfl_loss:.3f} (w={w_dfl_loss})  iou {loss_iou_print.item() * w_iou_loss:.3f} (w={w_iou_loss})  "
                   f"tot_batch_avg {averaged_batch_loss.item():.3f}")
              with torch.no_grad():
                     fg_indices = fg_mask_img.nonzero(as_tuple=False).squeeze(1)
@@ -1401,6 +1396,7 @@ class PostprocessorForONNX(nn.Module):
         boxes_xyxy_level = torch.stack([x1, y1, x2, y2], dim=-1) # Shape (B, num_anchors_level, 4)
 
         # scores_level = torch.sigmoid(cls_logit_perm + self.logit_scale * obj_logit_perm)
+        # scores_level = torch.sigmoid((cls_logit_perm + 0.5) / 0.8)
         scores_level = torch.sigmoid(cls_logit_perm)
 
         return boxes_xyxy_level, scores_level
@@ -1478,7 +1474,7 @@ def append_nms_to_onnx(
         raw_boxes: str = "raw_boxes",     # [B , A , 4]
         raw_scores: str = "raw_scores",   # [B , A , C]
         top_k_before_nms: bool = True,
-        k_value: int = 800,
+        k_value: int = 600,
 ):
     m = onnx.load(in_path)
     g = m.graph
@@ -1881,14 +1877,14 @@ def main(argv: List[str] | None = None):
         lat_k = 5
         cls_conv_depth = 3
     else:
-        # for out_ch choose a number divisible by 6 (ghost conv ratio 2 and 3), 8
+        # for out_ch choose a number divisible by 2, 8
         # large out_ch can often take a smaller conv_depth
         out_ch = 120  # 144
         lat_k = 5
         cls_conv_depth = 3
         # assigner ctr often needs to be larger with larger images as well
     gamma_loss = 2.0
-    quality_floor_vfl = 0.05
+    quality_floor_vfl = 0.04
     q_gamma = 0.5
     model = PicoDet(
         backbone, 
@@ -1946,7 +1942,7 @@ def main(argv: List[str] | None = None):
 
     # Curriculum learning, gradually smaller boxes included
     curriculum_schedule = [
-        (20, 24),  # Stage 1: For the first 15 epochs, only use boxes >= 24x24 pixels.
+        (18, 24),  # Stage 1: For the first N epochs, only use boxes >= 24x24 pixels.
         (2, 22),
         (2, 20),
         (2, 18),
@@ -2122,9 +2118,9 @@ def main(argv: List[str] | None = None):
             use_focal_loss_for_epoch = ep < FOCAL_LOSS_WARMUP_EPOCHS
             if ep == FOCAL_LOSS_WARMUP_EPOCHS:
                 print("[INFO] Switching from Focal Loss warmup to Varifocal Loss for subsequent epochs.")
-                quality_floor_vfl = quality_floor_vfl * 3
+                quality_floor_vfl = quality_floor_vfl * 2
             elif ep == (FOCAL_LOSS_WARMUP_EPOCHS + 1):
-                quality_floor_vfl = quality_floor_vfl / 3
+                quality_floor_vfl = quality_floor_vfl / 2
         else:
             use_focal_loss_for_epoch = use_focal_loss
         if ep < 2:
@@ -2133,11 +2129,13 @@ def main(argv: List[str] | None = None):
             assigner.cls_cost_weight = 2.0
             assigner.r = 5.25
             CLS_WEIGHT = 0.4
+            IOU_WEIGHT = 4.0
         elif ep < 4:
-            pass
+            assigner.cls_cost_weight = 2.2
+            CLS_WEIGHT = 0.5
         elif ep < 6:
             assigner.dynamic_k_min = 4
-            assigner.r = 4.5
+            assigner.r = 4.6
             assigner.k = 10
             assigner.cls_cost_weight = 3.0
             CLS_WEIGHT = 1.0
@@ -2148,18 +2146,22 @@ def main(argv: List[str] | None = None):
             CLS_WEIGHT = 1.8
         elif ep < 10:
             CLS_WEIGHT = 2.5
+        elif ep == 14:
+            IOU_WEIGHT = 3.0
         elif ep == 15:
             assigner.cls_cost_weight = 4.0
             CLS_WEIGHT = 3.0
-        elif ep == 20:
-            quality_floor_vfl = 0.005
-        elif ep == 50:
+        elif ep == 17:
+            quality_floor_vfl = 0.02
+        elif ep == 22:
             assigner.dynamic_k_min = 1
+            quality_floor_vfl = 0.005
         elif ep == 55:
-            pass
-            # q_gamma = 1.0
+            q_gamma = 0.6
         elif ep == 60:
             assigner.r = 3.0
+        elif ep == 65 and assigner.mean_fg_iou > 0.45:
+            q_gamma = 0.8
         elif ep == 70:
             gamma_loss = 2.25
         elif ep == 80:
@@ -2189,6 +2191,7 @@ def main(argv: List[str] | None = None):
             debug_prints=debug_prints,
             use_focal_loss=use_focal_loss_for_epoch,
             w_cls_loss=CLS_WEIGHT,
+            w_iou_loss=IOU_WEIGHT,
             gamma_loss=gamma_loss,
             q_gamma=q_gamma,
         )
@@ -2314,6 +2317,7 @@ def main(argv: List[str] | None = None):
             iou_weight_change_epoch=2,
             debug_prints=False,
             w_cls_loss=CLS_WEIGHT,
+            w_iou_loss=IOU_WEIGHT,
             use_focal_loss=use_focal_loss,
             q_gamma=q_gamma,
         )

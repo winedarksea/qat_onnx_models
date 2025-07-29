@@ -246,7 +246,7 @@ class PicoDetHead(nn.Module):
     def _initialize_biases(self):
     
         # ---- class branch (unchanged) ----
-        cls_prior = 0.05
+        cls_prior = 0.03
         cls_bias  = -math.log((1-cls_prior)/cls_prior)
         for conv in self.cls_pred:
             nn.init.constant_(conv.bias, cls_bias)
@@ -323,6 +323,7 @@ class PicoDetHead(nn.Module):
 
         # Use the learned scaler during inference to combine logits.
         # scores = (cls_logit_perm + self.logit_scale * obj_logit_perm).sigmoid()
+        # scores = ((cls_logit_perm + 0.5) / 0.8).sigmoid()
         scores = cls_logit_perm.sigmoid()
         return boxes, scores
 
