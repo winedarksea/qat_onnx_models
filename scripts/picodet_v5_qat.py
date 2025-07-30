@@ -26,7 +26,7 @@ if False:  # this is just here for a quirk in testing, imports are still availab
     try: 
         from picodet_lib_v2 import (
             PicoDet, get_backbone, VarifocalLoss, dfl_loss,
-            build_dfl_targets, PicoDetHead, ResizeNorm
+            build_dfl_targets, PicoDetHead, ResizeNorm, QualityFocalLoss
         )
     except Exception:
         # when running manually in console, these are already loaded
@@ -1396,8 +1396,8 @@ class PostprocessorForONNX(nn.Module):
         boxes_xyxy_level = torch.stack([x1, y1, x2, y2], dim=-1) # Shape (B, num_anchors_level, 4)
 
         # scores_level = torch.sigmoid(cls_logit_perm + self.logit_scale * obj_logit_perm)
-        # scores_level = torch.sigmoid((cls_logit_perm + 0.5) / 0.8)
-        scores_level = torch.sigmoid(cls_logit_perm)
+        scores_level = torch.sigmoid((cls_logit_perm + 0.5) / 0.8)
+        # scores_level = torch.sigmoid(cls_logit_perm)
 
         return boxes_xyxy_level, scores_level
 
@@ -1868,6 +1868,7 @@ def main(argv: List[str] | None = None):
     print(f'[INFO] device = {dev}')
 
     backbone, feat_chs = get_backbone(cfg.arch, ckpt=None, img_size=IMG_SIZE) # Pass img_size
+    reg_conv_depth = 2
     if IMG_SIZE < 320:
         out_ch = 96
         lat_k = 5
@@ -1893,6 +1894,7 @@ def main(argv: List[str] | None = None):
         neck_out_ch=out_ch,  # 96
         img_size=IMG_SIZE,
         head_reg_max=9 if IMG_SIZE < 320 else int((2 * math.ceil(IMG_SIZE / 128) + 3)),
+        reg_conv_depth=reg_conv_depth,
         cls_conv_depth=cls_conv_depth,
         lat_k=lat_k,
         inplace_act_for_head_neck=not cfg.no_inplace_head_neck # Control from arg
@@ -2157,11 +2159,11 @@ def main(argv: List[str] | None = None):
             assigner.dynamic_k_min = 1
             quality_floor_vfl = 0.005
         elif ep == 55:
-            q_gamma = 0.6
+            q_gamma = 0.4
         elif ep == 60:
             assigner.r = 3.0
         elif ep == 65 and assigner.mean_fg_iou > 0.45:
-            q_gamma = 0.8
+            q_gamma = 0.3
         elif ep == 70:
             gamma_loss = 2.25
         elif ep == 80:

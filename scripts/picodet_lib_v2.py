@@ -129,6 +129,16 @@ class CSPPAN(nn.Module):
 
         return (self.out[0](p3), self.out[1](p4), self.out[2](p5))
 
+
+# --- tiny ESE gate ----------------------------------------
+class ESE(nn.Module):
+    def __init__(self, c):
+        super().__init__()
+        self.fc = nn.Conv2d(c, c, 1, bias=False)
+    def forward(self, x):
+        w = torch.sigmoid(self.fc(x.mean((2,3), keepdim=True)))
+        return x * w
+
 # ─────────────────────── losses (VFL · DFL · IoU) ──────────────────
 class VarifocalLoss(nn.Module):
     """Implementation that expects *raw* joint logits (cls+obj)."""
@@ -148,6 +158,61 @@ class VarifocalLoss(nn.Module):
         if self.reduction == 'mean':
             return loss.mean()
         return loss
+
+class QualityFocalLoss(nn.Module):
+    """
+    Quality Focal Loss (QFL) for object detection.
+
+    This loss is designed to address the inconsistency between classification
+    scores and localization quality (IoU). It uses the IoU between the predicted
+    bounding box and the ground truth box as the target for the classification
+    score of the positive class.
+
+    The formula is: QFL(σ) = -|y - σ|^β * ((1 - y)log(1 - σ) + y*log(σ))
+    where:
+      - σ (sigma) is the predicted score (output of sigmoid).
+      - y is the quality target (e.g., IoU score).
+      - β (beta) is the focusing parameter (gamma in original Focal Loss).
+
+    Args:
+        beta (float): The focusing parameter (also called gamma). Defaults to 2.0.
+    """
+    def __init__(self, beta: float = 2.0):
+        super().__init__()
+        self.beta = beta
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        """
+        Calculates the Quality Focal Loss.
+
+        Args:
+            logits (torch.Tensor): The raw, un-sigmoid-ed predictions from the model.
+                                   Shape: (N, C) or any other shape.
+            targets (torch.Tensor): The quality targets, which are typically a tensor of the
+                                    same shape as logits. For positive classes, the target
+                                    is the IoU score (0-1). For negative classes, it's 0.
+
+        Returns:
+            torch.Tensor: The calculated loss, summed over all elements.
+        """
+        # For numerical stability, use PyTorch's built-in function
+        # which combines sigmoid and BCE, and works with raw logits.
+        bce_loss = F.binary_cross_entropy_with_logits(logits, targets, reduction='none')
+
+        # The predicted scores (sigma) are needed for the modulating factor.
+        # This is the only place we need the sigmoid output.
+        pred_scores = torch.sigmoid(logits).clamp_(1e-4, 1 - 1e-4)
+
+        # The modulating factor is based on the absolute difference between
+        # the target quality (y) and the predicted score (sigma).
+        modulating_factor = (targets - pred_scores).abs().pow(self.beta)
+
+        # The final loss is the element-wise product of the modulating factor and BCE loss.
+        loss = modulating_factor * bce_loss
+
+        # We return the sum, as normalization is typically handled outside by
+        # dividing by the number of positive samples.
+        return loss.sum()
 
 def build_dfl_targets(offsets: torch.Tensor, reg_max: int) -> torch.Tensor:
     """Soft distribution targets for DFL (Distilled Focal Loss)."""
@@ -189,7 +254,8 @@ class PicoDetHead(nn.Module):
                  score_thresh: float = 0.05, 
                  nms_iou: float = 0.6,
                  img_size: int = 224,
-                 cls_conv_depth: int = 3,  # 2
+                 cls_conv_depth: int = 3,
+                 reg_conv_depth: int = 2,
                  inplace_act: bool = False):
         super().__init__()
         self.nc = num_classes
@@ -198,7 +264,7 @@ class PicoDetHead(nn.Module):
         self.max_det = max_det
         self.score_th = score_thresh
         self.iou_th = nms_iou
-        self.reg_conv_depth = 2
+        self.reg_conv_depth = reg_conv_depth
         self.cls_conv_depth = cls_conv_depth
         self.img_size = img_size
         first_cls_conv_k = 3  # 1
@@ -246,7 +312,7 @@ class PicoDetHead(nn.Module):
     def _initialize_biases(self):
     
         # ---- class branch (unchanged) ----
-        cls_prior = 0.03
+        cls_prior = 0.05
         cls_bias  = -math.log((1-cls_prior)/cls_prior)
         for conv in self.cls_pred:
             nn.init.constant_(conv.bias, cls_bias)
@@ -323,8 +389,8 @@ class PicoDetHead(nn.Module):
 
         # Use the learned scaler during inference to combine logits.
         # scores = (cls_logit_perm + self.logit_scale * obj_logit_perm).sigmoid()
-        # scores = ((cls_logit_perm + 0.5) / 0.8).sigmoid()
-        scores = cls_logit_perm.sigmoid()
+        scores = ((cls_logit_perm + 0.5) / 0.8).sigmoid()
+        # scores = cls_logit_perm.sigmoid()
         return boxes, scores
 
     def forward(self, neck_feature_maps: Tuple[torch.Tensor, ...]):
@@ -374,6 +440,7 @@ class PicoDet(nn.Module):
                  head_score_thresh: float = 0.08, # Will be used by ONNX NMS logic
                  head_nms_iou: float = 0.55, # Will be used by ONNX NMS logic
                  cls_conv_depth: int = 3,
+                 reg_conv_depth: int = 2,
                  lat_k: int = 5,
                  inplace_act_for_head_neck: bool = False):
         super().__init__()
@@ -393,6 +460,7 @@ class PicoDet(nn.Module):
             score_thresh=head_score_thresh,
             nms_iou=head_nms_iou,
             img_size=img_size,
+            reg_conv_depth=reg_conv_depth,
             cls_conv_depth=cls_conv_depth,
             inplace_act=inplace_act_for_head_neck,
         )
@@ -666,7 +734,8 @@ def get_backbone(arch: str, ckpt: str | None, img_size: int = 224):
     
 # Convenience export
 __all__ = [
-    'GhostConv', 'DWConv', 'CSPBlock', 'CSPPAN',
+    'GhostConv', 'DWConv', 'CSPBlock', 'CSPPAN', 'ESE',
     'VarifocalLoss', 'dfl_loss', 'build_dfl_targets',
-    'PicoDetHead', 'ResizeNorm', 'get_backbone', 'PicoDet'
+    'PicoDetHead', 'ResizeNorm', 'get_backbone', 'PicoDet',
+    'QualityFocalLoss',
 ]

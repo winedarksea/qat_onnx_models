@@ -407,7 +407,7 @@ if __name__ == "__main__":
     parser.add_argument("--workers", type=int, default=0, help="Number of DataLoader workers.")
     parser.add_argument("--device", type=str, default="cpu", choices=["cpu", "cuda"], 
                         help="Device for ONNX Runtime ('cpu' or 'cuda').")
-    parser.add_argument("--score_thresh_plot", type=float, default=0.02, help="Score threshold for plotting detections.")
+    parser.add_argument("--score_thresh_plot", type=float, default=0.15, help="Score threshold for plotting detections.")
     parser.add_argument("--num_plot_samples", type=int, default=5, help="Number of sample images to plot.")
     parser.add_argument("--basic_acc_score_thresh", type=float, default=0.15, help="Score threshold for basic accuracy calculation.")
     parser.add_argument("--basic_acc_iou_thresh", type=float, default=0.10, help="IoU threshold for basic accuracy calculation.")
