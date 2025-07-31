@@ -854,8 +854,6 @@ def train_epoch(
                 """
             
             else:  # Varifocal Loss proper
-                alpha_dyn = 0.75
-                
                 targets = torch.zeros_like(joint_logits)
                 
                 if pos_indices.numel() > 0:
@@ -866,13 +864,16 @@ def train_epoch(
                         iou_pred = tvops.box_iou(pred_boxes_fg_img, box_targets_fg_img).diag()
                 
                         # shape quality
-                        quality = iou_pred.clamp_min(quality_floor_vfl).pow(q_gamma)
+                        quality = iou_pred.clamp_min(quality_floor_vfl).pow(q_gamma)  # VFL
+                        # quality = iou_pred.clamp_min(quality_floor_vfl)  # QFL
                 
                     targets[pos_indices, gt_labels_pos] = quality
                 
-                vfl_calculator = VarifocalLoss(alpha=alpha_dyn, gamma=gamma_loss, reduction='sum')
+                vfl_calculator = VarifocalLoss(alpha=0.75, gamma=gamma_loss, reduction='sum')
+                # vfl_calculator = QualityFocalLoss(beta=gamma_loss, reduction='sum')
                 loss_cls = vfl_calculator(joint_logits, targets) / max(1, num_fg_img)
-                w_obj_loss = 0.1  # small for initial testing of adding to VFL
+
+                w_obj_loss = 0.01  # small placeholder
             
             # Final sample loss (obj already inside joint_logits)
             current_sample_total_loss = (
@@ -936,6 +937,10 @@ def train_epoch(
                     # Find the highest logit among all *incorrect* classes for each FG prediction
                     cls_p_fg_img[torch.arange(num_fg_img), gt_labels_fg] = -float('inf') # Mask out correct class
                     max_incorrect_class_logits, _ = cls_p_fg_img.max(dim=1)
+                    
+                    # cls_p_fg_img_for_debug = cls_p_fg_img.clone()
+                    # cls_p_fg_img_for_debug[torch.arange(num_fg_img), gt_labels_fg] = -float('inf') # Mask out correct class
+                    # max_incorrect_class_logits, _ = cls_p_fg_img_for_debug.max(dim=1)
             
                     # The "margin" is the difference. We want this to be large and positive.
                     logit_margin = correct_class_logits - max_incorrect_class_logits
@@ -1396,8 +1401,8 @@ class PostprocessorForONNX(nn.Module):
         boxes_xyxy_level = torch.stack([x1, y1, x2, y2], dim=-1) # Shape (B, num_anchors_level, 4)
 
         # scores_level = torch.sigmoid(cls_logit_perm + self.logit_scale * obj_logit_perm)
-        scores_level = torch.sigmoid((cls_logit_perm + 0.5) / 0.8)
-        # scores_level = torch.sigmoid(cls_logit_perm)
+        # scores_level = torch.sigmoid((cls_logit_perm + 0.5) / 0.8)
+        scores_level = torch.sigmoid(cls_logit_perm)
 
         return boxes_xyxy_level, scores_level
 
@@ -2144,12 +2149,12 @@ def main(argv: List[str] | None = None):
         elif ep < 8:
             assigner.r = 4.0
             assigner.dynamic_k_min = 2
-            assigner.cls_cost_weight = 4.0
+            assigner.cls_cost_weight = 3.5
             CLS_WEIGHT = 1.8
         elif ep < 10:
             CLS_WEIGHT = 2.5
         elif ep == 14:
-            IOU_WEIGHT = 3.0
+            IOU_WEIGHT = 2.5
         elif ep == 15:
             assigner.cls_cost_weight = 4.0
             CLS_WEIGHT = 3.0

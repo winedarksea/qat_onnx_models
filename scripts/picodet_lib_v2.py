@@ -106,7 +106,16 @@ class CSPPAN(nn.Module):
     def __init__(self, in_chs=(40, 112, 160), out_ch=96, lat_k=5, inplace_act: bool = False): # out_ch=64 would be faster than 96
         super().__init__()
         self.in_chs = in_chs
-        self.reduce = nn.ModuleList([GhostConv(c, out_ch, 1, inplace_act=inplace_act) for c in in_chs])
+        # self.reduce = nn.ModuleList([GhostConv(c, out_ch, 1, inplace_act=inplace_act) for c in in_chs])
+        self.reduce = nn.ModuleList([
+            GhostConv(in_chs[0], out_ch, 1, inplace_act=inplace_act),  # C3
+            GhostConv(in_chs[1], out_ch, 1, inplace_act=inplace_act),  # C4
+            nn.Sequential(                                             # C5 (plain 1×1)
+                nn.Conv2d(in_chs[2], out_ch, 1, bias=False),
+                nn.BatchNorm2d(out_ch),
+                nn.ReLU6(inplace=inplace_act),
+            ),
+        ])  # I think this will not be worth the latency
         self.lat    = nn.ModuleList([DWConv(out_ch, k=lat_k, inplace_act=inplace_act) for _ in in_chs[:-1]])
         lst_ly = len(in_chs) - 1
         self.out = nn.ModuleList([
@@ -177,9 +186,10 @@ class QualityFocalLoss(nn.Module):
     Args:
         beta (float): The focusing parameter (also called gamma). Defaults to 2.0.
     """
-    def __init__(self, beta: float = 2.0):
+    def __init__(self, beta: float = 2.0, reduction: str = 'sum'):
         super().__init__()
         self.beta = beta
+        self.reduction = reduction
 
     def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
         """
@@ -201,7 +211,7 @@ class QualityFocalLoss(nn.Module):
 
         # The predicted scores (sigma) are needed for the modulating factor.
         # This is the only place we need the sigmoid output.
-        pred_scores = torch.sigmoid(logits).clamp_(1e-4, 1 - 1e-4)
+        pred_scores = torch.sigmoid(logits).clamp(1e-4, 1 - 1e-4)
 
         # The modulating factor is based on the absolute difference between
         # the target quality (y) and the predicted score (sigma).
@@ -210,9 +220,14 @@ class QualityFocalLoss(nn.Module):
         # The final loss is the element-wise product of the modulating factor and BCE loss.
         loss = modulating_factor * bce_loss
 
-        # We return the sum, as normalization is typically handled outside by
-        # dividing by the number of positive samples.
-        return loss.sum()
+        if self.reduction == 'sum':
+            return loss.sum()
+        elif self.reduction == 'mean':
+            return loss.mean()
+        elif self.reduction is None:
+            return loss
+        else:
+            raise ValueError(f"unrecognized reduction {self.reduction}")
 
 def build_dfl_targets(offsets: torch.Tensor, reg_max: int) -> torch.Tensor:
     """Soft distribution targets for DFL (Distilled Focal Loss)."""
@@ -291,6 +306,8 @@ class PicoDetHead(nn.Module):
             [nn.Conv2d(num_feats, 4 * (self.reg_max + 1), 1) for _ in range(self.nl)]
         )
         
+        self.cls_ese = nn.ModuleList([ESE(num_feats) for _ in range(self.nl)])
+
         # Initialized to 1.0 to match the original additive behavior at the start.
         # self.logit_scale = nn.Parameter(torch.ones(1), requires_grad=True)
         self._initialize_biases()
@@ -389,8 +406,8 @@ class PicoDetHead(nn.Module):
 
         # Use the learned scaler during inference to combine logits.
         # scores = (cls_logit_perm + self.logit_scale * obj_logit_perm).sigmoid()
-        scores = ((cls_logit_perm + 0.5) / 0.8).sigmoid()
-        # scores = cls_logit_perm.sigmoid()
+        # scores = ((cls_logit_perm + 0.5) / 0.8).sigmoid()
+        scores = cls_logit_perm.sigmoid()
         return boxes, scores
 
     def forward(self, neck_feature_maps: Tuple[torch.Tensor, ...]):
@@ -401,7 +418,10 @@ class PicoDetHead(nn.Module):
         for i, f_map_level in enumerate(neck_feature_maps):
             cls_common_feat = self.cls_conv(f_map_level)
             reg_common_feat = self.reg_conv(f_map_level)
+
+            cls_common_feat = self.cls_ese[i](cls_common_feat)
             raw_cls_logits_levels.append(self.cls_pred[i](cls_common_feat))
+
             # raw_obj_logits_levels.append(self.obj_pred[i](cls_common_feat))
             raw_reg_logits_levels.append(self.reg_pred[i](reg_common_feat))
 
