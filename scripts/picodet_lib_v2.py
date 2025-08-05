@@ -42,7 +42,8 @@ class GhostConv(nn.Module):
             s: int = 1,
             dw_size: int = 3,  # dw_size 5 is maybe a bit slower but more accurate than 3
             ratio: int = 2,  # 1.5 generally slower, maybe more accurate, 3.0 faster, maybe less accurate
-            inplace_act: bool = False
+            inplace_act: bool = False,
+            act_layer = nn.ReLU6,    # ReLU6, HardSwish, SiLU
          ):
         super().__init__()
         self.c_out = c_out # Store c_out
@@ -53,7 +54,8 @@ class GhostConv(nn.Module):
 
         self.primary = nn.Sequential(
             nn.Conv2d(c_in, init_ch, k, s, k // 2, bias=False),
-            nn.BatchNorm2d(init_ch), nn.ReLU6(inplace=inplace_act)  # ReLU6, HardSwish
+            nn.BatchNorm2d(init_ch),
+            act_layer(inplace=inplace_act),
         )
         if self.cheap_ch > 0:
             self.cheap = nn.Sequential(
@@ -80,12 +82,13 @@ class GhostConv(nn.Module):
 class DWConv(nn.Module):
     def __init__(
             self, c: int, k: int = 5,  # k=5 for 5x5, 3 for 3x3
-            inplace_act: bool = False
+            inplace_act: bool = False,
+            act_layer = nn.ReLU6,  # ReLU6, HardSwish
     ):
         super().__init__()
         self.dw = nn.Conv2d(c, c, k, 1, k // 2, groups=c, bias=False)
         self.bn = nn.BatchNorm2d(c)
-        self.act = nn.ReLU6(inplace=inplace_act)  # ReLU6, HardSwish
+        self.act = act_layer(inplace=inplace_act)
 
     def forward(self, x): return self.act(self.bn(self.dw(x)))
 
@@ -96,14 +99,21 @@ class CSPBlock(nn.Module):
         self.cv1 = GhostConv(c, c // 2, 1, inplace_act=inplace_act)
         self.cv2 = GhostConv(c, c // 2, 1, inplace_act=inplace_act)
         self.m = nn.Sequential(*[GhostConv(c // 2, c // 2, k=m_k, inplace_act=inplace_act) for _ in range(n)])
-        self.cv3 = GhostConv(c, c, 1, inplace_act=inplace_act)
+        self.cv3 = GhostConv(c, c, 1, inplace_act=inplace_act)  # act_layer=nn.HardSwish
 
     def forward(self, x):
         return self.cv3(torch.cat((self.m(self.cv1(x)), self.cv2(x)), 1))
 
 # ───────────────────────────── neck ────────────────────────────────
 class CSPPAN(nn.Module):
-    def __init__(self, in_chs=(40, 112, 160), out_ch=96, lat_k=5, inplace_act: bool = False): # out_ch=64 would be faster than 96
+    def __init__(
+            self,
+            in_chs=(40, 112, 160),
+            out_ch=96,  # out_ch=64 would be faster than 96
+            lat_k=5,
+            inplace_act: bool = False,
+            act_layer=nn.ReLU6
+    ):
         super().__init__()
         self.in_chs = in_chs
         # self.reduce = nn.ModuleList([GhostConv(c, out_ch, 1, inplace_act=inplace_act) for c in in_chs])
@@ -113,7 +123,7 @@ class CSPPAN(nn.Module):
             nn.Sequential(                                             # C5 (plain 1×1)
                 nn.Conv2d(in_chs[2], out_ch, 1, bias=False),
                 nn.BatchNorm2d(out_ch),
-                nn.ReLU6(inplace=inplace_act),
+                act_layer(inplace=inplace_act),
             ),
         ])  # I think this will not be worth the latency
         self.lat    = nn.ModuleList([DWConv(out_ch, k=lat_k, inplace_act=inplace_act) for _ in in_chs[:-1]])

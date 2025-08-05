@@ -937,10 +937,6 @@ def train_epoch(
                     # Find the highest logit among all *incorrect* classes for each FG prediction
                     cls_p_fg_img[torch.arange(num_fg_img), gt_labels_fg] = -float('inf') # Mask out correct class
                     max_incorrect_class_logits, _ = cls_p_fg_img.max(dim=1)
-                    
-                    # cls_p_fg_img_for_debug = cls_p_fg_img.clone()
-                    # cls_p_fg_img_for_debug[torch.arange(num_fg_img), gt_labels_fg] = -float('inf') # Mask out correct class
-                    # max_incorrect_class_logits, _ = cls_p_fg_img_for_debug.max(dim=1)
             
                     # The "margin" is the difference. We want this to be large and positive.
                     logit_margin = correct_class_logits - max_incorrect_class_logits
