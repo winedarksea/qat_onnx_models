@@ -1854,6 +1854,7 @@ def main(argv: List[str] | None = None):
     pa.add_argument('--out', default='picodet_v5_int8.onnx')
     pa.add_argument('--no_inplace_head_neck', default=True, action='store_true', help="Disable inplace activations in head/neck")
     pa.add_argument('--min_box_size', type=int, default=11, help="Minimum pixel width/height for a GT box to be used in training.")
+    pa.add_argument('--load_from', type=str, default="picodet_50coco.pt", help="Path to a checkpoint to resume or finetune from (e.g., picodet_50coco.pt)")
     cfg = pa.parse_args(argv)
 
     TRAIN_SUBSET = None
@@ -1888,6 +1889,8 @@ def main(argv: List[str] | None = None):
     gamma_loss = 2.0
     quality_floor_vfl = 0.04
     q_gamma = 0.5
+    CLS_WEIGHT = 2.0
+    IOU_WEIGHT = 2.0
     model = PicoDet(
         backbone, 
         feat_chs,
@@ -2081,8 +2084,27 @@ def main(argv: List[str] | None = None):
         debug_epochs=5 if debug_prints else 0,
         dynamic_k_min=2,
     )
-    if False:
-        start_epoch = load_checkpoint(model, cfg.load_from, opt, dev)  # noqa
+    # ── Resume / Finetune from checkpoint (optional) ─────────────────
+    start_epoch = 0
+    if cfg.load_from:
+        start_epoch = load_checkpoint(model, cfg.load_from, opt, dev)  # returns next epoch index
+        # Align the LR scheduler with the starting epoch
+        # (SequentialLR respects last_epoch; set and do NOT step here)
+        sch.last_epoch = start_epoch - 1
+        # Align the curriculum stage so the right DataLoader is used
+        def _curriculum_stage_for_epoch(ep:int):
+            passed = 0
+            for i, (num_epochs, _min_size) in enumerate(curriculum_schedule):
+                if i == len(curriculum_schedule) - 1:   # last stage "the rest"
+                    return i, max(0, ep - passed)
+                if ep < passed + num_epochs:
+                    return i, ep - passed
+                passed += num_epochs
+            return len(curriculum_schedule) - 1, 0
+
+        current_stage_idx, epochs_in_current_stage = _curriculum_stage_for_epoch(start_epoch)
+        print(f"[RESUME] start_epoch={start_epoch}, curriculum stage={current_stage_idx}, "
+              f"epoch-in-stage={epochs_in_current_stage}")
 
     original_model_head_nc = model.head.nc
     original_model_head_reg_max = model.head.reg_max
@@ -2090,7 +2112,10 @@ def main(argv: List[str] | None = None):
     training_history = {}
 
     # ... (FP32 training loop) ...
-    for ep in range(cfg.epochs):
+    fp32_epochs = cfg.epochs
+    if start_epoch > fp32_epochs:
+        fp32_epochs = start_epoch + 2
+    for ep in range(start_epoch, fp32_epochs):
         if ep < BACKBONE_FREEZE_EPOCHS:
             for p in model.backbone.parameters():
                 p.requires_grad = False
@@ -2189,7 +2214,7 @@ def main(argv: List[str] | None = None):
             head_nc_for_loss=original_model_head_nc,
             head_reg_max_for_loss=original_model_head_reg_max,
             dfl_project_buffer_for_decode=original_dfl_project_buffer,
-            max_epochs=cfg.epochs, # Pass total epochs for VFL alpha scheduling
+            max_epochs=fp32_epochs, # Pass total epochs for VFL alpha scheduling
             quality_floor_vfl=quality_floor_vfl,  # try sometime 0.15
             debug_prints=debug_prints,
             use_focal_loss=use_focal_loss_for_epoch,
@@ -2207,7 +2232,7 @@ def main(argv: List[str] | None = None):
             current_lr = opt.param_groups[0]['lr']
             iou_05 = epoch_metrics.get('iou_at_5', 0.0)
             iou_25 = epoch_metrics.get('iou_at_25', 0.0)
-            print(f"Epoch {ep + 1}/{cfg.epochs} | Loss: {l:.4f} | IoU@.05: {iou_05:.3f} | IoU@.25: {iou_25:.3f} | LR: {current_lr:.6f}\n")
+            print(f"Epoch {ep + 1}/{fp32_epochs} | Loss: {l:.4f} | IoU@.05: {iou_05:.3f} | IoU@.25: {iou_25:.3f} | LR: {current_lr:.6f}\n")
             print("─" * 15 + f" SimOTA Report for Epoch {ep + 1} " + "─" * 15)
             assigner.print_debug_report()
             assigner.print_classification_debug_report()

@@ -49,8 +49,8 @@ if __name__ == "__main__":
         print("Usage: python convert_images.py <input_root> <output_root>")
         sys.exit(1)
 
-    input_root = Path(sys.argv[1])
-    output_root = Path(sys.argv[2])
+    input_root = Path("/Users/colincatlin/Downloads/project_1")  # Path(sys.argv[1])
+    output_root = Path("/Users/colincatlin/Downloads/project_1_rename")   # Path(sys.argv[2])
 
     if not input_root.exists():
         print(f"Input directory {input_root} does not exist.")
