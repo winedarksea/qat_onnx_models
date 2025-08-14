@@ -1,7 +1,7 @@
 # train_picodet_qat.py – minimal pipeline: COCO ➜ FP32 ➜ QAT ➜ INT8 ➜ ONNX (with NMS)
 # built on pytorch version 2.7
 from __future__ import annotations
-import argparse, random, time, warnings, math, copy, os
+import argparse, random, time, warnings, math, copy, os, json
 import functools
 from typing import List, Tuple
 import traceback
@@ -97,6 +97,15 @@ class CocoDetectionV2(CocoDetection):
         if self._tf is not None:                      # v2 ops work on (img,tgt)
             img, tgt = self._tf(img, tgt)
         return img, tgt
+
+def build_label_map_and_names_from_ann(ann_path: str):
+    with open(ann_path, 'r') as f:
+        d = json.load(f)
+    # Keep a stable order; your file uses ids 1:person, 2:snake, 3:spider
+    cats = sorted(d['categories'], key=lambda c: c['id'])
+    catid2contig = {c['id']: i for i, c in enumerate(cats)}   # {1:0, 2:1, 3:2}
+    id2name      = {i: c['name'] for i, c in enumerate(cats)} # {0:'person',1:'snake',2:'spider'}
+    return catid2contig, id2name
 
 # ---------- transforms ----------
 def build_transforms(size, train):
@@ -603,6 +612,7 @@ def train_epoch(
         use_focal_loss: bool = False,
         debug_prints: bool = True,
         gamma_loss = 2.0,
+        alpha_loss = 0.75,
         q_gamma = 0.5,  # sqrt lift of low IoUs
 ):
     model.train()
@@ -730,7 +740,7 @@ def train_epoch(
             if num_fg_img == 0:
                 skips += 1
                 if skips == 400:
-                    print("Large number of skipped batches, POssibly there is a bug")
+                    print("Large number of skipped batches, Possibly there is a bug")
                     
                     print("\n--- COORDINATE SYSTEM SANITY CHECK ---")
                     gt_sample = gt_boxes_img[0] if gt_boxes_img.numel() > 0 else "N/A no GT"
@@ -869,7 +879,7 @@ def train_epoch(
                 
                     targets[pos_indices, gt_labels_pos] = quality
                 
-                vfl_calculator = VarifocalLoss(alpha=0.75, gamma=gamma_loss, reduction='sum')
+                vfl_calculator = VarifocalLoss(alpha=alpha_loss, gamma=gamma_loss, reduction='sum')
                 # vfl_calculator = QualityFocalLoss(beta=gamma_loss, reduction='sum')
                 loss_cls = vfl_calculator(joint_logits, targets) / max(1, num_fg_img)
 
@@ -1794,6 +1804,7 @@ def load_checkpoint(new_model: nn.Module, ckpt_path: str, optimizer: torch.optim
         'img_size': new_model.head.img_size,
         'head_reg_max': new_model.head.reg_max,
         'neck_out_ch': new_model.neck.out[0].cv3.out_channels,
+        'num_classes': new_model.head.nc,
         # Add any other critical params you might change
     }
 
@@ -1801,7 +1812,8 @@ def load_checkpoint(new_model: nn.Module, ckpt_path: str, optimizer: torch.optim
     is_finetuning = (
         saved_config.get('img_size') != new_model_config['img_size'] or
         saved_config.get('head_reg_max') != new_model_config['head_reg_max'] or
-        saved_config.get('neck_out_ch') != new_model_config['neck_out_ch']
+        saved_config.get('neck_out_ch') != new_model_config['neck_out_ch'] or
+        saved_config.get('num_classes')  != new_model_config['num_classes']
     )
 
     start_epoch = ckpt['epoch'] + 1
@@ -1855,6 +1867,9 @@ def main(argv: List[str] | None = None):
     pa.add_argument('--no_inplace_head_neck', default=True, action='store_true', help="Disable inplace activations in head/neck")
     pa.add_argument('--min_box_size', type=int, default=11, help="Minimum pixel width/height for a GT box to be used in training.")
     pa.add_argument('--load_from', type=str, default="picodet_50coco.pt", help="Path to a checkpoint to resume or finetune from (e.g., picodet_50coco.pt)")
+    pa.add_argument('--data_root', default='webextension')
+    pa.add_argument('--ann', default='webextension/annotations/instances.json')
+    pa.add_argument('--val_pct', type=float, default=0.1)
     cfg = pa.parse_args(argv)
 
     TRAIN_SUBSET = None
@@ -1887,22 +1902,11 @@ def main(argv: List[str] | None = None):
         cls_conv_depth = 3
         # assigner ctr often needs to be larger with larger images as well
     gamma_loss = 2.0
+    alpha_loss = 0.75
     quality_floor_vfl = 0.04
     q_gamma = 0.5
     CLS_WEIGHT = 2.0
     IOU_WEIGHT = 2.0
-    model = PicoDet(
-        backbone, 
-        feat_chs,
-        num_classes=80, 
-        neck_out_ch=out_ch,  # 96
-        img_size=IMG_SIZE,
-        head_reg_max=9 if IMG_SIZE < 320 else int((2 * math.ceil(IMG_SIZE / 128) + 3)),
-        reg_conv_depth=reg_conv_depth,
-        cls_conv_depth=cls_conv_depth,
-        lat_k=lat_k,
-        inplace_act_for_head_neck=not cfg.no_inplace_head_neck # Control from arg
-    ).to(dev)
 
     # Load data
     root = cfg.coco_root
@@ -1912,18 +1916,63 @@ def main(argv: List[str] | None = None):
     )
     coco_label_map = CANONICAL_COCO80_MAP
 
-    train_ds = CocoDetectionV2(
-        f"{root}/train2017",
-        f"{root}/annotations/instances_train2017.json",
-        coco_label_map,
-        transforms=build_transforms((IMG_SIZE, IMG_SIZE), train=True),
-    )
-    val_ds   = CocoDetectionV2(
-        f"{root}/val2017",
-        f"{root}/annotations/instances_val2017.json",
-        coco_label_map,
-        transforms=build_transforms((IMG_SIZE, IMG_SIZE), train=False),
-    )
+    use_coco = True
+    if not use_coco:
+        NUM_CLASS = 3
+        root = cfg.data_root
+        ann_path = cfg.ann
+        label_map, id2name = build_label_map_and_names_from_ann(ann_path)
+        coco_label_map = label_map   # just a name reuse
+        # Build two dataset objects so they can have different transforms
+        full_train_tf = build_transforms((IMG_SIZE, IMG_SIZE), train=True)
+        full_val_tf   = build_transforms((IMG_SIZE, IMG_SIZE), train=False)
+        
+        full_trainval_ds = CocoDetectionV2(
+            img_dir=f"{root}/images",
+            ann_file=ann_path,
+            lb_map=label_map,
+            transforms=None  # transform applied after subset selection
+        )
+        
+        # Random split (deterministic)
+        g = torch.Generator().manual_seed(SEED)
+        n = len(full_trainval_ds)
+        val_n = max(1, int(cfg.val_pct * n))
+        perm = torch.randperm(n, generator=g)
+        val_idx   = perm[:val_n].tolist()
+
+        train_ds = CocoDetectionV2(f"{root}/images", ann_path, label_map, transforms=full_train_tf)
+        val_ds = torch.utils.data.Subset(
+            CocoDetectionV2(f"{root}/images", ann_path, label_map, transforms=full_val_tf),
+            val_idx
+        )
+    else:
+        NUM_CLASS = 80
+        train_ds = CocoDetectionV2(
+            f"{root}/train2017",
+            f"{root}/annotations/instances_train2017.json",
+            coco_label_map,
+            transforms=build_transforms((IMG_SIZE, IMG_SIZE), train=True),
+        )
+        val_ds   = CocoDetectionV2(
+            f"{root}/val2017",
+            f"{root}/annotations/instances_val2017.json",
+            coco_label_map,
+            transforms=build_transforms((IMG_SIZE, IMG_SIZE), train=False),
+        )
+
+    model = PicoDet(
+        backbone, 
+        feat_chs,
+        num_classes=NUM_CLASS, 
+        neck_out_ch=out_ch,  # 96
+        img_size=IMG_SIZE,
+        head_reg_max=9 if IMG_SIZE < 320 else int((2 * math.ceil(IMG_SIZE / 128) + 3)),
+        reg_conv_depth=reg_conv_depth,
+        cls_conv_depth=cls_conv_depth,
+        lat_k=lat_k,
+        inplace_act_for_head_neck=not cfg.no_inplace_head_neck # Control from arg
+    ).to(dev)
     
     # ------- (optional) random subset for quick runs -------
     train_sampler = None
@@ -2221,6 +2270,7 @@ def main(argv: List[str] | None = None):
             w_cls_loss=CLS_WEIGHT,
             w_iou_loss=IOU_WEIGHT,
             gamma_loss=gamma_loss,
+            alpha_loss=alpha_loss,
             q_gamma=q_gamma,
         )
         model.eval()
@@ -2347,6 +2397,7 @@ def main(argv: List[str] | None = None):
             w_cls_loss=CLS_WEIGHT,
             w_iou_loss=IOU_WEIGHT,
             use_focal_loss=use_focal_loss,
+            alpha_loss=alpha_loss,
             q_gamma=q_gamma,
         )
         scheduler_q.step() # Step the QAT LR scheduler
