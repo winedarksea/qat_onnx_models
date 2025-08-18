@@ -34,8 +34,8 @@ warnings.filterwarnings(
 )
 
 try:
-    folder_to_add = r"/Users/colincatlin/Documents-NoCloud/qat_onnx_models/scripts" 
-    # folder_to_add = r"C:\Users\Colin\qat_onnx_models\scripts"
+    # folder_to_add = r"/Users/colincatlin/Documents-NoCloud/qat_onnx_models/scripts" 
+    folder_to_add = r"C:\Users\Colin\qat_onnx_models\scripts"
     # folder_to_add = r"/home/colin/img_data"
     # folder_to_add = r"/home/colin/qat_onnx_models/scripts"
     # Check if the path and file exist before trying to add to sys.path and import
@@ -264,7 +264,7 @@ def get_backbone(arch: str, ncls: int, width: float,
             drop_rate=drop_rate, # For classifier
             drop_path_rate=drop_path_rate
         )
-    elif arch in ["ssh_hybrid_s", "ssh_hybrid_s_bl", "ssh_hybrid_m", "ssh_hybrid_l", "conv-l", "conv-xl"]:
+    elif arch in ["ssh_hybrid_s", "ssh_hybrid_s_bl", "ssh_hybrid_m", "ssh_hybrid_l", "conv_s", "conv_m", "conv_l", "conv_xl"]:
         model = MobileNetV4(
             variant=arch,
             width_multiplier=width,
@@ -473,15 +473,14 @@ def load_backbone_from_checkpoint(model: nn.Module,
 
 # --- Main script execution ---
 data_dir: str = "filtered_imagenet2_native" # Example, replace with your actual path
-epochs: int = 75
-qat_epochs: int = 10
+epochs: int = 700
+qat_epochs: int = 30 if epochs >= 500 else 10
 batch: int = 64
 lr: float = 0.025
 qat_lr_factor: float = 0.05
 width_mult: float = 1.0
 device_arg = None
-compile_model: bool = False
-arch: str = "mnv4c" # Change to "mnv2", "mnv3", "mnv3l", "mnv4s", "mnv4m", "mnv4c" as needed
+arch: str = "conv_s" # Change to "mnv2", "mnv3", "mnv3l", "mnv4s", "mnv4m", "mnv4c" as needed
 pretrained: bool = True # Using pretrained weights for FP32 start
 drop_rate: float = 0.2
 
@@ -534,7 +533,7 @@ with open(class_map_path) as f:
     class_map = json.load(f)
     class_names = list(class_map.keys())
     ncls = len(class_map)
-    
+
 print(f"[INFO] #classes = {ncls}")
 
 
@@ -545,7 +544,7 @@ model = build_model(ncls, width_mult, dev, arch=arch, pretrained=pretrained, dro
 # load_backbone_from_checkpoint(model, f"{output_base_name}_fp32_backbone.pt")
 
 crit = nn.CrossEntropyLoss(label_smoothing=0.1)
-scaler = torch.amp.GradScaler(enabled=(dev.type == "cuda" and not compile_model)) # torch.compile may not like scaler with fullgraph
+scaler = torch.amp.GradScaler(enabled=(dev.type == "cuda")) # torch.compile may not like scaler with fullgraph
 
 stock_trainer = False
 if stock_trainer:
@@ -649,6 +648,8 @@ print("\n[INFO] Preparing model for QAT...")
 qat_train_device = torch.device("cpu") if dev.type == "mps" else dev
 print(f"[INFO] QAT will run on: {qat_train_device}")
 
+backend_config = get_native_backend_config() # For fusion patterns
+
 # 1. Create a CPU copy of the FP32-trained model FOR QAT PREPARATION
 #    Make sure it's a deepcopy to avoid altering the original FP32 model.
 model_for_qat_prep = copy.deepcopy(model).cpu()
@@ -665,7 +666,7 @@ example_inputs_cpu_for_prepare = (torch.randint(0, 256, (1, 3, DUMMY_H, DUMMY_W)
 qconfig_mapping = get_default_qat_qconfig_mapping("x86")
 
 # Customize QConfig for per-channel weights (optional, but often good)
-# The default "x86" QAT mapping already uses good observers.
+# The default "x86" QAT mapping already uses good observers.s
 # If you want specific per-channel symmetric for weights globally:
 default_activation_factory = qconfig_mapping.global_qconfig.activation
 per_channel_weight_observer = MovingAveragePerChannelMinMaxObserver.with_args(
@@ -677,8 +678,6 @@ custom_global_qconfig = QConfig(
 )
 qconfig_mapping = qconfig_mapping.set_global(custom_global_qconfig)
 # Note: The default "x86" map already sets BN/Dropout QConfig to None, so they won't be quantized.
-
-backend_config = get_native_backend_config() # For fusion patterns
 
 # 4. Patch F.dropout for tracing if it causes issues (especially with complex models or control flow)
 #    This makes F.dropout an identity function ONLY during prepare_qat_fx tracing.
@@ -713,18 +712,19 @@ sched_q = CosineAnnealingLR(opt_q, T_max=qat_epochs, eta_min=(lr * qat_lr_factor
 
 print(f"[INFO] Starting QAT fine-tuning on {qat_train_device} for {qat_epochs} epochs...")
 # The 'scaler' for AMP is not used here as train_epoch handles it via qat_mode_active.
+best_val_qat = 0.0
 for qep in range(qat_epochs):
     l_q = train_epoch(qat_model, tr, crit, opt_q, scaler, qat_train_device, qep, qat_mode_active=True)
     # It's good practice to evaluate on the same device as training for consistency during QAT.
     val_acc_q = evaluate(qat_model, vl, qat_train_device)
+    if best_val_qat < val_acc_q:
+        print("\n[INFO] Preparing QAT model for INT8 conversion (CPU, eval mode)...")
+        qat_model_for_conversion = copy.deepcopy(qat_model).eval().cpu()
+        best_val_qat = val_acc_q
     sched_q.step()
     print(f"QAT Epoch {qep+1}/{qat_epochs} loss {l_q:.4f} val@1 {val_acc_q*100:.2f}% lr {opt_q.param_groups[0]['lr']:.6f}")
 
 # ───────────────────────── INT8 Conversion and Export ─────────────────────────
-print("\n[INFO] Preparing QAT model for INT8 conversion (CPU, eval mode)...")
-qat_model.eval() # Set to eval mode (disables dropout, uses learned BN stats, fixes observer ranges)
-qat_model_for_conversion = qat_model.cpu() # Move to CPU
-
 print("[INFO] Converting QAT model to an INT8 GraphModule using convert_fx_torch...")
 # Pass the backend_config to convert_fx as well to ensure fusions are correctly applied
 int8_model_final = convert_fx_torch(
@@ -736,20 +736,6 @@ int8_model_final = convert_fx_torch(
 # print("\n--- INT8 GraphModule Structure (Post convert_fx_torch) ---")
 # int8_model_final.print_readable(print_output=True) # May be very verbose
 # print("--- End of INT8 GraphModule Structure ---\n")
-
-if compile_model:
-    print("[INFO] Compiling INT8 model with torch.compile...")
-    try:
-        # Ensure we are compiling the actual module
-        # torch.compile works best on CPU or CUDA
-        compiled_model = torch.compile(int8_model_final.cpu(), mode="reduce-overhead", fullgraph=True)
-        int8_model_final = compiled_model
-        print("[INFO] torch.compile successful.")
-    except Exception as e:
-        print(f"[WARN] torch.compile() failed – {e}. Using uncompiled model.")
-        # Ensure int8_model_final is still the CPU model if compile failed
-        int8_model_final = int8_model_final.cpu()
-
 
 # Ensure the model for saving/export is the core module and on CPU, in eval mode
 final_model_for_export = int8_model_final.cpu().eval()
@@ -772,13 +758,78 @@ try:
         input_names=["input_u8"],
         output_names=["logits"],
         dynamic_axes={"input_u8": {0: "batch", 2: "height", 3: "width"}, "logits": {0: "batch"}},
-        opset_version=18, # Using a recent opset, 18 has antialias resize
+        opset_version=19, # Using a recent opset, 18 has antialias resize
         do_constant_folding=True
     )
     print(f"[SAVE] INT8 ONNX model → {onnx_path}")
     print(f"[INFO] Use the ONNX inspection and inference script to test '{Path(onnx_path).name}'")
 except Exception as e:
     print(f"[ERROR] ONNX export failed: {repr(e)}")
+    import traceback
+    traceback.print_exc()
+
+
+try:
+    local_name = str(onnx_path).replace(".onnx", "_opset13.onnx")
+    torch.onnx.export(
+        final_model_for_export,
+        dummy_input_onnx_cpu, # Must be a tuple of inputs
+        local_name,
+        input_names=["input_u8"],
+        output_names=["logits"],
+        dynamic_axes={"input_u8": {0: "batch", 2: "height", 3: "width"}, "logits": {0: "batch"}},
+        opset_version=13, # Using a recent opset, 18 has antialias resize, 13 for hswish, DequantizeLinear
+        do_constant_folding=True
+    )
+    print(f"[SAVE] INT8 ONNX model → {onnx_path}")
+    print(f"[INFO] Use the ONNX inspection and inference script to test '{local_name}'")
+except Exception as e:
+    print(f"[ERROR] ONNX export failed: {repr(e)}")
+    import traceback
+    traceback.print_exc()
+
+try:
+    from torch.ao.quantization.quantize_pt2e import prepare_qat_pt2e, convert_pt2e
+    from torch.ao.quantization import move_exported_model_to_eval
+    reference_int8_model = convert_pt2e(qat_model_for_conversion.cpu())
+    ref_model_for_export = move_exported_model_to_eval(final_model_for_export)
+
+    dummy_input_onnx_cpu = (torch.randint(0, 256, (1, 3, IMG_SIZE, IMG_SIZE), dtype=torch.uint8),)
+    torch.onnx.export(
+        ref_model_for_export,
+        dummy_input_onnx_cpu, # Must be a tuple of inputs
+        str(onnx_path).replace(".onnx", "_refv.onnx"),
+        input_names=["input_u8"],
+        output_names=["logits"],
+        dynamic_axes={"input_u8": {0: "batch", 2: "height", 3: "width"}, "logits": {0: "batch"}},
+        opset_version=19, # Using a recent opset, 18 has antialias resize
+        do_constant_folding=True
+    )
+    print(f"[SAVE] INT8 REFV ONNX model → {onnx_path}")
+    print(f"[INFO] Use the ONNX inspection and inference script to test '{Path(onnx_path).name}'")
+except Exception as e:
+    print(f"[ERROR] REFV ONNX export failed: {repr(e)}")
+    import traceback
+    traceback.print_exc()
+
+
+try:
+    compiled_model = torch.compile(int8_model_final.cpu(), mode="reduce-overhead", fullgraph=True)
+    dummy_input_onnx_cpu = (torch.randint(0, 256, (1, 3, IMG_SIZE, IMG_SIZE), dtype=torch.uint8),)
+    torch.onnx.export(
+        compiled_model,
+        dummy_input_onnx_cpu, # Must be a tuple of inputs
+        str(onnx_path).replace(".onnx", "_compiled.onnx"),
+        input_names=["input_u8"],
+        output_names=["logits"],
+        dynamic_axes={"input_u8": {0: "batch", 2: "height", 3: "width"}, "logits": {0: "batch"}},
+        opset_version=19, # Using a recent opset, 18 has antialias resize
+        do_constant_folding=True
+    )
+    print(f"[SAVE] INT8 COMPILED ONNX model → {onnx_path}")
+    print(f"[INFO] Use the ONNX inspection and inference script to test '{Path(onnx_path).name}'")
+except Exception as e:
+    print(f"[ERROR] COMPILED ONNX export failed: {repr(e)}")
     import traceback
     traceback.print_exc()
 
