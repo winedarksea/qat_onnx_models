@@ -1773,50 +1773,30 @@ def save_checkpoint(model: nn.Module, optimizer: torch.optim.Optimizer, epoch: i
 
 
 def load_checkpoint(new_model: nn.Module, ckpt_path: str, optimizer: torch.optim.Optimizer | None = None, device: torch.device = 'cpu'):
-    """
-    Loads a checkpoint intelligently, handling configuration mismatches for finetuning.
-
-    Args:
-        new_model: An instance of the model with the desired NEW configuration.
-        ckpt_path: Path to the checkpoint file.
-        optimizer: An optional optimizer to restore its state.
-        device: The device to map the loaded tensors to.
-
-    Returns:
-        The starting epoch for training (epoch from checkpoint + 1).
-    """
     if not os.path.exists(ckpt_path):
         print(f"[WARN] Checkpoint file not found at {ckpt_path}. Starting from scratch.")
         return 0
 
     print(f"[LOAD] Loading checkpoint from {ckpt_path}...")
     ckpt = torch.load(ckpt_path, map_location=device)
-
-    # --- Metadata Comparison Logic ---
     saved_config = ckpt.get('model_config', {})
-    if not saved_config:
-        print("[WARN] No config metadata found in checkpoint. Attempting a simple weight load.")
-        new_model.load_state_dict(ckpt['model_state_dict'])
-        return ckpt.get('epoch', 0) + 1
+    model_sd = ckpt['model_state_dict']
 
-    # Get the configuration of the new model we are trying to load into
     new_model_config = {
         'img_size': new_model.head.img_size,
         'head_reg_max': new_model.head.reg_max,
         'neck_out_ch': new_model.neck.out[0].cv3.out_channels,
         'num_classes': new_model.head.nc,
-        # Add any other critical params you might change
     }
 
-    # Check for mismatches that necessitate finetuning
     is_finetuning = (
-        saved_config.get('img_size') != new_model_config['img_size'] or
+        saved_config.get('img_size')     != new_model_config['img_size'] or
         saved_config.get('head_reg_max') != new_model_config['head_reg_max'] or
-        saved_config.get('neck_out_ch') != new_model_config['neck_out_ch'] or
+        saved_config.get('neck_out_ch')  != new_model_config['neck_out_ch']  or
         saved_config.get('num_classes')  != new_model_config['num_classes']
     )
 
-    start_epoch = ckpt['epoch'] + 1
+    start_epoch = ckpt.get('epoch', 0) + 1
 
     if is_finetuning:
         print("[INFO] Mismatch detected between saved and new model configurations.")
@@ -1824,33 +1804,46 @@ def load_checkpoint(new_model: nn.Module, ckpt_path: str, optimizer: torch.optim
         print(f"         Saved config:   img_size={saved_config.get('img_size')}, reg_max={saved_config.get('head_reg_max')}")
         print(f"         Current config: img_size={new_model_config['img_size']}, reg_max={new_model_config['head_reg_max']}")
 
-        # When finetuning, load weights with strict=False
-        model_sd = ckpt['model_state_dict']
-        missing_keys, unexpected_keys = new_model.load_state_dict(model_sd, strict=False)
+        # 1) Remove incompatible class head tensors (80→3)
+        pruned_sd = {}
+        for k, v in model_sd.items():
+            if k.startswith('head.cls_pred.'):
+                # drop these so shape mismatch doesn't error
+                continue
+            pruned_sd[k] = v
 
-        print("\n--- Weight Loading Report ---")
+        # If your old checkpoint had an objectness branch you removed, ignore it too:
+        # if k.startswith('head.obj_pred.'): continue
+
+        missing_keys, unexpected_keys = new_model.load_state_dict(pruned_sd, strict=False)
+
+        print("\n--- Weight Loading Report (finetune) ---")
         if missing_keys:
-            print("Missing keys (expected for finetuning):")
-            for k in missing_keys: print(f"  - {k}")
+            print(f"Missing (expected): {len(missing_keys)} keys (e.g. class head)")
         if unexpected_keys:
-            print("Unexpected keys (expected for finetuning):")
-            for k in unexpected_keys: print(f"  - {k}")
-        print("----------------\n")
+            print(f"Unexpected (ignored): {len(unexpected_keys)} keys")
+        print("----------------------------------------\n")
 
-        # Do NOT load the optimizer state and reset epoch, as we are starting a new training phase
+        # 2) Re-init the new class head (optional but recommended)
+        with torch.no_grad():
+            for m in new_model.head.cls_pred:
+                if hasattr(m, 'weight') and m.weight is not None:
+                    nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if hasattr(m, 'bias') and m.bias is not None:
+                    # modestly negative prior works well for one-stage detectors
+                    m.bias.fill_(-2.0)
+
         print("[INFO] Optimizer state not loaded. Starting finetuning from epoch 0.")
-        return 0 # Start finetuning from epoch 0
+        return 0
 
     else:
-        # If no mismatch, it's a direct resume of training
         print("[INFO] Configurations match. Resuming training.")
-        new_model.load_state_dict(ckpt['model_state_dict'], strict=True)
+        new_model.load_state_dict(model_sd, strict=True)
         if optimizer:
             print("[INFO] Loading optimizer state.")
             optimizer.load_state_dict(ckpt['optimizer_state_dict'])
         else:
             print("[WARN] No optimizer provided. Optimizer state not loaded.")
-
         print(f"[INFO] Resuming from epoch {start_epoch}.")
         return start_epoch
 
@@ -1869,7 +1862,7 @@ def main(argv: List[str] | None = None):
     pa.add_argument('--load_from', type=str, default="picodet_50coco.pt", help="Path to a checkpoint to resume or finetune from (e.g., picodet_50coco.pt)")
     pa.add_argument('--data_root', default='webextension')
     pa.add_argument('--ann', default='webextension/annotations/instances.json')
-    pa.add_argument('--val_pct', type=float, default=0.1)
+    pa.add_argument('--val_pct', type=float, default=0.05)
     cfg = pa.parse_args(argv)
 
     TRAIN_SUBSET = None
