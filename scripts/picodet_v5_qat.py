@@ -19,6 +19,7 @@ import torch.nn.functional as F
 
 import onnx
 from onnx import TensorProto as TP, helper as oh
+import onnxruntime as ort
 
 from pycocotools.coco import COCO
 
@@ -34,7 +35,43 @@ if False:  # this is just here for a quirk in testing, imports are still availab
 
 warnings.filterwarnings('ignore', category=UserWarning)
 SEED = 42; random.seed(SEED); torch.manual_seed(SEED)
-IMG_SIZE = 256  # PicoDet’s anchors assume stride-divisible sizes. Divisible by 32
+IMG_SIZE = 256  # PicoDet's anchors assume stride-divisible sizes. Divisible by 32
+
+# ───────────────────── ONNX optimization helper ─────────────────────────
+def optimize_onnx_with_ort(input_path: str, output_path: str):
+    """
+    Optimizes an ONNX model using ONNX Runtime's graph optimization.
+    
+    Args:
+        input_path: Path to the input ONNX model
+        output_path: Path to save the optimized ONNX model
+    """
+    print(f"[INFO] Optimizing ONNX model with ORT_ENABLE_ALL: {input_path}")
+    
+    try:
+        sess_options = ort.SessionOptions()
+        # Set graph optimization level to ALL for most aggressive optimization
+        sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        
+        # Set up the output path for the optimized model
+        sess_options.optimized_model_filepath = output_path
+        
+        # Create a session with the model and options to trigger optimization and save
+        # We don't actually need to run inference here
+        _ = ort.InferenceSession(input_path, sess_options, providers=['CPUExecutionProvider'])
+        
+        if os.path.exists(output_path):
+            print(f"[SAVE] Optimized ONNX model → {output_path}")
+            return True
+        else:
+            print(f"[WARN] Optimized model was not saved to {output_path}")
+            return False
+            
+    except Exception as e:
+        print(f"[ERROR] Failed to optimize ONNX model with ORT: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
 
 # ───────────────────── data & transforms ───────────────────────
 # COCO’s official 80-class list (order matters!)
@@ -1092,7 +1129,7 @@ def quick_val_iou(
             if debug_prints and batch_idx == 0 and i < 2:
                 print(f"[Debug Eval Img {num_images_processed-1}] GTs: {gt_boxes_tensor.shape[0]}.")
                 print(f"  Num Preds BEFORE NMS (passed score_thresh): {debug_num_preds_before_nms_batch[i]}")
-                print(f"  Num Preds AFTER NMS (final): {num_actual_dets_this_img}")
+                print(f"  Num Preds AFTER NMS (final): {num_actual_dets_after_nms_this_img}")
                 # The problematic debug line that accessed model.head.cls_pred was here and has been removed.
 
             if num_actual_dets_this_img == 0:
@@ -1537,6 +1574,11 @@ def save_fp32_onnx_reference(model, cfg):
         max_det=int(model.head.max_det),
     )
     print(f'[SAVE] FP32 reference ONNX with NMS → {fp32_nms_path}')
+    
+    # Create optimized versions
+    fp32_nms_optimized_path = fp32_nms_path.replace(".onnx", "_optimized.onnx")
+    optimize_onnx_with_ort(fp32_nms_path, fp32_nms_optimized_path)
+    
     return fp32_onnx_path, fp32_nms_path
 
 
@@ -2422,6 +2464,13 @@ def main(argv: List[str] | None = None):
         iou_thresh=float(model.head.iou_th),  # 0.6
         max_det=int(model.head.max_det),  # 100
     )
+    
+    # ---------------- Create optimized versions ------------------------------
+    print("[INFO] Creating optimized ONNX versions...")
+    # Optimize the final model (with NMS)
+    final_optimized_path = out_dest.replace(".onnx", "_optimized.onnx")
+    optimize_onnx_with_ort(out_dest, final_optimized_path)
+    
     return training_history
 
 
