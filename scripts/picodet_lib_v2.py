@@ -338,8 +338,8 @@ class PicoDetHead(nn.Module):
 
     def _initialize_biases(self):
     
-        # ---- class branch (unchanged) ----
-        cls_prior = 0.05
+        # ---- class branch - more conservative to reduce false positives ----
+        cls_prior = 0.02  # Reduced from 0.05 to make model less confident initially
         cls_bias  = -math.log((1-cls_prior)/cls_prior)
         for conv in self.cls_pred:
             nn.init.constant_(conv.bias, cls_bias)
@@ -394,6 +394,19 @@ class PicoDetHead(nn.Module):
         B, _, H_feat, W_feat = cls_logit.shape
         stride = self.strides_buffer[level_idx]
 
+        cls_logit_perm = cls_logit.permute(0,2,3,1).reshape(B, H_feat*W_feat, self.nc)
+        scores = cls_logit_perm.sigmoid()
+        
+        # Early score filtering for inference speed - only decode boxes for promising predictions
+        max_scores = scores.max(dim=-1).values  # (B, H_feat*W_feat)
+        score_threshold = 0.01  # Lower threshold for early filtering
+        keep_mask = max_scores > score_threshold  # (B, H_feat*W_feat)
+        
+        # If all scores are too low, return empty results
+        if not keep_mask.any():
+            empty_boxes = torch.zeros(B, H_feat*W_feat, 4, device=cls_logit.device)
+            return empty_boxes, scores
+
         # build grid *on the fly* so it always matches H_feat,W_feat
         yv, xv = torch.meshgrid(
             torch.arange(H_feat, device=cls_logit.device),
@@ -402,10 +415,7 @@ class PicoDetHead(nn.Module):
         )
         anchor_centers = (torch.stack((xv, yv), dim=2).view(-1, 2) + 0.5) * stride
 
-        cls_logit_perm = cls_logit.permute(0,2,3,1).reshape(B, H_feat*W_feat, self.nc)
-        # obj_logit_perm = obj_logit.permute(0,2,3,1).reshape(B, H_feat*W_feat, 1)
         reg_logit_perm = reg_logit.permute(0,2,3,1).reshape(B, H_feat*W_feat, 4*(self.reg_max+1))
-
         ltrb = self._dfl_to_ltrb_inference(reg_logit_perm) * stride
 
         x1 = anchor_centers[:,0].unsqueeze(0) - ltrb[...,0]
@@ -414,10 +424,6 @@ class PicoDetHead(nn.Module):
         y2 = anchor_centers[:,1].unsqueeze(0) + ltrb[...,3]
         boxes = torch.stack([x1,y1,x2,y2], dim=-1)
 
-        # Use the learned scaler during inference to combine logits.
-        # scores = (cls_logit_perm + self.logit_scale * obj_logit_perm).sigmoid()
-        # scores = ((cls_logit_perm + 0.5) / 0.8).sigmoid()
-        scores = cls_logit_perm.sigmoid()
         return boxes, scores
 
     def forward(self, neck_feature_maps: Tuple[torch.Tensor, ...]):

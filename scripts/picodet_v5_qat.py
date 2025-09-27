@@ -660,6 +660,11 @@ class SimOTACache:
 
         assign_gt = cost.argmin(0)                # (A,)
         
+        # Early IoU filtering: prevent very poor matches from corrupting training
+        min_iou_threshold = 0.02  # Reject assignments with IoU < 2%
+        low_iou_mask = iou.max(0).values < min_iou_threshold  # (A,) - anchors with max IoU < threshold
+        # Don't modify assign_gt directly as it's used for indexing - filter will be applied in fg_final
+        
         if self.is_debug_mode:
             # Only calculate on the valid candidate anchors to get a meaningful comparison
             valid_mask = centre_mask.T & fg_cand_mask.unsqueeze(0) # (M, A)
@@ -673,12 +678,15 @@ class SimOTACache:
                 num_switches = (assign_gt != assign_gt_only_loc).sum().item()
                 self._classification_debug_stats["assignment_switches"].append((num_switches, A))
 
-        # 5. final fg mask = candidate ∧ in-centre of its chosen GT
+        # 5. final fg mask = candidate ∧ in-centre of its chosen GT ∧ decent IoU
         fg_final = torch.zeros(A, dtype=torch.bool, device=device)
         cand_idx = fg_cand_mask.nonzero(as_tuple=False).squeeze(1)
         if cand_idx.numel():
             in_centre = centre_mask[cand_idx, assign_gt[cand_idx]]
-            fg_final[cand_idx[in_centre]] = True
+            # Apply IoU quality filter - reject poor quality matches
+            good_iou = ~low_iou_mask[cand_idx]  # Keep anchors with decent IoU
+            final_mask = in_centre & good_iou
+            fg_final[cand_idx[final_mask]] = True
 
         # 6. build outputs
         gt_lbl_out = torch.full((A,), -1, dtype=torch.long,  device=device)
@@ -857,10 +865,8 @@ def train_epoch(
             
             dfl_target = build_dfl_targets(ltrb_offsets.clamp_(0, head_reg_max_for_loss), head_reg_max_for_loss)
 
-            # --- FIX IS HERE ---
-            # The library's dfl_loss returns a mean loss (SUM / (N_fg * 4)).
-            # The other losses are SUM / N_fg (average per anchor).
-            # To make DFL loss comparable (average per anchor), we multiply its output by 4.
+            # DFL loss normalization: dfl_loss returns batchmean (sum/(N_fg*4))
+            # Multiply by 4 to get per-anchor normalization for consistency with other losses
             loss_dfl = dfl_loss(reg_p_fg_batch, dfl_target) * 4.0
             
             pred_ltrb_fg = PicoDetHead.dfl_decode_for_training(
@@ -2040,9 +2046,9 @@ def main(argv: List[str] | None = None):
 
     assigner = SimOTACache(
         nc=model.head.nc,
-        ctr=4.0,  # 2.5,   1.5 might be better later for strict bounding
+        ctr=3.5,  # Increased from 2.5/4.0 - 5.14% hit rate was too low
         topk=10,  # 10
-        cls_cost_weight=3.0,  # Increased to emphasize classification
+        cls_cost_weight=2.0,  # Reduced from 3.0 - 21.85% switch rate too high
         debug_epochs=5 if debug_prints else 0,
         dynamic_k_min=2,
     )
