@@ -51,6 +51,92 @@ CANONICAL_COCO80_MAP: dict[int, int] = {
     coco_id: i for i, coco_id in enumerate(CANONICAL_COCO80_IDS)
 }
 
+from torch.utils.data import Sampler
+from collections import defaultdict
+
+def create_class_balanced_sampler(dataset: CocoDetectionV2, target_weights: dict[int, float]) -> Sampler:
+    """
+    Creates a WeightedRandomSampler to balance the dataset according to target weights.
+
+    This function is designed to address class imbalance by oversampling minority classes.
+    It calculates a weight for each sample in the dataset such that, when sampled,
+    the resulting batches will approximate the class distribution defined by target_weights.
+
+    Args:
+        dataset: The training dataset, assumed to be a CocoDetectionV2 instance.
+        target_weights: A dictionary mapping class indices to their desired relative
+                        weight in the distribution (e.g., {0: 3.0, 1: 1.0, 2: 1.0}).
+
+    Returns:
+        A PyTorch WeightedRandomSampler configured for class balancing.
+    """
+    print("[INFO] Creating a class-balanced sampler...")
+
+    # --- 1. Count samples per class ---
+    # We use the first label in an image to represent its primary class for sampling.
+    class_counts = defaultdict(int)
+    sample_to_class_idx = [] # Stores the primary class for each sample
+
+    for i in range(len(dataset)):
+        # We need to access the raw target dict, not the transformed one.
+        # This assumes the dataset object can be indexed to get the raw annotation.
+        # The CocoDetectionV2 class is perfect for this.
+        _, target_list = dataset.coco.loadImgs(dataset.ids[i]), dataset.coco.loadAnns(dataset.coco.getAnnIds(imgIds=dataset.ids[i]))
+        target = _coco_to_tvt(target_list, dataset.lb_map, (0,0)) # canvas_size doesn't matter here
+
+        if len(target['labels']) > 0:
+            primary_class = target['labels'][0].item()
+            class_counts[primary_class] += 1
+            sample_to_class_idx.append(primary_class)
+        else:
+            # For images with no objects (true negatives), we'll give them a neutral
+            # weight later. -1 is a placeholder.
+            sample_to_class_idx.append(-1)
+
+    print(f"  Initial class distribution (by image): {dict(class_counts)}")
+    num_classes = len(target_weights)
+
+    # --- 2. Calculate weight per class ---
+    # The formula to achieve the target ratio is:
+    #   weight_for_class_c = target_ratio_c / num_samples_in_class_c
+    # This ensures that the total weight contributed by each class to the sampler
+    # is proportional to the desired target ratio.
+    class_weights = {}
+    for class_idx in range(num_classes):
+        # Use target_weights.get(class_idx, 1.0) to be safe
+        target = target_weights.get(class_idx, 1.0)
+        count = class_counts.get(class_idx, 1) # Avoid division by zero
+        if count == 0:
+            print(f"  [WARN] Class {class_idx} has 0 samples in the training set.")
+            class_weights[class_idx] = 0.0
+        else:
+            class_weights[class_idx] = target / float(count)
+
+    # For true negatives, assign the weight of the second minority class (class index 1)
+    # This ensures they are sampled but don't dominate.
+    if 1 in class_weights:
+        class_weights[-1] = class_weights[1]
+    else: # Fallback if class 1 has no samples
+        class_weights[-1] = 1.0 / len(dataset)
+
+
+    print(f"  Calculated per-class weights for sampler: {class_weights}")
+
+    # --- 3. Create a weight for each individual sample ---
+    sample_weights = [class_weights[cls_idx] for cls_idx in sample_to_class_idx]
+    sample_weights_tensor = torch.DoubleTensor(sample_weights)
+
+    # --- 4. Create and return the sampler ---
+    # replacement=True is crucial for oversampling.
+    # num_samples is the total number of items to draw per epoch. Defaulting to
+    # the dataset size is standard practice.
+    sampler = torch.utils.data.WeightedRandomSampler(
+        weights=sample_weights_tensor,
+        num_samples=len(sample_weights_tensor),
+        replacement=True
+    )
+    print("[INFO] Sampler created successfully.")
+    return sampler
 
 def contiguous_id_to_name(coco_api: COCO) -> dict[int, str]:
     """Return {0-79 → class-name} using the official 80-class list."""
@@ -101,10 +187,10 @@ class CocoDetectionV2(CocoDetection):
 def build_label_map_and_names_from_ann(ann_path: str):
     with open(ann_path, 'r') as f:
         d = json.load(f)
-    # Keep a stable order; your file uses ids 1:person, 2:snake, 3:spider
+    # Keep a stable order
     cats = sorted(d['categories'], key=lambda c: c['id'])
     catid2contig = {c['id']: i for i, c in enumerate(cats)}   # {1:0, 2:1, 3:2}
-    id2name      = {i: c['name'] for i, c in enumerate(cats)} # {0:'person',1:'snake',2:'spider'}
+    id2name      = {i: c['name'] for i, c in enumerate(cats)}
     return catid2contig, id2name
 
 # ---------- transforms ----------
@@ -597,428 +683,196 @@ class SimOTACache:
 
 # ───────────────────── train / val loops ────────────────────────
 def train_epoch(
-        model: nn.Module, loader, opt, scaler, assigner: SimOTACache,
-        device: torch.device, epoch: int, coco_label_map: dict,
-        head_nc_for_loss: int,
-        head_reg_max_for_loss: int,
-        dfl_project_buffer_for_decode: torch.Tensor,
-        max_epochs: int = 300,
-        quality_floor_vfl: float = 0.05,
-        w_cls_loss: float = 3.0,
-        w_obj_loss: float = 0.5,
-        w_dfl_loss: float = 0.5,
-        w_iou_loss: float = 4.0,
-        iou_weight_change_epoch: int = None, # Epoch to change IoU weight
-        use_focal_loss: bool = False,
-        debug_prints: bool = True,
-        gamma_loss = 2.0,
-        alpha_loss = 0.75,
-        q_gamma = 0.5,  # sqrt lift of low IoUs
+    model: torch.nn.Module,
+    loader,
+    opt,
+    scaler,
+    assigner: SimOTACache,
+    device: torch.device,
+    epoch: int,
+    coco_label_map: dict,
+    head_nc_for_loss: int,
+    head_reg_max_for_loss: int,
+    dfl_project_buffer_for_decode: torch.Tensor,
+    max_epochs: int = 300,
+    quality_floor_vfl: float = 0.05,
+    w_cls_loss: float = 3.0,
+    w_dfl_loss: float = 0.5,
+    w_iou_loss: float = 4.0,
+    use_focal_loss: bool = False,
+    debug_prints: bool = True,
+    gamma_loss: float = 2.0,
+    alpha_loss: float = 0.75,
+    q_gamma: float = 0.5,
 ):
+    """
+    Runs a single training epoch, refactored for batch-centric loss calculation
+    to correctly train on both positive and negative samples.
+    """
     model.train()
-    # ─── containers for epoch‑wide diagnostics ──────────────────────────
-    total_samples_contributing_to_loss_epoch = 0
-    fg_total, img_total = 0, 0
-    skips = 0
-    _, tot_loss_accum = time.time(), 0.
+    # --- Containers for epoch-wide diagnostics ---
+    fg_total, img_total, successful_updates = 0, 0, 0
+    tot_loss_accum = 0.
 
     for i, (imgs, tgts_batch) in enumerate(loader):
-        # Handle the case where the entire batch was filtered out
         if imgs is None or not imgs.numel():
             if debug_prints:
                 print(f"Skipping batch {i} because it became empty after filtering.")
             continue
-        H, W = imgs.shape[-2:]
-        assert H % 32 == 0 and W % 32 == 0, "IMG_SIZE must be multiple of 32"
+
+        bs, _, H, W = imgs.shape
+        assert H % 32 == 0 and W % 32 == 0, "IMG_SIZE must be a multiple of 32"
 
         imgs = imgs.to(device)
-        model_outputs = model(imgs)
+        cls_preds_levels, reg_preds_levels, strides_per_level_tensors = model(imgs)
 
-        if not model.training:
-             raise RuntimeError("train_epoch called with model not in training mode.")
-        if len(model_outputs) != 3:  # 4 for objectness
-            raise ValueError(
-                f"Expected 4 outputs from model in training mode (preds_cls, #preds_obj, preds_reg, strides), got {len(model_outputs)}"
-            )
-        # cls_preds_levels, obj_preds_levels, reg_preds_levels, strides_per_level_tensors = model_outputs
-        cls_preds_levels, reg_preds_levels, strides_per_level_tensors = model_outputs
+        fmap_shapes = [
+            (lvl.shape[2], lvl.shape[3], strides_per_level_tensors[lv])
+            for lv, lvl in enumerate(cls_preds_levels)
+        ]
 
-        bs = imgs.size(0)
-        fmap_shapes = []
-        for lv in range(len(cls_preds_levels)):
-            H, W = cls_preds_levels[lv].shape[2:]
-            s = strides_per_level_tensors[lv].item()
-            fmap_shapes.append((H, W, s))
-        if debug_prints and epoch == 0 and i == 0:
-            for lv, (_, _, actual_s) in enumerate(fmap_shapes):
-                expected_s = model.head.strides_buffer[lv].item()
-                print(f"[DEBUG STRIDE CHECK] Level {lv}: actual stride = {actual_s}, expected (head buffer) = {expected_s}")
+        anchor_centers_batch = torch.cat(
+            [getattr(model.head, f'anchor_points_level_{i}').to(device) for i in range(model.head.nl)]
+        )
 
-        batch_total_loss = torch.tensor(0.0, device=device, dtype=torch.float32)
-        num_samples_with_loss_in_batch = 0
+        cls_p_batch = torch.cat([
+            lvl.permute(0, 2, 3, 1).reshape(bs, -1, head_nc_for_loss)
+            for lvl in cls_preds_levels
+        ], dim=1)
+        reg_p_batch = torch.cat([
+            lvl.permute(0, 2, 3, 1).reshape(bs, -1, 4 * (head_reg_max_for_loss + 1))
+            for lvl in reg_preds_levels
+        ], dim=1)
 
-        loss_cls_print, loss_obj_print, loss_dfl_print, loss_iou_print = [torch.tensor(0.0) for _ in range(4)]
+        batch_cls_targets = torch.zeros_like(cls_p_batch)
+        batch_box_targets = torch.zeros(bs, reg_p_batch.shape[1], 4, device=device)
+        batch_fg_mask = torch.zeros_like(cls_p_batch[..., 0], dtype=torch.bool)
+        total_num_fg_batch = 0
 
         for b_idx in range(bs):
             tgt_i = tgts_batch[b_idx]
-            gt_boxes_unfiltered = tgt_i["boxes"].to(dtype=torch.float32, device=device, non_blocking=True)
-            gt_labels_unfiltered = tgt_i["labels"].to(device=device, non_blocking=True)
+            gt_boxes_img = tgt_i["boxes"].to(dtype=torch.float32, device=device)
+            gt_labels_img = tgt_i["labels"].to(device=device)
 
-            gt_boxes_img = gt_boxes_unfiltered
-            gt_labels_img = gt_labels_unfiltered
-
-            if gt_boxes_unfiltered.numel() > 0:
-                # assert (gt_labels_img < model.head.nc).all(), "Found an invalid class label index!"
-                widths = gt_boxes_unfiltered[:, 2] - gt_boxes_unfiltered[:, 0]
-                heights = gt_boxes_unfiltered[:, 3] - gt_boxes_unfiltered[:, 1]
-                epsilon_wh = 1e-3
-                valid_gt_mask = (widths > epsilon_wh) & (heights > epsilon_wh)
-                gt_boxes_img = gt_boxes_unfiltered[valid_gt_mask]
-                gt_labels_img = gt_labels_unfiltered[valid_gt_mask]
-
-            target_dict_for_assigner = {'boxes': gt_boxes_img, 'labels': gt_labels_img}
-
-            if assigner.nc != head_nc_for_loss and i == 1:
-                 warnings.warn(f"Warning: assigner.nc ({assigner.nc}) != head_nc_for_loss ({head_nc_for_loss}).")
-
-            if debug_prints and epoch == 0 and i == 0:
-                H_img_shape, W_img_shape = imgs[b_idx].shape[-2:]
-                bad_coords_after_filter = False
-                if gt_boxes_img.numel() > 0:
-                    widths_filtered = gt_boxes_img[:, 2] - gt_boxes_img[:, 0]
-                    heights_filtered = gt_boxes_img[:, 3] - gt_boxes_img[:, 1]
-                    bad_coords_after_filter = (
-                        (gt_boxes_img[:, 0] < -epsilon_wh) | (gt_boxes_img[:, 1] < -epsilon_wh) |
-                        (gt_boxes_img[:, 2] > W_img_shape + epsilon_wh) | (gt_boxes_img[:, 3] > H_img_shape + epsilon_wh) |
-                        (widths_filtered <= 0) | (heights_filtered <= 0)
-                    ).any()
-                first_tgt_original_boxes = tgts_batch[b_idx]["boxes"]
-                first_box_original_coords = first_tgt_original_boxes[:1].tolist() if first_tgt_original_boxes.numel() else None
-                if bad_coords_after_filter:
-                    raise ValueError(f"bad coords: [CHECK] Img shape {imgs[b_idx].shape}, sample {b_idx} first original box: {first_box_original_coords}")
-
-            # flatten predictions
-            cls_p_img = torch.cat([
-                lvl[b_idx].permute(1, 2, 0).reshape(-1, head_nc_for_loss)
-                for lvl in cls_preds_levels
-            ], dim=0)                                     # (A, C)
-            # obj_p_img = torch.cat([
-            #     lvl[b_idx].permute(1, 2, 0).reshape(-1)
-            #     for lvl in obj_preds_levels
-            # ], dim=0)                                     # (A,)
-            reg_p_img = torch.cat([
-                lvl[b_idx].permute(1,2,0).reshape(-1, 4*(head_reg_max_for_loss+1))
-                for lvl in reg_preds_levels
-            ], dim=0)
-            if i == 0 and b_idx in [0, 1]   :
-                print("\n--- COORDINATE SYSTEM SANITY CHECK ---")
-                gt_sample = gt_boxes_img[0] if gt_boxes_img.numel() > 0 else "N/A no GT"
-                gt_max = gt_boxes_img.max().item() if gt_boxes_img.numel() > 0 else "N/A no GT"
-                
-                # Recreate the anchor list used by the assigner
-                anchors = torch.cat([getattr(model.head, f'anchor_points_level_{i}') for i in range(model.head.nl)], 0)
-                
-                print(f"Image Size: {list(imgs.shape[-2:])}")
-                print(f"Ground-Truth Box Sample: {gt_sample}")
-                print(f"Ground-Truth Box Max Value: {gt_max}")
-                print(f"Anchor Center Max Value: {anchors.max().item()}")
-                print("--- END CHECK ---\n")
-
-            fg_mask_img, gt_labels, gt_boxes, gt_ious = assigner(
-                    fmap_shapes, device, target_dict_for_assigner,
-                    cls_logits=cls_p_img, # Raw class logits
-                    # obj_logits=obj_p_img,
-                    model_head=model.head,
+            fg_mask_img, gt_labels_assigned, gt_boxes_assigned, _ = assigner(
+                fmap_shapes, device, {'boxes': gt_boxes_img, 'labels': gt_labels_img},
+                cls_logits=cls_p_batch[b_idx], model_head=model.head,
             )
-            reg_p_fg_img = reg_p_img[fg_mask_img]
-            box_targets_fg_img = gt_boxes[fg_mask_img]
 
             num_fg_img = fg_mask_img.sum().item()
+            total_num_fg_batch += num_fg_img
             fg_total += num_fg_img
             img_total += 1
-            loss_norm_factor = float(num_fg_img)
-            if num_fg_img == 0:
-                skips += 1
-                if skips == 400:
-                    print("Large number of skipped batches, Possibly there is a bug")
-                    
-                    print("\n--- COORDINATE SYSTEM SANITY CHECK ---")
-                    gt_sample = gt_boxes_img[0] if gt_boxes_img.numel() > 0 else "N/A no GT"
-                    gt_max = gt_boxes_img.max().item() if gt_boxes_img.numel() > 0 else "N/A no GT"
-                    
-                    # Recreate the anchor list used by the assigner
-                    anchors = torch.cat([getattr(model.head, f'anchor_points_level_{i}') for i in range(model.head.nl)], 0)
-                    
-                    print(f"Image Size: {list(imgs.shape[-2:])}")
-                    print(f"Ground-Truth Box Sample: {gt_sample}")
-                    print(f"Ground-Truth Box Max Value: {gt_max}")
-                    print(f"Anchor Center Max Value: {anchors.max().item()}")
-                    print("--- END CHECK ---\n")
-                continue
 
-            ##########
-            # --- Distribution Focal Loss (DFL) & IoU Loss for BBox Regression ---
-            # (These are independent of the classification/objectness choice above and operate on reg_p_img)
+            if num_fg_img > 0:
+                pos_indices = fg_mask_img.nonzero(as_tuple=False).squeeze(1)
+                batch_fg_mask[b_idx, pos_indices] = True
+                batch_box_targets[b_idx, pos_indices] = gt_boxes_assigned[pos_indices]
 
-            pred_ltrb_offsets_fg_img = PicoDetHead.dfl_decode_for_training(
-                reg_p_fg_img,
-                dfl_project_buffer_for_decode.to(reg_p_fg_img.device),
-                head_reg_max_for_loss
-            )
-
-            # build anchors & strides from the head buffers (always consistent)
-            head_anchors_list  = []
-            head_strides_list  = []
-            for lvl_idx in range(model.head.nl):
-                anchor_level = getattr(model.head, f'anchor_points_level_{lvl_idx}').to(device)
-                stride_val   = model.head.strides_buffer[lvl_idx].to(device)          # scalar tensor
-                head_anchors_list.append(anchor_level)
-                head_strides_list.append(stride_val.expand(anchor_level.size(0)))
-            
-            anchor_centers_all_img = torch.cat(head_anchors_list, 0)     # (A , 2)
-            anchor_centers_fg_img = anchor_centers_all_img[fg_mask_img]
-            strides_all_anchors_img = torch.cat(head_strides_list, 0)    # (A ,)
-            strides_fg_img = strides_all_anchors_img[fg_mask_img].unsqueeze(-1)
-
-            if debug_prints and epoch == 0 and i == 0 and b_idx == 0:
-                head_anchors_flat_list = []
-                for lvl_idx_head in range(model.head.nl):
-                    # Ensure model.head is accessible; if qat_model is passed, might need model_fp32.head
-                    anchor_points_level = getattr(model.head, f'anchor_points_level_{lvl_idx_head}')
-                    head_anchors_flat_list.append(anchor_points_level.to(device))
-                head_anchors_concatenated = torch.cat(head_anchors_flat_list, dim=0)
-            
-                if not torch.allclose(anchor_centers_all_img, head_anchors_concatenated, atol=1e-5):
-                    print("[CRITICAL WARNING] Anchor order mismatch between SimOTA generated anchors and PicoDetHead internal anchors!")
-                    print("SimOTA anchors (first 5):", anchor_centers_all_img[:5])
-                    print("Head anchors (first 5):", head_anchors_concatenated[:5])
-                    # Consider raising an error or adding more detailed comparison
+                if use_focal_loss:
+                    batch_cls_targets[b_idx, pos_indices, gt_labels_assigned[pos_indices]] = 1.0
                 else:
-                    print("[INFO] Anchor order check passed for first sample.")
+                    with torch.no_grad():
+                        reg_p_fg_img = reg_p_batch[b_idx, pos_indices]
+                        strides_all_anchors = torch.cat([
+                            s[2].expand(s[0] * s[1]) for s in fmap_shapes
+                        ]).to(device)
+                        strides_fg_img = strides_all_anchors[pos_indices].unsqueeze(-1)
+
+                        pred_ltrb = PicoDetHead.dfl_decode_for_training(
+                            reg_p_fg_img, dfl_project_buffer_for_decode.to(device), head_reg_max_for_loss
+                        ) * strides_fg_img
+                        pred_boxes_fg = torch.stack((
+                            anchor_centers_batch[pos_indices, 0] - pred_ltrb[:, 0],
+                            anchor_centers_batch[pos_indices, 1] - pred_ltrb[:, 1],
+                            anchor_centers_batch[pos_indices, 0] + pred_ltrb[:, 2],
+                            anchor_centers_batch[pos_indices, 1] + pred_ltrb[:, 3]
+                        ), dim=1)
+                        
+                        iou_pred = tvops.box_iou(pred_boxes_fg, gt_boxes_assigned[pos_indices]).diag()
+                        quality = iou_pred.clamp_min(quality_floor_vfl).pow(q_gamma)
+                        batch_cls_targets[b_idx, pos_indices, gt_labels_assigned[pos_indices]] = quality
+
+        loss_normalizer = total_num_fg_batch if total_num_fg_batch > 0 else bs
+
+        if use_focal_loss:
+            loss_cls = tvops.sigmoid_focal_loss(
+                cls_p_batch, batch_cls_targets, alpha=0.25, gamma=gamma_loss, reduction='sum'
+            ) / loss_normalizer
+        else:
+            vfl_calc = VarifocalLoss(alpha=alpha_loss, gamma=gamma_loss, reduction='sum')
+            loss_cls = vfl_calc(cls_p_batch, batch_cls_targets) / loss_normalizer
+
+        if total_num_fg_batch > 0:
+            reg_p_fg_batch = reg_p_batch[batch_fg_mask]
+            box_targets_fg_batch = batch_box_targets[batch_fg_mask]
+            anchor_centers_fg_batch = anchor_centers_batch.unsqueeze(0).expand(bs, -1, -1)[batch_fg_mask]
+            
+            strides_all = torch.cat([s[2].expand(s[0] * s[1]) for s in fmap_shapes]).to(device)
+            strides_fg_batch = strides_all.unsqueeze(0).expand(bs, -1)[batch_fg_mask].unsqueeze(-1)
 
             ltrb_offsets = torch.stack([
-                anchor_centers_fg_img[:, 0] - box_targets_fg_img[:, 0],
-                anchor_centers_fg_img[:, 1] - box_targets_fg_img[:, 1],
-                box_targets_fg_img[:, 2] - anchor_centers_fg_img[:, 0],
-                box_targets_fg_img[:, 3] - anchor_centers_fg_img[:, 1],
-            ], dim=1) / strides_fg_img
-            ltrb_offsets = ltrb_offsets.clamp_(0, head_reg_max_for_loss)
-            dfl_target_dist = build_dfl_targets(ltrb_offsets, head_reg_max_for_loss)
-            loss_dfl = dfl_loss(reg_p_fg_img, dfl_target_dist)  #  / num_fg_img
+                anchor_centers_fg_batch[:, 0] - box_targets_fg_batch[:, 0],
+                anchor_centers_fg_batch[:, 1] - box_targets_fg_batch[:, 1],
+                box_targets_fg_batch[:, 2] - anchor_centers_fg_batch[:, 0],
+                box_targets_fg_batch[:, 3] - anchor_centers_fg_batch[:, 1],
+            ], dim=1) / strides_fg_batch
+            
+            dfl_target = build_dfl_targets(ltrb_offsets.clamp_(0, head_reg_max_for_loss), head_reg_max_for_loss)
 
-            pred_ltrb_pixels_fg_img = pred_ltrb_offsets_fg_img * strides_fg_img
-            pred_boxes_fg_img = torch.stack((
-                anchor_centers_fg_img[:, 0] - pred_ltrb_pixels_fg_img[:, 0],
-                anchor_centers_fg_img[:, 1] - pred_ltrb_pixels_fg_img[:, 1],
-                anchor_centers_fg_img[:, 0] + pred_ltrb_pixels_fg_img[:, 2],
-                anchor_centers_fg_img[:, 1] + pred_ltrb_pixels_fg_img[:, 3]
+            # --- FIX IS HERE ---
+            # The library's dfl_loss returns a mean loss (SUM / (N_fg * 4)).
+            # The other losses are SUM / N_fg (average per anchor).
+            # To make DFL loss comparable (average per anchor), we multiply its output by 4.
+            loss_dfl = dfl_loss(reg_p_fg_batch, dfl_target) * 4.0
+            
+            pred_ltrb_fg = PicoDetHead.dfl_decode_for_training(
+                reg_p_fg_batch, dfl_project_buffer_for_decode.to(device), head_reg_max_for_loss
+            ) * strides_fg_batch
+            pred_boxes_fg_batch = torch.stack((
+                anchor_centers_fg_batch[:, 0] - pred_ltrb_fg[:, 0],
+                anchor_centers_fg_batch[:, 1] - pred_ltrb_fg[:, 1],
+                anchor_centers_fg_batch[:, 0] + pred_ltrb_fg[:, 2],
+                anchor_centers_fg_batch[:, 1] + pred_ltrb_fg[:, 3],
             ), dim=1)
-            loss_iou = tvops.complete_box_iou_loss(pred_boxes_fg_img, box_targets_fg_img, reduction='sum') / num_fg_img
+            loss_iou = tvops.complete_box_iou_loss(
+                pred_boxes_fg_batch, box_targets_fg_batch, reduction='sum'
+            ) / loss_normalizer
+        else:
+            loss_dfl = torch.tensor(0.0, device=device)
+            loss_iou = torch.tensor(0.0, device=device)
 
-            ########
-            # Joint logits: always the same expression
-            # joint_logits = cls_p_img + model.head.logit_scale * obj_p_img.unsqueeze(1)
-            joint_logits = cls_p_img
-            
-            # foreground indices for this image
-            pos_indices = fg_mask_img.nonzero(as_tuple=False).squeeze(1)  # (N_fg,)
-            
-            if pos_indices.numel() == 0:          # nothing to learn from this image
-                continue
+        batch_total_loss = w_cls_loss * loss_cls + w_dfl_loss * loss_dfl + w_iou_loss * loss_iou
 
-            gt_labels_pos    = gt_labels[pos_indices]             # (N_fg ,)
-            
-            # ------------------------------------------------------------------
-            # 2. Classification loss
-            # ------------------------------------------------------------------
-            loss_obj = torch.tensor(0.0)
-            if use_focal_loss:          # warm-up path (plain BCE is fine here)
-                cls_logits_pos = cls_p_img[pos_indices]
-                gt_labels_pos = gt_labels[pos_indices]
-                # Create one-hot targets for the foreground predictions
-                cls_targets_pos = torch.zeros_like(cls_logits_pos)
-                cls_targets_pos[torch.arange(num_fg_img, device=device), gt_labels_pos] = 1.0
-                # Use torchvision's numerically stable and reliable focal loss.
-                # It's normalized by the number of positive anchors, as is standard.
-                loss_cls = tvops.sigmoid_focal_loss(
-                    cls_logits_pos,
-                    cls_targets_pos,
-                    alpha=0.25,  # Standard value to balance positive/negative examples
-                    gamma=gamma_loss,   # Standard value to focus on hard examples
-                    reduction='sum'
-                ) / loss_norm_factor
-                # 2. Objectness Loss (Binary Cross-Entropy)
-                # Applied to ALL anchors (foreground and background).
-                # obj_targets = torch.zeros_like(obj_p_img)
-                # For foreground anchors, the target is their IoU with the matched GT box.
-                # This teaches the model that higher IoU boxes are "more object".
-                # obj_targets[fg_mask_img] = gt_ious[fg_mask_img]
-                # Use standard BCE with logits, averaged over all anchors.
-                # loss_obj = F.binary_cross_entropy_with_logits(obj_p_img, obj_targets, reduction='mean')
-
-                """
-                alpha_focal, gamma = 0.25, 2.0
-                loss_cls = tvops.sigmoid_focal_loss(
-                    cls_p_img, cls_targets, alpha=alpha_focal, gamma=gamma, reduction='sum'
-                ) / loss_norm_factor    
-                """
-            
-            else:  # Varifocal Loss proper
-                targets = torch.zeros_like(joint_logits)
-                
-                if pos_indices.numel() > 0:
-                    gt_labels_pos = gt_labels[pos_indices]
-                
-                    with torch.no_grad():
-                        # predicted boxes & matched GT for the *foreground* anchors
-                        iou_pred = tvops.box_iou(pred_boxes_fg_img, box_targets_fg_img).diag()
-                
-                        # shape quality
-                        quality = iou_pred.clamp_min(quality_floor_vfl).pow(q_gamma)  # VFL
-                        # quality = iou_pred.clamp_min(quality_floor_vfl)  # QFL
-                
-                    targets[pos_indices, gt_labels_pos] = quality
-                
-                vfl_calculator = VarifocalLoss(alpha=alpha_loss, gamma=gamma_loss, reduction='sum')
-                # vfl_calculator = QualityFocalLoss(beta=gamma_loss, reduction='sum')
-                loss_cls = vfl_calculator(joint_logits, targets) / max(1, num_fg_img)
-
-                w_obj_loss = 0.01  # small placeholder
-            
-            # Final sample loss (obj already inside joint_logits)
-            current_sample_total_loss = (
-                  w_cls_loss * loss_cls
-                + w_dfl_loss * loss_dfl
-                + w_iou_loss * loss_iou
-                + w_obj_loss * loss_obj
-            )
-            if not torch.isfinite(current_sample_total_loss):
-                print(f"current_sample_total_loss is not finite: {current_sample_total_loss}")
-                current_sample_total_loss = 10.0  # larger than normal error
-            
-            # for the first sample in the epoch – diagnostics only
-            if num_samples_with_loss_in_batch == 0 and total_samples_contributing_to_loss_epoch == 0:
-                loss_cls_print = loss_cls.detach()
-                loss_obj_print = loss_obj.detach()
-                loss_dfl_print = loss_dfl.detach()
-                loss_iou_print = loss_iou.detach()
-
-            batch_total_loss += current_sample_total_loss
-            num_samples_with_loss_in_batch += 1
-
-        if num_samples_with_loss_in_batch > 0:
-            averaged_batch_loss = batch_total_loss / num_samples_with_loss_in_batch
+        if torch.isfinite(batch_total_loss):
             opt.zero_grad(set_to_none=True)
-            if not torch.isfinite(averaged_batch_loss) or averaged_batch_loss.isnan():
-                continue
-            scaler.scale(averaged_batch_loss).backward()
+            scaler.scale(batch_total_loss).backward()
             scaler.unscale_(opt)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=6.0)
+            scaler.step(opt)
+            scaler.update()
+            tot_loss_accum += batch_total_loss.item()
+            successful_updates += 1
+        else:
+            if debug_prints: print(f"WARNING: Non-finite loss in batch {i}. Skipping update.")
+            continue
 
-            if i % 3000 == 0:
-                ### Norm sizing debug
-                total_norm = 0.0
-                for p in model.parameters():
-                    if p.grad is not None:
-                        param_norm = p.grad.detach().data.norm(2)
-                        total_norm += param_norm.item() ** 2
-                total_norm = total_norm ** 0.5
-                print(f"Batch {i}, Total Grad Norm: {total_norm:.4f}")
-            gradient_norm = 6.0  # 1.0 to 10.0 common, max gradient observed in debug was around 6
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=gradient_norm)
-            scaler.step(opt); scaler.update()
-            # with torch.no_grad():
-            #     model.head.logit_scale.clamp_(-1.0, 3.0)
-            tot_loss_accum += averaged_batch_loss.item() * num_samples_with_loss_in_batch
-            total_samples_contributing_to_loss_epoch += num_samples_with_loss_in_batch
+        if debug_prints and (i == 0 or (i > 0 and i % 500 == 0)):
+            avg_loss_so_far = tot_loss_accum / successful_updates if successful_updates > 0 else 0.
+            print(f"E{epoch:<3} {i:04d}/{len(loader)} | "
+                  f"Loss: {batch_total_loss.item():.4f} (Avg: {avg_loss_so_far:.4f}) | "
+                  f"FG/Batch: {total_num_fg_batch} | Norm: {loss_normalizer}")
 
-        if debug_prints and i == 0 and total_samples_contributing_to_loss_epoch > 0 : # Print first batch loss breakdown
-             print(f"E{epoch} B0 loss components: "
-                  f"cls {loss_cls_print.item() * w_cls_loss:.3f} (w={w_cls_loss})  obj {loss_obj_print.item() * w_obj_loss:.3f} (w={w_obj_loss})  "
-                  f"dfl {loss_dfl_print.item() * w_dfl_loss:.3f} (w={w_dfl_loss})  iou {loss_iou_print.item() * w_iou_loss:.3f} (w={w_iou_loss})  "
-                  f"tot_batch_avg {averaged_batch_loss.item():.3f}")
-             with torch.no_grad():
-                    fg_indices = fg_mask_img.nonzero(as_tuple=False).squeeze(1)
-                    cls_p_fg_img = cls_p_img[fg_indices] # (N_fg, C)
-                    gt_labels_fg = gt_labels[fg_indices] # (N_fg,)
-            
-                    # Get the logit value for the correct class for each FG prediction
-                    correct_class_logits = cls_p_fg_img[torch.arange(num_fg_img), gt_labels_fg]
-            
-                    # Find the highest logit among all *incorrect* classes for each FG prediction
-                    cls_p_fg_img[torch.arange(num_fg_img), gt_labels_fg] = -float('inf') # Mask out correct class
-                    max_incorrect_class_logits, _ = cls_p_fg_img.max(dim=1)
-            
-                    # The "margin" is the difference. We want this to be large and positive.
-                    logit_margin = correct_class_logits - max_incorrect_class_logits
-            
-                    print(f"\n--- [DBG E{epoch} B{i}] Logit Analysis (FG Samples) ---")
-                    print(f"  Avg Logit for Correct Class: {correct_class_logits.mean().item():.3f}")
-                    print(f"  Avg Logit for Top Incorrect Class: {max_incorrect_class_logits.mean().item():.3f}")
-                    print(f"  Avg Margin (Correct - Incorrect): {logit_margin.mean().item():.3f} (Stdev: {logit_margin.std().item():.3f})")
-                    print(f"  % of FG samples with negative margin: {(logit_margin < 0).float().mean().item():.2%}\n")
-
-        elif debug_prints and i % 500 == 0 and i > 0 and num_samples_with_loss_in_batch > 0:
-            print(f"E{epoch} {i:04d}/{len(loader)} loss {averaged_batch_loss.item():.3f} (batch avg)")
-        if debug_prints and (epoch % 10 == 0) and i == 0:
-            try:
-                with torch.no_grad():
-                    # ─── concatenate logits from all FPN levels ───────────────────
-                    cls_logits_all = torch.cat(
-                        [lvl.detach().permute(0, 2, 3, 1).reshape(-1, head_nc_for_loss)
-                         for lvl in cls_preds_levels], dim=0)                # [A_total , C]
-                    # obj_logits_all = torch.cat(
-                    #     [lvl.detach().permute(0, 2, 3, 1).reshape(-1, 1)
-                    #      for lvl in obj_preds_levels], dim=0)                # [A_total , 1]
-            
-                    # Classification confidence analysis
-                    cls_probs = cls_logits_all.sigmoid()
-                    # obj_probs = obj_logits_all.sigmoid()
-                    # joint_conf = (cls_logits_all + obj_logits_all).sigmoid().flatten()
-                    joint_conf = cls_logits_all.sigmoid().flatten()
-                    
-                    # Per-class prediction distribution
-                    max_cls_probs, max_cls_indices = cls_probs.max(dim=1)
-                    print(f"\n[DBG] Epoch {epoch} Classification Analysis:")
-                    print(f"  Cls logits range: [{cls_logits_all.min().item():.3f}, {cls_logits_all.max().item():.3f}]")
-                    # print(f"  Obj logits range: [{obj_logits_all.min().item():.3f}, {obj_logits_all.max().item():.3f}]")
-                    print(f"  Joint conf range: [{joint_conf.min().item():.3f}, {joint_conf.max().item():.3f}]")
-                    
-                    # Class distribution
-                    print("  Top predicted classes:")
-                    for class_id in range(min(5, head_nc_for_loss)):
-                        count = (max_cls_indices == class_id).sum().item()
-                        avg_conf = cls_probs[:, class_id].mean().item()
-                        print(f"    Class {class_id}: {count:6d} predictions, avg_conf: {avg_conf:.4f}")
-            
-                    # sample at most 100k values to keep it fast
-                    if joint_conf.numel() > 100000:
-                        idx = torch.randperm(joint_conf.numel(), device=joint_conf.device)[:100_000]
-                        joint_conf = joint_conf[idx]
-            
-                    q50, q90, q99 = torch.quantile(
-                        joint_conf.cpu(), torch.tensor([0.5, 0.9, 0.99]))
-                    print(f"  Conf quantiles 50/90/99%: {q50:.3f} {q90:.3f} {q99:.3f}")
-                    
-                    # Confidence thresholds
-                    for thresh in [0.01, 0.05, 0.1, 0.25]:
-                        above_thresh = (joint_conf > thresh).sum().item()
-                        percentage = 100 * above_thresh / joint_conf.numel()
-                        print(f"  >{thresh:.2f}: {percentage:.1f}%")
-                        
-            except Exception as e:
-                print(f"[DEBUG ERROR] {repr(e)}")
-
-    if total_samples_contributing_to_loss_epoch > 0:
-        avg_epoch_loss_per_sample = tot_loss_accum / total_samples_contributing_to_loss_epoch
+    if successful_updates > 0:
+        avg_epoch_loss = tot_loss_accum / successful_updates
         epoch_diag = {
             "fg_per_img": fg_total / max(img_total, 1),
-            "centre_hit":  np.mean(assigner._debug_stats["ctr_hit_rate"])
+            "centre_hit": np.mean(assigner._debug_stats["ctr_hit_rate"]) if assigner._debug_stats.get("ctr_hit_rate") else 0.0
         }
-        return avg_epoch_loss_per_sample, epoch_diag
+        return avg_epoch_loss, epoch_diag
     else:
-        print(f"E{epoch} No samples contributed to loss this epoch.")
+        print(f"E{epoch}: No successful updates were made this epoch.")
         return 0.0, {}
-
 
 # ───────────────────── QAT helpers ───────────────────────────────
 from torch.ao.quantization import (
@@ -1860,8 +1714,8 @@ def main(argv: List[str] | None = None):
     pa.add_argument('--no_inplace_head_neck', default=True, action='store_true', help="Disable inplace activations in head/neck")
     pa.add_argument('--min_box_size', type=int, default=11, help="Minimum pixel width/height for a GT box to be used in training.")
     pa.add_argument('--load_from', type=str, default="picodet_50coco.pt", help="Path to a checkpoint to resume or finetune from (e.g., picodet_50coco.pt)")
-    pa.add_argument('--data_root', default='webextension')
-    pa.add_argument('--ann', default='webextension/annotations/instances.json')
+    pa.add_argument('--data_root', default='test')
+    pa.add_argument('--ann', default='test/annotations/instances.json')
     pa.add_argument('--val_pct', type=float, default=0.05)
     cfg = pa.parse_args(argv)
 
@@ -1916,29 +1770,52 @@ def main(argv: List[str] | None = None):
         ann_path = cfg.ann
         label_map, id2name = build_label_map_and_names_from_ann(ann_path)
         coco_label_map = label_map   # just a name reuse
-        # Build two dataset objects so they can have different transforms
+        
         full_train_tf = build_transforms((IMG_SIZE, IMG_SIZE), train=True)
         full_val_tf   = build_transforms((IMG_SIZE, IMG_SIZE), train=False)
         
-        full_trainval_ds = CocoDetectionV2(
+        # This dataset object is used for creating the sampler, before transforms are applied
+        train_ds_for_sampler = CocoDetectionV2(
             img_dir=f"{root}/images",
             ann_file=ann_path,
             lb_map=label_map,
-            transforms=None  # transform applied after subset selection
+            transforms=None # No transforms needed for counting
         )
         
-        # Random split (deterministic)
+        # Create the actual training dataset with augmentations
+        train_ds = CocoDetectionV2(
+            img_dir=f"{root}/images",
+            ann_file=ann_path,
+            lb_map=label_map,
+            transforms=full_train_tf
+        )
+
+        # Random split for validation (deterministic)
         g = torch.Generator().manual_seed(SEED)
-        n = len(full_trainval_ds)
+        n = len(train_ds)
         val_n = max(1, int(cfg.val_pct * n))
         perm = torch.randperm(n, generator=g)
-        val_idx   = perm[:val_n].tolist()
+        val_idx = perm[:val_n].tolist()
+        
+        # NOTE: The sampler needs to operate on the full training set indices before subsetting.
+        # We will apply validation subsetting after creating the sampler.
+        train_idx = perm[val_n:].tolist()
 
-        train_ds = CocoDetectionV2(f"{root}/images", ann_path, label_map, transforms=full_train_tf)
+        # Create a Subset of the original dataset for actual training
+        train_ds_subset = torch.utils.data.Subset(train_ds, train_idx)
+        # Create a sampler for that subset
+        train_ds_sampler_subset = torch.utils.data.Subset(train_ds_for_sampler, train_idx)
+        
         val_ds = torch.utils.data.Subset(
             CocoDetectionV2(f"{root}/images", ann_path, label_map, transforms=full_val_tf),
             val_idx
         )
+
+        # --- NEW: Create and assign the class-balanced sampler ---
+        # Class 0 is over-represented. Target is 3:1:1
+        target_class_weights = {0: 3.0, 1: 1.0, 2: 1.0}
+        train_sampler = create_class_balanced_sampler(train_ds_sampler_subset, target_class_weights)
+
     else:
         NUM_CLASS = 80
         train_ds = CocoDetectionV2(
@@ -2005,10 +1882,11 @@ def main(argv: List[str] | None = None):
     total_scheduled_epochs = 0
     for i, (num_epochs, min_size) in enumerate(curriculum_schedule):
         collate_fn = functools.partial(collate_and_filter_more, min_box_size=min_size)
-        
-        # Use the existing train_sampler logic
+
         train_loaders[i] = DataLoader(
-            train_ds, batch_size=cfg.batch, sampler=train_sampler,
+            train_ds_subset if not use_coco else train_ds, # Use the subset for training
+            batch_size=cfg.batch,
+            sampler=train_sampler,
             num_workers=cfg.workers,
             collate_fn=collate_fn,
             pin_memory=True, persistent_workers=bool(cfg.workers)
