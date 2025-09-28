@@ -401,11 +401,16 @@ class PicoDetHead(nn.Module):
         max_scores = scores.max(dim=-1).values  # (B, H_feat*W_feat)
         score_threshold = 0.01  # Lower threshold for early filtering
         keep_mask = max_scores > score_threshold  # (B, H_feat*W_feat)
-        
-        # If all scores are too low, return empty results
+
+        # Always keep at least the strongest anchor per image to avoid empty outputs
+        fallback_max = max_scores.max(dim=1, keepdim=True).values
+        keep_mask = keep_mask | (max_scores == fallback_max)
+
+        # If all scores are too low (extremely unlikely after fallback), return zeros safely
         if not keep_mask.any():
-            empty_boxes = torch.zeros(B, H_feat*W_feat, 4, device=cls_logit.device)
-            return empty_boxes, scores
+            empty_boxes = torch.zeros(B, H_feat*W_feat, 4, device=cls_logit.device, dtype=cls_logit.dtype)
+            empty_scores = scores.new_zeros(B, H_feat*W_feat, self.nc)
+            return empty_boxes, empty_scores
 
         # build grid *on the fly* so it always matches H_feat,W_feat
         yv, xv = torch.meshgrid(
@@ -423,6 +428,10 @@ class PicoDetHead(nn.Module):
         x2 = anchor_centers[:,0].unsqueeze(0) + ltrb[...,2]
         y2 = anchor_centers[:,1].unsqueeze(0) + ltrb[...,3]
         boxes = torch.stack([x1,y1,x2,y2], dim=-1)
+
+        mask_expanded = keep_mask.unsqueeze(-1)
+        boxes = boxes.masked_fill(~mask_expanded, 0.0)
+        scores = scores.masked_fill(~mask_expanded, 0.0)
 
         return boxes, scores
 
