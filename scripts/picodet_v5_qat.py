@@ -264,7 +264,7 @@ def _make_valid_mask(xyxy, H, W,
     ar = w / (h + 1e-6)
 
     # 1. positive dims
-    pos_wh = (w > 0) & (h > 0) if allow_neg else torch.ones_like(w, dtype=torch.bool)
+    pos_wh = torch.ones_like(w, dtype=torch.bool) if allow_neg else (w > 0) & (h > 0)
 
     # 2. reasonable size
     big = (w * h) > max_cover * H * W         # covers nearly full canvas
@@ -458,6 +458,7 @@ class SimOTACache:
                  cls_cost_weight: float = 1.0,
                  debug_epochs: int = 0,         # 0 = silent
                  dynamic_k_min: int = 2,
+                 min_iou_threshold: float = 0.02,  # Reject assignments with IoU below this
                  ):
         self.nc = nc
         self.r = ctr
@@ -466,6 +467,7 @@ class SimOTACache:
         self.cache = {}               # anchor centres per (H,W,stride,device)
         self.simota_prefilter = False
         self.dynamic_k_min = dynamic_k_min  # 3, or 1-2
+        self.min_iou_threshold = min_iou_threshold
         self.power = 0.0 
         self.mean_fg_iou = 0.0
 
@@ -609,7 +611,7 @@ class SimOTACache:
                 - gt_centres.unsqueeze(0)).abs().max(dim=-1).values   # (A,M)
         centre_mask = dist < (self.r * anchor_strides.unsqueeze(1))   # (A,M)
         if self.simota_prefilter:
-            # add inside mask filter (this needs further debugging as it removes too many boxes)
+            # add inside mask filter (this needs further debugging as it removes too many boxes, use union with a soft constraint perhaps)
             inside_mask = (
                 (anchor_centers[:, 0].unsqueeze(1) >= gt_boxes[:, 0]) &
                 (anchor_centers[:, 0].unsqueeze(1) <= gt_boxes[:, 2]) &
@@ -626,22 +628,23 @@ class SimOTACache:
         fg_cand_mask = torch.zeros(A, dtype=torch.bool, device=device)
 
         for g in range(M):
-            valid_idx = centre_mask[:, g].nonzero(as_tuple=False).squeeze(1)
+            valid_idx = centre_mask[:, g].nonzero(as_tuple=False).view(-1)  # Use view(-1) for safety
             if valid_idx.numel():
                 ious_local = iou[g, valid_idx]
                 k = min(dynamic_ks[g].item(), valid_idx.numel())
                 topk_idx = torch.topk(ious_local, k).indices
                 fg_cand_mask[valid_idx[topk_idx]] = True
 
-        eps = 1e-8
-
         num_anchors_total = cls_logits.size(0)
         idx_anchor_dim = torch.arange(num_anchors_total, device=device).unsqueeze(0).repeat(M, 1) # Shape (M, A)
         idx_class_dim = gt_labels.unsqueeze(1).repeat(1, num_anchors_total) # Shape (M, A)
         logit_cls_gt = cls_logits[idx_anchor_dim, idx_class_dim] # Shape (M, A)
 
-        giou = tvops.generalized_box_iou(gt_boxes, anchor_candidate_boxes) # (M,A)
-        cost_loc = 6.0 * (1.0 - giou)
+        # Use standard IoU for cost calculation (more stable than GIoU for assignment)
+        cost_loc = 6.0 * (1.0 - iou)
+        # Alternative: GIoU can handle non-overlapping boxes better but may be less stable
+        # giou = tvops.generalized_box_iou(gt_boxes, anchor_candidate_boxes)  # (M,A)
+        # cost_loc = 6.0 * (1.0 - giou)
         # -- VFL-style cost --------------------------------------
         cls_prob = logit_cls_gt.sigmoid().clamp(1e-6, 1.0 - 1e-6)
         # Use the square of the standard IoU as a powerful quality weight
@@ -661,9 +664,8 @@ class SimOTACache:
         assign_gt = cost.argmin(0)                # (A,)
         
         # Early IoU filtering: prevent very poor matches from corrupting training
-        min_iou_threshold = 0.02  # Reject assignments with IoU < 2%
-        low_iou_mask = iou.max(0).values < min_iou_threshold  # (A,) - anchors with max IoU < threshold
-        # Don't modify assign_gt directly as it's used for indexing - filter will be applied in fg_final
+        assigned_iou_per_anchor = iou[assign_gt, torch.arange(A, device=device)]  # (A,)
+        low_iou_mask = assigned_iou_per_anchor < self.min_iou_threshold  # (A,) - anchors with poor IoU to assigned GT
         
         if self.is_debug_mode:
             # Only calculate on the valid candidate anchors to get a meaningful comparison
@@ -680,7 +682,7 @@ class SimOTACache:
 
         # 5. final fg mask = candidate ∧ in-centre of its chosen GT ∧ decent IoU
         fg_final = torch.zeros(A, dtype=torch.bool, device=device)
-        cand_idx = fg_cand_mask.nonzero(as_tuple=False).squeeze(1)
+        cand_idx = fg_cand_mask.nonzero(as_tuple=False).view(-1)  # Use view(-1) to avoid squeeze issues with single element
         if cand_idx.numel():
             in_centre = centre_mask[cand_idx, assign_gt[cand_idx]]
             # Apply IoU quality filter - reject poor quality matches
@@ -694,7 +696,7 @@ class SimOTACache:
         iou_out    = torch.zeros((A,),  dtype=torch.float32, device=device)
 
         if fg_final.any():
-            fg_idx  = fg_final.nonzero(as_tuple=False).squeeze(1)
+            fg_idx  = fg_final.nonzero(as_tuple=False).view(-1)  # Use view(-1) to avoid squeeze issues
             gt_idx  = assign_gt[fg_idx]
             gt_lbl_out[fg_idx] = gt_labels[gt_idx]
             gt_box_out[fg_idx] = gt_boxes[gt_idx]
@@ -810,7 +812,7 @@ def train_epoch(
             img_total += 1
 
             if num_fg_img > 0:
-                pos_indices = fg_mask_img.nonzero(as_tuple=False).squeeze(1)
+                pos_indices = fg_mask_img.nonzero(as_tuple=False).view(-1)  # Use view(-1) for safety
                 batch_fg_mask[b_idx, pos_indices] = True
                 batch_box_targets[b_idx, pos_indices] = gt_boxes_assigned[pos_indices]
 
@@ -856,31 +858,59 @@ def train_epoch(
             strides_all = torch.cat([s[2].expand(s[0] * s[1]) for s in fmap_shapes]).to(device)
             strides_fg_batch = strides_all.unsqueeze(0).expand(bs, -1)[batch_fg_mask].unsqueeze(-1)
 
-            ltrb_offsets = torch.stack([
-                anchor_centers_fg_batch[:, 0] - box_targets_fg_batch[:, 0],
-                anchor_centers_fg_batch[:, 1] - box_targets_fg_batch[:, 1],
-                box_targets_fg_batch[:, 2] - anchor_centers_fg_batch[:, 0],
-                box_targets_fg_batch[:, 3] - anchor_centers_fg_batch[:, 1],
-            ], dim=1) / strides_fg_batch
+            # Filter out anchors whose centers are outside their assigned GT box
+            # This avoids training the model to predict degenerate zero-area boxes
+            anchor_inside_gt_mask = (
+                (anchor_centers_fg_batch[:, 0] >= box_targets_fg_batch[:, 0]) &  # anchor_x >= gt_x1
+                (anchor_centers_fg_batch[:, 0] <= box_targets_fg_batch[:, 2]) &  # anchor_x <= gt_x2
+                (anchor_centers_fg_batch[:, 1] >= box_targets_fg_batch[:, 1]) &  # anchor_y >= gt_y1
+                (anchor_centers_fg_batch[:, 1] <= box_targets_fg_batch[:, 3])    # anchor_y <= gt_y2
+            )
             
-            dfl_target = build_dfl_targets(ltrb_offsets.clamp_(0, head_reg_max_for_loss), head_reg_max_for_loss)
+            num_inside = anchor_inside_gt_mask.sum().item()
+            num_outside = total_num_fg_batch - num_inside
+            if num_outside > 0 and debug_prints and i == 0:
+                print(f"  [INFO] Filtered {num_outside} anchors outside GT boxes ({100*num_outside/total_num_fg_batch:.1f}%)")
+            
+            # Only proceed with regression loss if we have valid inside anchors
+            if num_inside > 0:
+                reg_p_fg_batch = reg_p_fg_batch[anchor_inside_gt_mask]
+                box_targets_fg_batch = box_targets_fg_batch[anchor_inside_gt_mask]
+                anchor_centers_fg_batch = anchor_centers_fg_batch[anchor_inside_gt_mask]
+                strides_fg_batch = strides_fg_batch[anchor_inside_gt_mask]
+                
+                ltrb_offsets = torch.stack([
+                    anchor_centers_fg_batch[:, 0] - box_targets_fg_batch[:, 0],
+                    anchor_centers_fg_batch[:, 1] - box_targets_fg_batch[:, 1],
+                    box_targets_fg_batch[:, 2] - anchor_centers_fg_batch[:, 0],
+                    box_targets_fg_batch[:, 3] - anchor_centers_fg_batch[:, 1],
+                ], dim=1) / strides_fg_batch
+                
+                # With inside filtering, LTRB should always be >= 0. Clamp is a safety net.
+                dfl_target = build_dfl_targets(ltrb_offsets.clamp(0, head_reg_max_for_loss), head_reg_max_for_loss)
 
-            # DFL loss normalization: dfl_loss returns batchmean (sum/(N_fg*4))
-            # Multiply by 4 to get per-anchor normalization for consistency with other losses
-            loss_dfl = dfl_loss(reg_p_fg_batch, dfl_target) * 4.0
-            
-            pred_ltrb_fg = PicoDetHead.dfl_decode_for_training(
-                reg_p_fg_batch, dfl_project_buffer_for_decode.to(device), head_reg_max_for_loss
-            ) * strides_fg_batch
-            pred_boxes_fg_batch = torch.stack((
-                anchor_centers_fg_batch[:, 0] - pred_ltrb_fg[:, 0],
-                anchor_centers_fg_batch[:, 1] - pred_ltrb_fg[:, 1],
-                anchor_centers_fg_batch[:, 0] + pred_ltrb_fg[:, 2],
-                anchor_centers_fg_batch[:, 1] + pred_ltrb_fg[:, 3],
-            ), dim=1)
-            loss_iou = tvops.complete_box_iou_loss(
-                pred_boxes_fg_batch, box_targets_fg_batch, reduction='sum'
-            ) / loss_normalizer
+                # DFL loss normalization: dfl_loss returns batchmean (sum/(N_fg*4))
+                # Multiply by 4 to get per-anchor normalization for consistency with other losses
+                # Use num_inside for normalization since we filtered to only inside anchors
+                reg_loss_normalizer = num_inside if num_inside > 0 else 1
+                loss_dfl = dfl_loss(reg_p_fg_batch, dfl_target) * 4.0
+                
+                pred_ltrb_fg = PicoDetHead.dfl_decode_for_training(
+                    reg_p_fg_batch, dfl_project_buffer_for_decode.to(device), head_reg_max_for_loss
+                ) * strides_fg_batch
+                pred_boxes_fg_batch = torch.stack((
+                    anchor_centers_fg_batch[:, 0] - pred_ltrb_fg[:, 0],
+                    anchor_centers_fg_batch[:, 1] - pred_ltrb_fg[:, 1],
+                    anchor_centers_fg_batch[:, 0] + pred_ltrb_fg[:, 2],
+                    anchor_centers_fg_batch[:, 1] + pred_ltrb_fg[:, 3],
+                ), dim=1)
+                loss_iou = tvops.complete_box_iou_loss(
+                    pred_boxes_fg_batch, box_targets_fg_batch, reduction='sum'
+                ) / reg_loss_normalizer
+            else:
+                # All foreground anchors were outside their GT boxes - skip regression loss
+                loss_dfl = torch.tensor(0.0, device=device)
+                loss_iou = torch.tensor(0.0, device=device)
         else:
             loss_dfl = torch.tensor(0.0, device=device)
             loss_iou = torch.tensor(0.0, device=device)
@@ -1135,7 +1165,7 @@ def quick_val_iou(
             if debug_prints and batch_idx == 0 and i < 2:
                 print(f"[Debug Eval Img {num_images_processed-1}] GTs: {gt_boxes_tensor.shape[0]}.")
                 print(f"  Num Preds BEFORE NMS (passed score_thresh): {debug_num_preds_before_nms_batch[i]}")
-                print(f"  Num Preds AFTER NMS (final): {num_actual_dets_after_nms_this_img}")
+                print(f"  Num Preds AFTER NMS (final): {num_actual_dets_this_img}")
                 # The problematic debug line that accessed model.head.cls_pred was here and has been removed.
 
             if num_actual_dets_this_img == 0:
@@ -1760,7 +1790,7 @@ def main(argv: List[str] | None = None):
     pa.add_argument('--device', default=None)
     pa.add_argument('--out', default='picodet_v5_int8.onnx')
     pa.add_argument('--no_inplace_head_neck', default=True, action='store_true', help="Disable inplace activations in head/neck")
-    pa.add_argument('--min_box_size', type=int, default=11, help="Minimum pixel width/height for a GT box to be used in training.")
+    pa.add_argument('--min_box_size', type=int, default=8, help="Minimum pixel width/height for a GT box to be used in training.")
     pa.add_argument('--load_from', type=str, default="picodet_50coco.pt", help="Path to a checkpoint to resume or finetune from (e.g., picodet_50coco.pt)")
     pa.add_argument('--data_root', default='test')
     pa.add_argument('--ann', default='test/annotations/instances.json')
@@ -1915,13 +1945,11 @@ def main(argv: List[str] | None = None):
 
     # Curriculum learning, gradually smaller boxes included
     curriculum_schedule = [
-        (18, 24),  # Stage 1: For the first N epochs, only use boxes >= 24x24 pixels.
-        (2, 22),
-        (2, 20),
-        (2, 18),
-        (20, 16),   # Stage 2: For the next 20 epochs
-        (0, cfg.min_box_size)     # Stage 3: For the rest of training, use boxes >= cfg.min_box_size.
-                   # (Epoch count of 0 or a large number signifies 'the rest')
+        (1, 14),   # Epoch 0: boxes >= 14
+        (1, 12),   # Epoch 1: boxes >= 12  
+        (2, 10),   # Epochs 2-3: boxes >= 10
+        (4, 9),    # Epochs 4-7: boxes >= 9
+        (0, cfg.min_box_size),    # Rest: boxes >= 8 (final target)
     ]
     current_stage_idx = 0
     epochs_in_current_stage = 0

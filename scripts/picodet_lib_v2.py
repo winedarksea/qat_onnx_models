@@ -106,47 +106,74 @@ class CSPBlock(nn.Module):
 
 # ───────────────────────────── neck ────────────────────────────────
 class CSPPAN(nn.Module):
+    """CSP-PAN neck that dynamically handles N input feature levels (minimum 2)."""
     def __init__(
             self,
-            in_chs=(40, 112, 160),
-            out_ch=96,  # out_ch=64 would be faster than 96
-            lat_k=5,
+            in_chs: Tuple[int, ...] = (40, 112, 160),
+            out_ch: int = 96,  # out_ch=64 would be faster than 96
+            lat_k: int = 5,
             inplace_act: bool = False,
             act_layer=nn.ReLU6
     ):
         super().__init__()
         self.in_chs = in_chs
-        # self.reduce = nn.ModuleList([GhostConv(c, out_ch, 1, inplace_act=inplace_act) for c in in_chs])
-        self.reduce = nn.ModuleList([
-            GhostConv(in_chs[0], out_ch, 1, inplace_act=inplace_act),  # C3
-            GhostConv(in_chs[1], out_ch, 1, inplace_act=inplace_act),  # C4
-            nn.Sequential(                                             # C5 (plain 1×1)
-                nn.Conv2d(in_chs[2], out_ch, 1, bias=False),
-                nn.BatchNorm2d(out_ch),
-                act_layer(inplace=inplace_act),
-            ),
-        ])  # I think this will not be worth the latency
-        self.lat    = nn.ModuleList([DWConv(out_ch, k=lat_k, inplace_act=inplace_act) for _ in in_chs[:-1]])
-        lst_ly = len(in_chs) - 1
+        self.num_levels = len(in_chs)
+        assert self.num_levels >= 2, f"CSPPAN requires at least 2 feature levels, got {self.num_levels}"
+        
+        # Reduce convs: GhostConv for all but the last level, plain 1x1 for deepest
+        reduce_list = []
+        for i, c in enumerate(in_chs):
+            if i == self.num_levels - 1:  # Last (deepest) level
+                reduce_list.append(nn.Sequential(
+                    nn.Conv2d(c, out_ch, 1, bias=False),
+                    nn.BatchNorm2d(out_ch),
+                    act_layer(inplace=inplace_act),
+                ))
+            else:
+                reduce_list.append(GhostConv(c, out_ch, 1, inplace_act=inplace_act))
+        self.reduce = nn.ModuleList(reduce_list)
+        
+        # Lateral convs for all but the deepest level
+        self.lat = nn.ModuleList([DWConv(out_ch, k=lat_k, inplace_act=inplace_act) for _ in range(self.num_levels - 1)])
+        
+        # Output blocks: deeper levels get more complex CSPBlocks
         self.out = nn.ModuleList([
-            CSPBlock(out_ch, n=2 if i == lst_ly else 1, m_k = 3 if i == lst_ly else 1, inplace_act=inplace_act) for i in range(len(in_chs))
+            CSPBlock(out_ch, n=2 if i == self.num_levels - 1 else 1, 
+                     m_k=3 if i == self.num_levels - 1 else 1, 
+                     inplace_act=inplace_act) 
+            for i in range(self.num_levels)
         ])
 
-    def forward(self, c3, c4, c5):
-        # top-down ------------------------------------------------------------
-        p5 = self.reduce[2](c5)
-        reduced_c4 = self.reduce[1](c4)
-        interpolated_p5 = F.interpolate(p5, scale_factor=2, mode='nearest')
-        p4 = reduced_c4 + interpolated_p5
-        p3 = self.reduce[0](c3) + F.interpolate(p4, scale_factor=2, mode='nearest')
-
-        p4, p3 = self.lat[1](p4), self.lat[0](p3)
-
-        # bottom-up  ---------------------------------------------------------
-        p4 = p4 + F.max_pool2d(p3, 2)
-        p5 = p5 + F.max_pool2d(p4, 2)
-
-        return (self.out[0](p3), self.out[1](p4), self.out[2](p5))
+    def forward(self, features: Tuple[torch.Tensor, ...]) -> Tuple[torch.Tensor, ...]:
+        """
+        Args:
+            features: Tuple of N feature maps from backbone, ordered from shallowest to deepest
+                      (e.g., (C3, C4, C5) or (C2, C3, C4, C5))
+        Returns:
+            Tuple of N processed feature maps (P3, P4, P5, ...) 
+        """
+        # top-down pathway --------------------------------------------------------
+        # Start from deepest feature
+        p = [None] * self.num_levels
+        p[-1] = self.reduce[-1](features[-1])  # Deepest level (e.g., P5)
+        
+        # Propagate top-down
+        for i in range(self.num_levels - 2, -1, -1):  # e.g., for 3 levels: i=1, 0
+            reduced = self.reduce[i](features[i])
+            upsampled = F.interpolate(p[i + 1], scale_factor=2, mode='nearest')
+            p[i] = reduced + upsampled
+        
+        # Apply lateral convs to all but deepest
+        for i in range(self.num_levels - 1):
+            p[i] = self.lat[i](p[i])
+        
+        # bottom-up pathway -------------------------------------------------------
+        for i in range(1, self.num_levels):  # e.g., for 3 levels: i=1, 2
+            p[i] = p[i] + F.max_pool2d(p[i - 1], 2)
+        
+        # Output blocks - build list explicitly for tracing compatibility
+        outputs = [self.out[i](p[i]) for i in range(self.num_levels)]
+        return tuple(outputs)
 
 
 # --- tiny ESE gate ----------------------------------------
@@ -242,9 +269,9 @@ class QualityFocalLoss(nn.Module):
 def build_dfl_targets(offsets: torch.Tensor, reg_max: int) -> torch.Tensor:
     """Soft distribution targets for DFL (Distilled Focal Loss)."""
     # offsets: (N,4)
-    x = offsets.clamp_(0, reg_max)
+    x = offsets.clamp(0, reg_max)  # Non-in-place to avoid mutating caller's tensor
     l = x.floor().long()
-    r = (l + 1).clamp_(max=reg_max)
+    r = (l + 1).clamp(max=reg_max)
     w_r = x - l.float()
     w_l = 1. - w_r
     one_hot_l = F.one_hot(l, reg_max + 1).float() * w_l.unsqueeze(-1)
@@ -273,7 +300,8 @@ class PicoDetHead(nn.Module):
     def __init__(self, num_classes: int = 80,
                  reg_max: int = 8,
                  num_feats: int = 96,
-                 num_levels: int = 3, 
+                 num_levels: int = 3,
+                 strides: Tuple[int, ...] = None,  # If None, defaults to (8, 16, 32) for 3 levels
                  # NMS parameters are stored for use by external NMS/ONNX appending
                  max_det: int = 100, 
                  score_thresh: float = 0.05, 
@@ -294,7 +322,24 @@ class PicoDetHead(nn.Module):
         self.img_size = img_size
         first_cls_conv_k = 3  # 1
 
-        strides_tensor = torch.tensor([8, 16, 32][:num_levels], dtype=torch.float32)
+        # Default strides based on num_levels (common FPN configurations)
+        if strides is None:
+            # Default: stride doubles at each level, starting at 8 for 3 levels
+            # For 3 levels: (8, 16, 32), for 4 levels: (4, 8, 16, 32)
+            default_strides_map = {
+                2: (8, 16),
+                3: (8, 16, 32),
+                4: (4, 8, 16, 32),
+                5: (4, 8, 16, 32, 64),
+            }
+            strides = default_strides_map.get(num_levels)
+            if strides is None:
+                raise ValueError(f"No default strides for num_levels={num_levels}. Please provide explicit strides.")
+        
+        assert len(strides) == num_levels, \
+            f"strides length ({len(strides)}) must match num_levels ({num_levels})"
+        
+        strides_tensor = torch.tensor(strides, dtype=torch.float32)
         self.register_buffer('strides_buffer', strides_tensor, persistent=False)
         
         dfl_project_tensor = torch.arange(self.reg_max + 1, dtype=torch.float32)
@@ -476,7 +521,7 @@ class PicoDetHead(nn.Module):
 
 
 class PicoDet(nn.Module):
-    def __init__(self, backbone: nn.Module, feat_chs: Tuple[int, int, int],
+    def __init__(self, backbone: nn.Module, feat_chs: Tuple[int, ...],
                  num_classes: int = 80,
                  neck_out_ch: int = 96,  # suggestion: 64 if img≤320; 96 if 320 < img≤512; 128 if larger.
                  img_size: int = 224,
@@ -484,6 +529,7 @@ class PicoDet(nn.Module):
                  head_max_det: int = 100, # Will be used by ONNX NMS logic
                  head_score_thresh: float = 0.08, # Will be used by ONNX NMS logic
                  head_nms_iou: float = 0.55, # Will be used by ONNX NMS logic
+                 head_strides: Tuple[int, ...] = None,  # If None, auto-determined by num_levels
                  cls_conv_depth: int = 3,
                  reg_conv_depth: int = 2,
                  lat_k: int = 5,
@@ -493,6 +539,7 @@ class PicoDet(nn.Module):
         self.backbone = backbone
         self.neck = CSPPAN(in_chs=feat_chs, out_ch=neck_out_ch, lat_k=lat_k, inplace_act=inplace_act_for_head_neck)
         num_fpn_levels = len(feat_chs)
+        self.num_fpn_levels = num_fpn_levels
         self.debug_count = 0
         self.img_size = img_size
         
@@ -501,6 +548,7 @@ class PicoDet(nn.Module):
             reg_max=head_reg_max,
             num_feats=neck_out_ch,
             num_levels=num_fpn_levels,
+            strides=head_strides,
             max_det=head_max_det,
             score_thresh=head_score_thresh,
             nms_iou=head_nms_iou,
@@ -513,18 +561,18 @@ class PicoDet(nn.Module):
     def forward(self, x: torch.Tensor):
         x = self.pre(x)
         backbone_features = self.backbone(x)
-        c3, c4, c5 = backbone_features[0], backbone_features[1], backbone_features[2]
-        p3, p4, p5 = self.neck(c3, c4, c5)
+        
+        # Pass backbone features as tuple (not *args) for tracing compatibility
+        neck_outputs = self.neck(backbone_features)
         
         if self.debug_count == 0:
             input_img_h = x.shape[2]
-            print(f"[DEBUG P_STRIDES] Input H: {input_img_h}")
-            print(f"[DEBUG P_STRIDES] P3 shape: {p3.shape}, Actual Stride P3: {input_img_h / p3.shape[2]}")
-            print(f"[DEBUG P_STRIDES] P4 shape: {p4.shape}, Actual Stride P4: {input_img_h / p4.shape[2]}")
-            print(f"[DEBUG P_STRIDES] P5 shape: {p5.shape}, Actual Stride P5: {input_img_h / p5.shape[2]}")
+            print(f"[DEBUG P_STRIDES] Input H: {input_img_h}, Num FPN levels: {self.num_fpn_levels}")
+            for i, p in enumerate(neck_outputs):
+                print(f"[DEBUG P_STRIDES] P{i+3} shape: {p.shape}, Actual Stride: {input_img_h / p.shape[2]}")
             print(f"[DEBUG P_STRIDES] Head expected strides: {self.head.strides_buffer.tolist()}")
             self.debug_count = 1
-        return self.head((p3, p4, p5))
+        return self.head(neck_outputs)
 
 
 class ResizeNorm(nn.Module):
@@ -628,8 +676,19 @@ def pick_nodes_by_stride(model: nn.Module, img_size: int = 256, desired: Tuple[i
 
 
 @torch.no_grad()
-def _get_dynamic_feat_chs(model: nn.Module, img_size: int, device: torch.device) -> Tuple[int, int, int]:
-    # ... (no change to this helper itself, but it relies on 'model' (TVExtractorWrapper or timm model) being correct)
+def _get_dynamic_feat_chs(model: nn.Module, img_size: int, device: torch.device, 
+                          min_features: int = 2) -> Tuple[int, ...]:
+    """Dynamically determine feature channel dimensions from backbone.
+    
+    Args:
+        model: Backbone model that returns a list/tuple of feature tensors
+        img_size: Input image size for dummy forward pass
+        device: Device to run inference on
+        min_features: Minimum expected number of feature levels (default 2)
+    
+    Returns:
+        Tuple of channel dimensions for each feature level
+    """
     model.eval()
     dummy_input = torch.randn(1, 3, img_size, img_size, device=device)
     original_device = next(model.parameters()).device if len(list(model.parameters())) > 0 else 'cpu'
@@ -639,16 +698,18 @@ def _get_dynamic_feat_chs(model: nn.Module, img_size: int, device: torch.device)
     
     model.to(original_device)
     
-    if not isinstance(features, (list, tuple)) or len(features) != 3:
-        # If using pick_nodes_by_stride, the number of features should match len(desired_strides)
-        # that were successfully found and mapped.
-        num_expected_features = 3 # Assuming C3, C4, C5
-        current_len = len(features) if isinstance(features, (list, tuple)) else 0
+    if not isinstance(features, (list, tuple)):
         raise ValueError(
-            f"Backbone expected to return {num_expected_features} feature maps, "
-            f"got {current_len} (type: {type(features)}). "
-            f"This might be due to pick_nodes_by_stride not finding all required feature layers."
+            f"Backbone expected to return list/tuple of feature maps, "
+            f"got {type(features).__name__}"
         )
+    
+    if len(features) < min_features:
+        raise ValueError(
+            f"Backbone expected to return at least {min_features} feature maps, "
+            f"got {len(features)}. Check backbone configuration."
+        )
+    
     return tuple(f.shape[1] for f in features)
 
 
