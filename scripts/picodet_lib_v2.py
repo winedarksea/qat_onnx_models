@@ -8,7 +8,6 @@ import torch, torch.nn as nn, torch.nn.functional as F
 from torchvision.models import mobilenet_v3_small, MobileNet_V3_Small_Weights
 
 from torchvision.models.feature_extraction import create_feature_extractor
-import timm
 
 try:
     folder_to_add_pos = [
@@ -40,16 +39,14 @@ class GhostConv(nn.Module):
             c_out: int,
             k: int = 1,
             s: int = 1,
-            dw_size: int = 3,  # dw_size 5 is maybe a bit slower but more accurate than 3
-            ratio: int = 2,  # 1.5 generally slower, maybe more accurate, 3.0 faster, maybe less accurate
+            dw_size: int = 3,
+            ratio: int = 2,
             inplace_act: bool = False,
-            act_layer = nn.ReLU6,    # ReLU6, HardSwish, SiLU
+            act_layer = nn.ReLU6,
          ):
         super().__init__()
-        self.c_out = c_out # Store c_out
-        init_ch = math.ceil(c_out / ratio)
-        # Ensure init_ch is not greater than c_out, especially if c_out is small.
-        init_ch = min(init_ch, c_out)
+        self.c_out = c_out
+        init_ch = min(math.ceil(c_out / ratio), c_out)
         self.cheap_ch = c_out - init_ch
 
         self.primary = nn.Sequential(
@@ -61,7 +58,7 @@ class GhostConv(nn.Module):
             self.cheap = nn.Sequential(
                 nn.Conv2d(init_ch, self.cheap_ch, dw_size, 1, dw_size // 2,
                           groups=init_ch, bias=False),
-                nn.BatchNorm2d(self.cheap_ch), nn.ReLU6(inplace=inplace_act)  # ReLU6, HardSwish
+                nn.BatchNorm2d(self.cheap_ch), nn.ReLU6(inplace=inplace_act)
             )
         else:
             self.cheap = None
@@ -69,22 +66,16 @@ class GhostConv(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         y_primary = self.primary(x)
         if self.cheap:
-            y_cheap = self.cheap(y_primary)
-            return torch.cat([y_primary, y_cheap], 1)
+            return torch.cat([y_primary, self.cheap(y_primary)], 1)
         return y_primary
 
     @property
     def out_channels(self):
-        # utility to query channels
         return self.primary[0].out_channels + (self.cheap[0].out_channels if self.cheap else 0)
 
 
 class DWConv(nn.Module):
-    def __init__(
-            self, c: int, k: int = 5,  # k=5 for 5x5, 3 for 3x3
-            inplace_act: bool = False,
-            act_layer = nn.ReLU6,  # ReLU6, HardSwish
-    ):
+    def __init__(self, c: int, k: int = 5, inplace_act: bool = False, act_layer=nn.ReLU6):
         super().__init__()
         self.dw = nn.Conv2d(c, c, k, 1, k // 2, groups=c, bias=False)
         self.bn = nn.BatchNorm2d(c)
@@ -99,7 +90,7 @@ class CSPBlock(nn.Module):
         self.cv1 = GhostConv(c, c // 2, 1, inplace_act=inplace_act)
         self.cv2 = GhostConv(c, c // 2, 1, inplace_act=inplace_act)
         self.m = nn.Sequential(*[GhostConv(c // 2, c // 2, k=m_k, inplace_act=inplace_act) for _ in range(n)])
-        self.cv3 = GhostConv(c, c, 1, inplace_act=inplace_act)  # act_layer=nn.HardSwish
+        self.cv3 = GhostConv(c, c, 1, inplace_act=inplace_act)
 
     def forward(self, x):
         return self.cv3(torch.cat((self.m(self.cv1(x)), self.cv2(x)), 1))
@@ -110,7 +101,7 @@ class CSPPAN(nn.Module):
     def __init__(
             self,
             in_chs: Tuple[int, ...] = (40, 112, 160),
-            out_ch: int = 96,  # out_ch=64 would be faster than 96
+            out_ch: int = 96,
             lat_k: int = 5,
             inplace_act: bool = False,
             act_layer=nn.ReLU6
@@ -145,35 +136,21 @@ class CSPPAN(nn.Module):
         ])
 
     def forward(self, features: Tuple[torch.Tensor, ...]) -> Tuple[torch.Tensor, ...]:
-        """
-        Args:
-            features: Tuple of N feature maps from backbone, ordered from shallowest to deepest
-                      (e.g., (C3, C4, C5) or (C2, C3, C4, C5))
-        Returns:
-            Tuple of N processed feature maps (P3, P4, P5, ...) 
-        """
-        # top-down pathway --------------------------------------------------------
-        # Start from deepest feature
+        # top-down pathway
         p = [None] * self.num_levels
-        p[-1] = self.reduce[-1](features[-1])  # Deepest level (e.g., P5)
+        p[-1] = self.reduce[-1](features[-1])
         
-        # Propagate top-down
-        for i in range(self.num_levels - 2, -1, -1):  # e.g., for 3 levels: i=1, 0
-            reduced = self.reduce[i](features[i])
-            upsampled = F.interpolate(p[i + 1], scale_factor=2, mode='nearest')
-            p[i] = reduced + upsampled
+        for i in range(self.num_levels - 2, -1, -1):
+            p[i] = self.reduce[i](features[i]) + F.interpolate(p[i + 1], scale_factor=2, mode='nearest')
         
-        # Apply lateral convs to all but deepest
         for i in range(self.num_levels - 1):
             p[i] = self.lat[i](p[i])
         
-        # bottom-up pathway -------------------------------------------------------
-        for i in range(1, self.num_levels):  # e.g., for 3 levels: i=1, 2
+        # bottom-up pathway
+        for i in range(1, self.num_levels):
             p[i] = p[i] + F.max_pool2d(p[i - 1], 2)
         
-        # Output blocks - build list explicitly for tracing compatibility
-        outputs = [self.out[i](p[i]) for i in range(self.num_levels)]
-        return tuple(outputs)
+        return tuple(self.out[i](p[i]) for i in range(self.num_levels))
 
 
 # --- tiny ESE gate ----------------------------------------
@@ -229,32 +206,9 @@ class QualityFocalLoss(nn.Module):
         self.reduction = reduction
 
     def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        """
-        Calculates the Quality Focal Loss.
-
-        Args:
-            logits (torch.Tensor): The raw, un-sigmoid-ed predictions from the model.
-                                   Shape: (N, C) or any other shape.
-            targets (torch.Tensor): The quality targets, which are typically a tensor of the
-                                    same shape as logits. For positive classes, the target
-                                    is the IoU score (0-1). For negative classes, it's 0.
-
-        Returns:
-            torch.Tensor: The calculated loss, summed over all elements.
-        """
-        # For numerical stability, use PyTorch's built-in function
-        # which combines sigmoid and BCE, and works with raw logits.
         bce_loss = F.binary_cross_entropy_with_logits(logits, targets, reduction='none')
-
-        # The predicted scores (sigma) are needed for the modulating factor.
-        # This is the only place we need the sigmoid output.
         pred_scores = torch.sigmoid(logits).clamp(1e-4, 1 - 1e-4)
-
-        # The modulating factor is based on the absolute difference between
-        # the target quality (y) and the predicted score (sigma).
         modulating_factor = (targets - pred_scores).abs().pow(self.beta)
-
-        # The final loss is the element-wise product of the modulating factor and BCE loss.
         loss = modulating_factor * bce_loss
 
         if self.reduction == 'sum':
@@ -267,9 +221,8 @@ class QualityFocalLoss(nn.Module):
             raise ValueError(f"unrecognized reduction {self.reduction}")
 
 def build_dfl_targets(offsets: torch.Tensor, reg_max: int) -> torch.Tensor:
-    """Soft distribution targets for DFL (Distilled Focal Loss)."""
-    # offsets: (N,4)
-    x = offsets.clamp(0, reg_max)  # Non-in-place to avoid mutating caller's tensor
+    """Soft distribution targets for DFL."""
+    x = offsets.clamp(0, reg_max)
     l = x.floor().long()
     r = (l + 1).clamp(max=reg_max)
     w_r = x - l.float()
@@ -280,20 +233,12 @@ def build_dfl_targets(offsets: torch.Tensor, reg_max: int) -> torch.Tensor:
 
 
 def dfl_loss(pred_logits, target_dist, eps: float = 1e-7):
-    """
-    pred_logits : (N*4, M+1)  raw logits
-    target_dist : (N,4,M+1)   soft distribution from build_dfl_targets
-    """
-    n, _, K = target_dist.shape                          # K = M+1
+    """DFL loss using KL-divergence."""
+    n, _, K = target_dist.shape
     pred = pred_logits.view(n * 4, K)
-    tgt  = target_dist.view(n * 4, K)
-    # 1.  Clamp targets so log(·) is defined and sum ≈ 1
-    tgt = tgt.clamp_min(eps)
+    tgt = target_dist.view(n * 4, K).clamp_min(eps)
     tgt = tgt / tgt.sum(dim=1, keepdim=True)
-    # 2.  log-probabilities of the prediction
-    logp = F.log_softmax(pred, dim=1)
-    # 3.  KL-divergence, normalised per *box* (not per batch)
-    return F.kl_div(logp, tgt, reduction='batchmean', log_target=False)
+    return F.kl_div(F.log_softmax(pred, dim=1), tgt, reduction='batchmean', log_target=False)
 
 
 class PicoDetHead(nn.Module):
@@ -301,8 +246,7 @@ class PicoDetHead(nn.Module):
                  reg_max: int = 8,
                  num_feats: int = 96,
                  num_levels: int = 3,
-                 strides: Tuple[int, ...] = None,  # If None, defaults to (8, 16, 32) for 3 levels
-                 # NMS parameters are stored for use by external NMS/ONNX appending
+                 strides: Tuple[int, ...] = None,
                  max_det: int = 100, 
                  score_thresh: float = 0.05, 
                  nms_iou: float = 0.6,
@@ -320,12 +264,9 @@ class PicoDetHead(nn.Module):
         self.reg_conv_depth = reg_conv_depth
         self.cls_conv_depth = cls_conv_depth
         self.img_size = img_size
-        first_cls_conv_k = 3  # 1
+        first_cls_conv_k = 3
 
-        # Default strides based on num_levels (common FPN configurations)
         if strides is None:
-            # Default: stride doubles at each level, starting at 8 for 3 levels
-            # For 3 levels: (8, 16, 32), for 4 levels: (4, 8, 16, 32)
             default_strides_map = {
                 2: (8, 16),
                 3: (8, 16, 32),
@@ -356,15 +297,10 @@ class PicoDetHead(nn.Module):
             )
         self.reg_conv = nn.Sequential(*[GhostConv(num_feats, num_feats, ratio=2.0, inplace_act=inplace_act) for _ in range(self.reg_conv_depth)])
         self.cls_pred = nn.ModuleList([nn.Conv2d(num_feats, self.nc, 1) for _ in range(self.nl)])
-        # self.obj_pred = nn.ModuleList([nn.Conv2d(num_feats, 1, 1) for _ in range(self.nl)])
         self.reg_pred = nn.ModuleList(
             [nn.Conv2d(num_feats, 4 * (self.reg_max + 1), 1) for _ in range(self.nl)]
         )
-        
         self.cls_ese = nn.ModuleList([ESE(num_feats) for _ in range(self.nl)])
-
-        # Initialized to 1.0 to match the original additive behavior at the start.
-        # self.logit_scale = nn.Parameter(torch.ones(1), requires_grad=True)
         self._initialize_biases()
 
         for i in range(self.nl):
@@ -378,25 +314,19 @@ class PicoDetHead(nn.Module):
             )
             grid = torch.stack((xv, yv), dim=2).reshape(H_level * W_level, 2)
             anchor_points_center = (grid + 0.5) * s
-            # _anchor_points_centers_list.append(anchor_points_center) # Not strictly needed if directly registering
             self.register_buffer(f'anchor_points_level_{i}', anchor_points_center, persistent=False)
 
     def _initialize_biases(self):
-    
-        # ---- class branch - more conservative to reduce false positives ----
-        cls_prior = 0.02  # Reduced from 0.05 to make model less confident initially
-        cls_bias  = -math.log((1-cls_prior)/cls_prior)
+        cls_prior = 0.02
+        cls_bias = -math.log((1 - cls_prior) / cls_prior)
         for conv in self.cls_pred:
             nn.init.constant_(conv.bias, cls_bias)
     
-        # ---- regression branch ----
         peak_prob = 0.90
-        delta = math.log((peak_prob / (1 - peak_prob)))
-    
+        delta = math.log(peak_prob / (1 - peak_prob))
         pattern = torch.zeros(4 * (self.reg_max + 1), device=self.cls_pred[0].weight.device)
-        for i in range(4):                       # l, t, r, b
+        for i in range(4):
             pattern[i * (self.reg_max + 1)] = delta
-    
         for conv in self.reg_pred:
             nn.init.zeros_(conv.weight)
             conv.bias.data.copy_(pattern)
@@ -433,7 +363,7 @@ class PicoDetHead(nn.Module):
 
     def _decode_predictions_for_level(
         self,
-        cls_logit: torch.Tensor, reg_logit: torch.Tensor,  # obj_logit: torch.Tensor, 
+        cls_logit: torch.Tensor, reg_logit: torch.Tensor,
         level_idx: int
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         B, _, H_feat, W_feat = cls_logit.shape
@@ -442,22 +372,19 @@ class PicoDetHead(nn.Module):
         cls_logit_perm = cls_logit.permute(0,2,3,1).reshape(B, H_feat*W_feat, self.nc)
         scores = cls_logit_perm.sigmoid()
         
-        # Early score filtering for inference speed - only decode boxes for promising predictions
-        max_scores = scores.max(dim=-1).values  # (B, H_feat*W_feat)
-        score_threshold = 0.01  # Lower threshold for early filtering
-        keep_mask = max_scores > score_threshold  # (B, H_feat*W_feat)
-
-        # Always keep at least the strongest anchor per image to avoid empty outputs
+        max_scores = scores.max(dim=-1).values
+        score_threshold = 0.01
+        keep_mask = max_scores > score_threshold
         fallback_max = max_scores.max(dim=1, keepdim=True).values
         keep_mask = keep_mask | (max_scores == fallback_max)
 
-        # If all scores are too low (extremely unlikely after fallback), return zeros safely
         if not keep_mask.any():
-            empty_boxes = torch.zeros(B, H_feat*W_feat, 4, device=cls_logit.device, dtype=cls_logit.dtype)
-            empty_scores = scores.new_zeros(B, H_feat*W_feat, self.nc)
-            return empty_boxes, empty_scores
+            return (
+                torch.zeros(B, H_feat*W_feat, 4, device=cls_logit.device, dtype=cls_logit.dtype),
+                scores.new_zeros(B, H_feat*W_feat, self.nc)
+            )
 
-        # build grid *on the fly* so it always matches H_feat,W_feat
+        # Build grid on the fly
         yv, xv = torch.meshgrid(
             torch.arange(H_feat, device=cls_logit.device),
             torch.arange(W_feat, device=cls_logit.device),
@@ -482,54 +409,41 @@ class PicoDetHead(nn.Module):
 
     def forward(self, neck_feature_maps: Tuple[torch.Tensor, ...]):
         raw_cls_logits_levels: List[torch.Tensor] = []
-        # raw_obj_logits_levels: List[torch.Tensor] = []
         raw_reg_logits_levels: List[torch.Tensor] = []
 
         for i, f_map_level in enumerate(neck_feature_maps):
-            cls_common_feat = self.cls_conv(f_map_level)
-            reg_common_feat = self.reg_conv(f_map_level)
-
-            cls_common_feat = self.cls_ese[i](cls_common_feat)
+            cls_common_feat = self.cls_ese[i](self.cls_conv(f_map_level))
             raw_cls_logits_levels.append(self.cls_pred[i](cls_common_feat))
-
-            # raw_obj_logits_levels.append(self.obj_pred[i](cls_common_feat))
-            raw_reg_logits_levels.append(self.reg_pred[i](reg_common_feat))
-
+            raw_reg_logits_levels.append(self.reg_pred[i](self.reg_conv(f_map_level)))
 
         if self.training:
-            strides_outputs_list = [self.strides_buffer[i] for i in range(self.nl)] # List[Tensor]
-
             return (
                 tuple(raw_cls_logits_levels),
-                # tuple(raw_obj_logits_levels),
                 tuple(raw_reg_logits_levels),
-                tuple(strides_outputs_list)
+                tuple(self.strides_buffer[i] for i in range(self.nl))
             )
-        else: # Inference path
+        else:
             decoded_boxes_all_levels: List[torch.Tensor] = []
             decoded_scores_all_levels: List[torch.Tensor] = []
             for i in range(self.nl):
-                # cls_l, obj_l, reg_l = raw_cls_logits_levels[i], raw_obj_logits_levels[i], raw_reg_logits_levels[i]
-                # boxes_level, scores_level = self._decode_predictions_for_level(cls_l, obj_l, reg_l, i)
-                cls_l, reg_l = raw_cls_logits_levels[i], raw_reg_logits_levels[i]
-                boxes_level, scores_level = self._decode_predictions_for_level(cls_l, reg_l, i)
+                boxes_level, scores_level = self._decode_predictions_for_level(
+                    raw_cls_logits_levels[i], raw_reg_logits_levels[i], i
+                )
                 decoded_boxes_all_levels.append(boxes_level)
                 decoded_scores_all_levels.append(scores_level)
-            batched_all_boxes = torch.cat(decoded_boxes_all_levels, dim=1)
-            batched_all_scores = torch.cat(decoded_scores_all_levels, dim=1)
-            return batched_all_boxes, batched_all_scores
+            return torch.cat(decoded_boxes_all_levels, dim=1), torch.cat(decoded_scores_all_levels, dim=1)
 
 
 class PicoDet(nn.Module):
     def __init__(self, backbone: nn.Module, feat_chs: Tuple[int, ...],
                  num_classes: int = 80,
-                 neck_out_ch: int = 96,  # suggestion: 64 if img≤320; 96 if 320 < img≤512; 128 if larger.
+                 neck_out_ch: int = 96,
                  img_size: int = 224,
-                 head_reg_max: int = 8,  # suggestion: 256 px → 7/8, 320 px → 11, 640 px → 15 or 16
-                 head_max_det: int = 100, # Will be used by ONNX NMS logic
-                 head_score_thresh: float = 0.08, # Will be used by ONNX NMS logic
-                 head_nms_iou: float = 0.55, # Will be used by ONNX NMS logic
-                 head_strides: Tuple[int, ...] = None,  # If None, auto-determined by num_levels
+                 head_reg_max: int = 8,
+                 head_max_det: int = 100,
+                 head_score_thresh: float = 0.08,
+                 head_nms_iou: float = 0.55,
+                 head_strides: Tuple[int, ...] = None,
                  cls_conv_depth: int = 3,
                  reg_conv_depth: int = 2,
                  lat_k: int = 5,
@@ -540,7 +454,6 @@ class PicoDet(nn.Module):
         self.neck = CSPPAN(in_chs=feat_chs, out_ch=neck_out_ch, lat_k=lat_k, inplace_act=inplace_act_for_head_neck)
         num_fpn_levels = len(feat_chs)
         self.num_fpn_levels = num_fpn_levels
-        self.debug_count = 0
         self.img_size = img_size
         
         self.head = PicoDetHead(
@@ -561,17 +474,7 @@ class PicoDet(nn.Module):
     def forward(self, x: torch.Tensor):
         x = self.pre(x)
         backbone_features = self.backbone(x)
-        
-        # Pass backbone features as tuple (not *args) for tracing compatibility
         neck_outputs = self.neck(backbone_features)
-        
-        if self.debug_count == 0:
-            input_img_h = x.shape[2]
-            print(f"[DEBUG P_STRIDES] Input H: {input_img_h}, Num FPN levels: {self.num_fpn_levels}")
-            for i, p in enumerate(neck_outputs):
-                print(f"[DEBUG P_STRIDES] P{i+3} shape: {p.shape}, Actual Stride: {input_img_h / p.shape[2]}")
-            print(f"[DEBUG P_STRIDES] Head expected strides: {self.head.strides_buffer.tolist()}")
-            self.debug_count = 1
         return self.head(neck_outputs)
 
 
@@ -584,39 +487,30 @@ class ResizeNorm(nn.Module):
         self.register_buffer('s', torch.tensor(std).view(1, 3, 1, 1))
 
     def forward(self, x: torch.Tensor):
-
         x_float_scaled = x.float() / 255.0
-
-        # Interpolation, faster if antialias=False
-        x_resized = F.interpolate(x_float_scaled, self.size, mode='bilinear', align_corners=False, antialias=False) # antialias=False for speed/simplicity
-
-        # Normalization (mean/std)
+        x_resized = F.interpolate(x_float_scaled, self.size, mode='bilinear', align_corners=False, antialias=False)
         return (x_resized - self.m) / self.s
 
 
 # ───────────────────────── backbone util ──────────────────────────
-# Helper to wrap torchvision's create_feature_extractor to output a list
 class TVExtractorWrapper(nn.Module):
     def __init__(self, base_model: nn.Module, return_nodes_dict: dict):
         super().__init__()
         self.extractor = create_feature_extractor(base_model, return_nodes_dict)
         self.output_keys = list(return_nodes_dict.values())
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]: # Changed to Tuple
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, ...]:
         feature_dict = self.extractor(x)
-        # Assuming 3 features are always returned, otherwise adjust Tuple annotation
-        return tuple(feature_dict[key] for key in self.output_keys) # Return as tuple
+        return tuple(feature_dict[key] for key in self.output_keys)
 
 def pick_nodes_by_stride(model: nn.Module, img_size: int = 256, desired: Tuple[int, ...] = (8, 16, 32)) -> dict:
     tmp = {}
-    # Ensure model is on the correct device for the dummy forward pass
     device = next(model.parameters()).device if len(list(model.parameters())) > 0 else torch.device('cpu')
     
     hooks = [m.register_forward_hook(
-        lambda mod, inp, out, n=name: tmp.setdefault(n, out.detach().clone().cpu())) # Detach, clone, move to CPU to save GPU mem
+        lambda mod, inp, out, n=name: tmp.setdefault(n, out.detach().clone().cpu()))
              for name, m in model.named_modules()]
     
-    # Perform dummy forward pass
     model.eval()
     try:
         model(torch.randn(1, 3, img_size, img_size, device=device))
@@ -626,41 +520,22 @@ def pick_nodes_by_stride(model: nn.Module, img_size: int = 256, desired: Tuple[i
 
     H_in = img_size
     stride_to_name = {}
-    # Sort tmp by length of name to prefer shorter, higher-level module names if multiple have same feature shape
-    # Or sort by some other heuristic if needed, e.g. depth in the network. For now, simple iteration.
     sorted_items = sorted(tmp.items(), key=lambda x: len(x[0]))
 
     for name, feat_tensor in sorted_items:
-        if not isinstance(feat_tensor, torch.Tensor) or feat_tensor.ndim < 4: # Basic check for valid feature map
+        if not isinstance(feat_tensor, torch.Tensor) or feat_tensor.ndim < 4:
             continue
-        
-        # Check if feature map height is a divisor of input height
         if H_in % feat_tensor.shape[-2] == 0:
-            stride = H_in // feat_tensor.shape[-2] # H and W are assumed equal after square resize
-            if stride in desired and stride not in stride_to_name:
-                # Basic check to avoid picking trivial layers like initial stem conv if not intended
-                # This heuristic might need adjustment depending on the backbone.
-                # Here, we assume a feature map is "significant" if its channel count isn't tiny.
-                # For MobileNetV3-Small, stride 8 has 24 channels, stride 16 has 40, stride 32 has 576 (before final classifier)
-                # The features.12 (last conv before pooling/classifier in mnv3) is what we want for C5.
-                # Heuristic: pick module if it's not too shallow (e.g. name contains a certain depth)
-                # or if it's a common pattern like 'features.X'
-                if '.' in name: # Prefer modules with some depth in their name
-                    stride_to_name[stride] = name
+            stride = H_in // feat_tensor.shape[-2]
+            if stride in desired and stride not in stride_to_name and '.' in name:
+                stride_to_name[stride] = name
     
     if len(stride_to_name) != len(desired):
         warnings.warn(
             f"pick_nodes_by_stride: Could not find all desired strides {desired}. "
-            f"Found: {stride_to_name}. Check backbone structure or adjust selection logic."
+            f"Found: {stride_to_name}."
         )
-        # Potentially return a partial map or raise an error, or fallback
-        # For now, let's allow partial if user wants to debug
 
-    # Map found strides to C3, C4, C5 based on sorted stride values
-    # Example: if desired=(8,16,32), then stride 8 -> C3, 16 -> C4, 32 -> C5
-    # sorted_found_strides = sorted(s for s in desired if s in stride_to_name) # Strides that were actually found
-    
-    # Ensure desired strides are present before trying to map them
     final_return_nodes = {}
     map_idx_to_c_label = {s_val: f"C{i+3}" for i, s_val in enumerate(sorted(list(desired)))}
 
@@ -669,8 +544,6 @@ def pick_nodes_by_stride(model: nn.Module, img_size: int = 256, desired: Tuple[i
             final_return_nodes[stride_to_name[s_val]] = map_idx_to_c_label[s_val]
         else:
             warnings.warn(f"Desired stride {s_val} not found by pick_nodes_by_stride.")
-            # Optionally, you could add a fallback here to hardcoded values if a stride is missing.
-            # e.g., if s_val == 8: final_return_nodes['fallback_name_for_s8'] = 'C3'
 
     return final_return_nodes
 
@@ -678,17 +551,7 @@ def pick_nodes_by_stride(model: nn.Module, img_size: int = 256, desired: Tuple[i
 @torch.no_grad()
 def _get_dynamic_feat_chs(model: nn.Module, img_size: int, device: torch.device, 
                           min_features: int = 2) -> Tuple[int, ...]:
-    """Dynamically determine feature channel dimensions from backbone.
-    
-    Args:
-        model: Backbone model that returns a list/tuple of feature tensors
-        img_size: Input image size for dummy forward pass
-        device: Device to run inference on
-        min_features: Minimum expected number of feature levels (default 2)
-    
-    Returns:
-        Tuple of channel dimensions for each feature level
-    """
+    """Dynamically determine feature channel dimensions from backbone."""
     model.eval()
     dummy_input = torch.randn(1, 3, img_size, img_size, device=device)
     original_device = next(model.parameters()).device if len(list(model.parameters())) > 0 else 'cpu'
@@ -721,41 +584,26 @@ def get_backbone(arch: str, ckpt: str | None, img_size: int = 224):
     if arch == "mnv3":
         weights = MobileNet_V3_Small_Weights.IMAGENET1K_V1 if pretrained else None
         base = mobilenet_v3_small(weights=weights, width_mult=1.0)
-        base.to(temp_device_for_init) # Move base model to device for pick_nodes_by_stride
+        base.to(temp_device_for_init)
 
-        # Use the helper function to get return_nodes
-        # It's important that 'base' is the nn.Module whose layer names are being sought.
         desired_strides_tuple = (8, 16, 32)
         return_nodes = pick_nodes_by_stride(base, img_size=img_size, desired=desired_strides_tuple)
-        
-        base.cpu() # Move back to CPU if it was on temp_device for pick_nodes
+        base.cpu()
 
         if len(return_nodes) != len(desired_strides_tuple):
-            warnings.warn(
-                f"pick_nodes_by_stride for '{arch}' did not find all {len(desired_strides_tuple)} desired strides. "
-                f"Found nodes for: {list(return_nodes.values())}. Falling back to hardcoded defaults for '{arch}'."
-            )
-            # Fallback to original hardcoded nodes if auto-detection fails
-            # (Ensure these hardcoded names are correct for the version of torchvision being used)
-            return_nodes = {
-                'features.3': 'C3',  # Stride 8
-                'features.6': 'C4',  # Stride 16
-                'features.12': 'C5', # Stride 32 (output of the last ConvBN in the 'features' sequence)
-            }
+            warnings.warn(f"pick_nodes_by_stride for '{arch}' failed. Using hardcoded defaults.")
+            return_nodes = {'features.3': 'C3', 'features.6': 'C4', 'features.12': 'C5'}
         
         print(f"[INFO] Using return_nodes for {arch}: {return_nodes}")
 
-        net = TVExtractorWrapper(base, return_nodes) # Wrap the original base model
+        net = TVExtractorWrapper(base, return_nodes)
         feat_chs = _get_dynamic_feat_chs(net, img_size, temp_device_for_init)
         
-        # Checkpoint loading for mnv3 (for 'base' model)
         if ckpt is not None and not pretrained:
             sd = torch.load(ckpt, map_location='cpu')
-            # Load into base model (net.extractor.model is 'base')
             missing, unexpected = base.load_state_dict(sd, strict=False)
             if missing: warnings.warn(f'Missing keys in base model ckpt ({arch}): {missing}')
             if unexpected: warnings.warn(f'Unexpected keys in base model ckpt ({arch}): {unexpected}')
-            # Re-calculate feat_chs might be needed if ckpt changed arch details, though unlikely for channels
             feat_chs = _get_dynamic_feat_chs(net, img_size, temp_device_for_init)
 
     elif arch == "mnv4c-s":
@@ -773,7 +621,7 @@ def get_backbone(arch: str, ckpt: str | None, img_size: int = 224):
         net = MobileNetV4(
             variant='conv_m',
             width_multiplier=1.0,
-            out_features_names=['p2_s4', 'p3_s8', 'p4_s16', 'p5_s32'],  # might break without CSPPAN change
+            out_features_names=['p2_s4', 'p3_s8', 'p4_s16', 'p5_s32'],
             features_only=True,
         )
         feature_info = net.get_feature_info()
@@ -791,18 +639,15 @@ def get_backbone(arch: str, ckpt: str | None, img_size: int = 224):
         feat_chs = tuple(info['num_chs'] for info in feature_info)
         print(f"[INFO] Detected feature channels: {feat_chs} for {arch}")
         ckpt = f"mobilenet_w1_0_{arch}_pretrained_drp0_2_fp32_backbone.pt"
-    elif arch == "mnv4c":  # older but still functional
+    elif arch == "mnv4c":
         if MobileNetV4ConvSmallPico is None:
-            raise ImportError("Cannot create 'mnv4_custom' backbone. `customMobilenetNetv4.py` not found or failed to import.")
+            raise ImportError("Cannot create 'mnv4_custom' backbone. `customMobilenetNetv4.py` not found.")
         
         print("[INFO] Creating custom MobileNetV4-Small backbone for PicoDet.")
-        
-        # Define the feature levels we want, corresponding to strides 8, 16, 32
-        # The custom model's _DEFAULT_FEATURE_INDICES makes this easy and reliable.
         feature_indices = (
-            MobileNetV4ConvSmallPico._DEFAULT_FEATURE_INDICES['p3_s8'],  # Block index for stride 8
-            MobileNetV4ConvSmallPico._DEFAULT_FEATURE_INDICES['p4_s16'], # Block index for stride 16
-            MobileNetV4ConvSmallPico._DEFAULT_FEATURE_INDICES['p5_s32'], # Block index for stride 32
+            MobileNetV4ConvSmallPico._DEFAULT_FEATURE_INDICES['p3_s8'],
+            MobileNetV4ConvSmallPico._DEFAULT_FEATURE_INDICES['p4_s16'],
+            MobileNetV4ConvSmallPico._DEFAULT_FEATURE_INDICES['p5_s32'],
         )
 
         net = MobileNetV4ConvSmallPico(

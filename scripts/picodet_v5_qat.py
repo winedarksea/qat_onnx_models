@@ -889,11 +889,10 @@ def train_epoch(
                 # With inside filtering, LTRB should always be >= 0. Clamp is a safety net.
                 dfl_target = build_dfl_targets(ltrb_offsets.clamp(0, head_reg_max_for_loss), head_reg_max_for_loss)
 
-                # DFL loss normalization: dfl_loss returns batchmean (sum/(N_fg*4))
-                # Multiply by 4 to get per-anchor normalization for consistency with other losses
-                # Use num_inside for normalization since we filtered to only inside anchors
-                reg_loss_normalizer = num_inside if num_inside > 0 else 1
-                loss_dfl = dfl_loss(reg_p_fg_batch, dfl_target) * 4.0
+                # DFL loss normalization: dfl_loss returns batchmean (sum/(num_inside*4))
+                # Multiply by 4, then scale by num_inside/loss_normalizer to match cls normalization
+                # This way filtered-out anchors contribute 0 but count in the denominator
+                loss_dfl = dfl_loss(reg_p_fg_batch, dfl_target) * 4.0 * (num_inside / loss_normalizer)
                 
                 pred_ltrb_fg = PicoDetHead.dfl_decode_for_training(
                     reg_p_fg_batch, dfl_project_buffer_for_decode.to(device), head_reg_max_for_loss
@@ -904,9 +903,10 @@ def train_epoch(
                     anchor_centers_fg_batch[:, 0] + pred_ltrb_fg[:, 2],
                     anchor_centers_fg_batch[:, 1] + pred_ltrb_fg[:, 3],
                 ), dim=1)
+                # Normalize IoU loss by loss_normalizer (not num_inside) to match cls normalization
                 loss_iou = tvops.complete_box_iou_loss(
                     pred_boxes_fg_batch, box_targets_fg_batch, reduction='sum'
-                ) / reg_loss_normalizer
+                ) / loss_normalizer
             else:
                 # All foreground anchors were outside their GT boxes - skip regression loss
                 loss_dfl = torch.tensor(0.0, device=device)
