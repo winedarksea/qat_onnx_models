@@ -15,7 +15,6 @@ from pathlib import Path
 import torch, torch.nn as nn, torch.optim as optim
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 import torchvision.transforms.v2 as T_v2
-from torchvision.transforms.v2 import MixUp, CutMix
 import torchvision.models as tvm
 import torchvision.datasets as dsets
 from torchvision.io import read_image, ImageReadMode
@@ -34,10 +33,8 @@ warnings.filterwarnings(
 )
 
 try:
-    # folder_to_add = r"/Users/colincatlin/Documents-NoCloud/qat_onnx_models/scripts" 
-    folder_to_add = r"C:\Users\Colin\qat_onnx_models\scripts"
-    # folder_to_add = r"/home/colin/img_data"
-    # folder_to_add = r"/home/colin/qat_onnx_models/scripts"
+    # Prefer a repo-relative import path so this script works on any OS.
+    folder_to_add = str(Path(__file__).resolve().parent)
     # Check if the path and file exist before trying to add to sys.path and import
     custom_module_path = os.path.join(folder_to_add, "customMobilenetNetv4.py")
     if os.path.exists(custom_module_path):
@@ -63,17 +60,20 @@ random.seed(SEED); torch.manual_seed(SEED)
 _CNL = lambda d: (d.type == "cuda")
 
 # ─────────────────────────── transforms ──────────────────────────
+TRAIN_CROP_SCALE = (0.80, 1.0)  # more conservative crops work better here
+RESIZE_ANTIALIAS = False        # match ONNX Resize behavior
+
 def _build_tf(train: bool):
     if train:
         return T_v2.Compose([
-            T_v2.RandomResizedCrop((IMG_SIZE, IMG_SIZE), scale=(0.67, 1.0), antialias=True),
+            T_v2.RandomResizedCrop((IMG_SIZE, IMG_SIZE), scale=TRAIN_CROP_SCALE, antialias=RESIZE_ANTIALIAS),
             T_v2.RandomHorizontalFlip(),
             T_v2.TrivialAugmentWide(),
             T_v2.ToDtype(torch.uint8, scale=False)
         ])
     else: # Validation (train=False)
         return T_v2.Compose([
-            T_v2.Resize((IMG_SIZE, IMG_SIZE), antialias=True),
+            T_v2.Resize((IMG_SIZE, IMG_SIZE), antialias=RESIZE_ANTIALIAS),
             T_v2.ToDtype(torch.uint8, scale=False)
         ])
 
@@ -375,25 +375,44 @@ def build_model(
     return model
 
 # ───────────────────── training helpers ─────────────────────────
-def train_epoch(model, loader, crit, opt, scaler, dev, ep, qat_mode_active:bool = False, mixup_fn=None):
+class ExponentialMovingAverage:
+    def __init__(self, model: nn.Module, decay: float = 0.9999):
+        self.decay = float(decay)
+        self.ema = copy.deepcopy(model).eval()
+        for p in self.ema.parameters():
+            p.requires_grad_(False)
+
+    @torch.no_grad()
+    def update(self, model: nn.Module):
+        ema_sd = self.ema.state_dict()
+        model_sd = model.state_dict()
+        for k, v in ema_sd.items():
+            mv = model_sd[k]
+            if v.dtype.is_floating_point:
+                v.mul_(self.decay).add_(mv.detach(), alpha=1.0 - self.decay)
+            else:
+                v.copy_(mv)
+
+
+def train_epoch(model, loader, crit, opt, scaler, dev, ep, qat_mode_active:bool = False, ema: ExponentialMovingAverage | None = None):
     model.train(); tot = loss_sum = 0
     for i, (img, lab) in enumerate(loader): # Consider adding tqdm here for progress
         img = img.to(dev, non_blocking=True,
                      memory_format=torch.channels_last if _CNL(dev) else torch.contiguous_format)
         lab = lab.to(dev, non_blocking=True)
-        # Apply MixUp/CutMix if provided
-        if mixup_fn and not qat_mode_active: # Usually not applied during QAT fine-tuning
-            # T_v2 MixUp/CutMix expect labels to be one-hotted if not already
-            img, lab = mixup_fn(img, lab) # lab will now be soft labels
         opt.zero_grad(set_to_none=True)
 
         if not qat_mode_active and dev.type == "cuda":
             with autocast(device_type=dev.type, enabled=True):
-                out = model(img); loss = crit(out, lab)
+                out = model(img)
+                loss = crit(out, lab)
             scaler.scale(loss).backward(); scaler.step(opt); scaler.update()
         else:
-            out = model(img); loss = crit(out, lab)
+            out = model(img)
+            loss = crit(out, lab)
             loss.backward(); opt.step()
+        if ema is not None and not qat_mode_active:
+            ema.update(model)
 
         tot += img.size(0); loss_sum += loss.item() * img.size(0)
         if i == 0 and ep == 0: # First batch of first epoch
@@ -483,6 +502,10 @@ device_arg = None
 arch: str = "conv_s" # Change to "mnv2", "mnv3", "mnv3l", "mnv4s", "mnv4m", "mnv4c" as needed
 pretrained: bool = True # Using pretrained weights for FP32 start
 drop_rate: float = 0.2
+drop_path_rate: float = 0.05  # train-time only; no inference cost
+
+use_ema: bool = True
+ema_decay: float = 0.9999
 
 if device_arg is None:
     device_name = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
@@ -540,10 +563,17 @@ print(f"[INFO] #classes = {ncls}")
 tr = get_loader(data_dir, batch, True, dev)
 vl = get_loader(data_dir, batch, False, dev)
 
-model = build_model(ncls, width_mult, dev, arch=arch, pretrained=pretrained, drop_rate=drop_rate)
+model = build_model(
+    ncls, width_mult, dev,
+    arch=arch,
+    pretrained=pretrained,
+    drop_rate=drop_rate,
+    drop_path_rate=drop_path_rate,
+)
 # load_backbone_from_checkpoint(model, f"{output_base_name}_fp32_backbone.pt")
 
-crit = nn.CrossEntropyLoss(label_smoothing=0.1)
+label_smoothing: float = 0.1
+crit = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
 scaler = torch.amp.GradScaler(enabled=(dev.type == "cuda")) # torch.compile may not like scaler with fullgraph
 
 stock_trainer = False
@@ -600,25 +630,23 @@ else:
     )
 
 print("[INFO] Starting FP32 training...")
-# if used, operate on batches, pass to mixup_fn
-mixup_or_cutmix = T_v2.RandomChoice([
-    MixUp(alpha=0.2, num_classes=ncls),
-    CutMix(alpha=1.0, num_classes=ncls)
-])
+ema = ExponentialMovingAverage(model, decay=ema_decay) if use_ema else None
+
 for ep in range(epochs):
-    l = train_epoch(model, tr, crit, opt, scaler, dev, ep, qat_mode_active=False, mixup_fn=None)
-    a = evaluate(model, vl, dev)
+    l = train_epoch(model, tr, crit, opt, scaler, dev, ep, qat_mode_active=False, ema=ema)
+    eval_model = ema.ema if ema is not None else model
+    a = evaluate(eval_model, vl, dev)
     sched.step()
     print(f"FP32 Epoch {ep+1}/{epochs}  loss {l:.4f}  val@1 {a*100:.2f}%  lr {opt.param_groups[0]['lr']:.5f}")
     if ep % 50 == 0:
         try:
-            save_backbone(model,  output_base_name, dev)
+            save_backbone(eval_model,  output_base_name, dev)
         except Exception as e:
             print("failed to export fp32 backbone: " + repr(e))
 
 # save raw training for loading into object detector on same backbone
 try:
-    save_backbone(model,  output_base_name, dev)
+    save_backbone(ema.ema if ema is not None else model,  output_base_name, dev)
 except Exception as e:
     print("failed to export fp32 backbone: " + repr(e))
 
@@ -627,7 +655,7 @@ try:
     path = output_base_name + "fp32_onnx.onnx"
     dummy_input_onnx_cpu = torch.randint(0, 256, (1, 3, IMG_SIZE, IMG_SIZE), dtype=torch.uint8)
     torch.onnx.export(
-        model.cpu().eval(),
+        (ema.ema if ema is not None else model).cpu().eval(),
         (dummy_input_onnx_cpu,),
         path,
         input_names=["input_u8"],
@@ -652,7 +680,7 @@ backend_config = get_native_backend_config() # For fusion patterns
 
 # 1. Create a CPU copy of the FP32-trained model FOR QAT PREPARATION
 #    Make sure it's a deepcopy to avoid altering the original FP32 model.
-model_for_qat_prep = copy.deepcopy(model).cpu()
+model_for_qat_prep = copy.deepcopy(ema.ema if ema is not None else model).cpu()
 model_for_qat_prep.train() # IMPORTANT: Set to TRAIN mode for prepare_qat_fx
 
 # 2. Define example inputs for tracing.
@@ -713,7 +741,28 @@ sched_q = CosineAnnealingLR(opt_q, T_max=qat_epochs, eta_min=(lr * qat_lr_factor
 print(f"[INFO] Starting QAT fine-tuning on {qat_train_device} for {qat_epochs} epochs...")
 # The 'scaler' for AMP is not used here as train_epoch handles it via qat_mode_active.
 best_val_qat = 0.0
+qat_model_for_conversion = copy.deepcopy(qat_model).eval().cpu()
+
+def _call_on_modules(model: nn.Module, method_name: str) -> int:
+    count = 0
+    for m in model.modules():
+        fn = getattr(m, method_name, None)
+        if callable(fn):
+            fn()
+            count += 1
+    return count
+
+freeze_observer_epoch = max(1, int(qat_epochs * 0.5))
+freeze_bn_epoch = max(1, int(qat_epochs * 0.75))
+
 for qep in range(qat_epochs):
+    if qep == freeze_observer_epoch:
+        n = _call_on_modules(qat_model, "disable_observer")
+        print(f"[INFO] QAT: disabled observers on {n} modules at epoch {qep}/{qat_epochs}")
+    if qep == freeze_bn_epoch:
+        n = _call_on_modules(qat_model, "freeze_bn_stats")
+        print(f"[INFO] QAT: froze BN stats on {n} modules at epoch {qep}/{qat_epochs}")
+
     l_q = train_epoch(qat_model, tr, crit, opt_q, scaler, qat_train_device, qep, qat_mode_active=True)
     # It's good practice to evaluate on the same device as training for consistency during QAT.
     val_acc_q = evaluate(qat_model, vl, qat_train_device)
