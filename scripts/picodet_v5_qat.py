@@ -759,6 +759,9 @@ def train_epoch(
     model.train()
     # --- Containers for epoch-wide diagnostics ---
     fg_total, img_total, successful_updates = 0, 0, 0
+    fg_zero_imgs = 0
+    low_iou_fg = 0
+    total_fg_count = 0
     tot_loss_accum = 0.
 
     for i, (imgs, tgts_batch) in enumerate(loader):
@@ -801,7 +804,7 @@ def train_epoch(
             gt_boxes_img = tgt_i["boxes"].to(dtype=torch.float32, device=device)
             gt_labels_img = tgt_i["labels"].to(device=device)
 
-            fg_mask_img, gt_labels_assigned, gt_boxes_assigned, _ = assigner(
+            fg_mask_img, gt_labels_assigned, gt_boxes_assigned, iou_out_img = assigner(
                 fmap_shapes, device, {'boxes': gt_boxes_img, 'labels': gt_labels_img},
                 cls_logits=cls_p_batch[b_idx], model_head=model.head,
             )
@@ -810,6 +813,11 @@ def train_epoch(
             total_num_fg_batch += num_fg_img
             fg_total += num_fg_img
             img_total += 1
+            fg_zero_imgs += int(num_fg_img == 0)
+            if num_fg_img > 0:
+                fg_iou_vals = iou_out_img[fg_mask_img]
+                low_iou_fg += (fg_iou_vals < 0.05).sum().item()
+                total_fg_count += num_fg_img
 
             if num_fg_img > 0:
                 pos_indices = fg_mask_img.nonzero(as_tuple=False).view(-1)  # Use view(-1) for safety
@@ -930,7 +938,7 @@ def train_epoch(
             if debug_prints: print(f"WARNING: Non-finite loss in batch {i}. Skipping update.")
             continue
 
-        if debug_prints and (i == 0 or (i > 0 and i % 500 == 0)):
+        if debug_prints and (i == 0 or (i > 0 and i % 1000 == 0)):
             avg_loss_so_far = tot_loss_accum / successful_updates if successful_updates > 0 else 0.
             print(f"E{epoch:<3} {i:04d}/{len(loader)} | "
                   f"Loss: {batch_total_loss.item():.4f} (Avg: {avg_loss_so_far:.4f}) | "
@@ -938,9 +946,50 @@ def train_epoch(
 
     if successful_updates > 0:
         avg_epoch_loss = tot_loss_accum / successful_updates
+        # --- Aggregate assignment diagnostics for the epoch ---
+        centre_hits = assigner._debug_stats.get("ctr_hit_rate", [])
+        k_dist_list = assigner._debug_stats.get("k_dist", [])
+        k_min_hits = assigner._debug_stats.get("k_min_hits", [])
+        cls_costs = assigner._classification_debug_stats.get("cls_cost_magnitude", [])
+        loc_costs = assigner._classification_debug_stats.get("loc_cost_magnitude", [])
+        switches = assigner._classification_debug_stats.get("assignment_switches", [])
+
+        centre_hit = float(np.mean(centre_hits)) if centre_hits else 0.0
+        if k_min_hits:
+            total_k_min_hits = sum(h for h, t in k_min_hits)
+            total_gt_boxes = sum(t for h, t in k_min_hits)
+            pct_gt_at_min_k = (total_k_min_hits / total_gt_boxes) * 100 if total_gt_boxes > 0 else 0.0
+        else:
+            pct_gt_at_min_k = 0.0
+
+        k_mean = k_std = k_median = float("nan")
+        if k_dist_list:
+            all_k_vals = torch.cat(k_dist_list).float()
+            k_mean = all_k_vals.mean().item()
+            k_std = all_k_vals.std().item()
+            k_median = all_k_vals.median().item()
+
+        avg_cls_cost = float(np.mean(cls_costs)) if cls_costs else float("nan")
+        avg_loc_cost = float(np.mean(loc_costs)) if loc_costs else float("nan")
+        if switches:
+            total_switches, total_anchors = map(sum, zip(*switches))
+            switch_rate = (total_switches / total_anchors) * 100 if total_anchors > 0 else 0.0
+        else:
+            switch_rate = float("nan")
+
         epoch_diag = {
             "fg_per_img": fg_total / max(img_total, 1),
-            "centre_hit": np.mean(assigner._debug_stats["ctr_hit_rate"]) if assigner._debug_stats.get("ctr_hit_rate") else 0.0
+            "fg_zero_img_pct": (fg_zero_imgs / max(img_total, 1)) * 100.0,
+            "mean_fg_iou": assigner.mean_fg_iou if hasattr(assigner, "mean_fg_iou") else float("nan"),
+            "pct_fg_iou_lt_0_05": (low_iou_fg / total_fg_count) * 100 if total_fg_count > 0 else 0.0,
+            "centre_hit": centre_hit,
+            "pct_gt_at_min_k": pct_gt_at_min_k,
+            "k_mean": k_mean,
+            "k_std": k_std,
+            "k_median": k_median,
+            "cls_cost": avg_cls_cost,
+            "loc_cost": avg_loc_cost,
+            "assignment_switch_rate": switch_rate,
         }
         return avg_epoch_loss, epoch_diag
     else:
@@ -2230,6 +2279,14 @@ def main(argv: List[str] | None = None):
             iou_05 = epoch_metrics.get('iou_at_5', 0.0)
             iou_25 = epoch_metrics.get('iou_at_25', 0.0)
             print(f"Epoch {ep + 1}/{fp32_epochs} | Loss: {l:.4f} | IoU@.05: {iou_05:.3f} | IoU@.25: {iou_25:.3f} | LR: {current_lr:.6f}\n")
+            diag_str = (
+                f"[Assign] fg/img={diag.get('fg_per_img', 0):.1f}, fg0%={diag.get('fg_zero_img_pct', 0):.1f}, "
+                f"fg_iou<.05%={diag.get('pct_fg_iou_lt_0_05', 0):.1f}, mean_fg_iou={diag.get('mean_fg_iou', 0):.3f}, "
+                f"ctr_hit={diag.get('centre_hit', 0):.2f}, k_mean={diag.get('k_mean', float('nan')):.2f}, "
+                f"min_k%={diag.get('pct_gt_at_min_k', 0):.1f}, switch%={diag.get('assignment_switch_rate', float('nan')):.1f}, "
+                f"cls={diag.get('cls_cost', float('nan')):.3f}, loc={diag.get('loc_cost', float('nan')):.3f}"
+            )
+            print(diag_str)
             print("─" * 15 + f" SimOTA Report for Epoch {ep + 1} " + "─" * 15)
             assigner.print_debug_report()
             assigner.print_classification_debug_report()
@@ -2339,7 +2396,6 @@ def main(argv: List[str] | None = None):
             dfl_project_buffer_for_decode=original_dfl_project_buffer,
             max_epochs=qat_epochs, # For VFL alpha scheduling (relative to QAT duration)
             quality_floor_vfl=quality_floor_vfl,
-            iou_weight_change_epoch=2,
             debug_prints=False,
             w_cls_loss=CLS_WEIGHT,
             w_iou_loss=IOU_WEIGHT,
@@ -2587,9 +2643,69 @@ def plot_training_history(history: dict, title: str = 'Training Progress'):
     plt.tight_layout(rect=[0, 0, 1, 0.96])
     plt.show()
 
+def plot_assignment_history(history: dict, title: str = 'Assignment Diagnostics'):
+    epochs = sorted(history)
+    if not epochs:
+        print("History is empty, cannot plot."); return
+
+    as_list = lambda k: [history[e].get(k, float('nan')) for e in epochs]
+    fg_per_img = as_list('fg_per_img')
+    fg0 = as_list('fg_zero_img_pct')
+    mean_fg_iou = as_list('mean_fg_iou')
+    low_iou = as_list('pct_fg_iou_lt_0_05')
+    ctr_hit = as_list('centre_hit')
+    min_k = as_list('pct_gt_at_min_k')
+    k_mean = as_list('k_mean')
+    cls_cost = as_list('cls_cost')
+    loc_cost = as_list('loc_cost')
+    switch = as_list('assignment_switch_rate')
+
+    fig, axs = plt.subplots(2, 2, figsize=(12, 9), sharex=True)
+    fig.suptitle(title, fontsize=16)
+
+    # fg stats
+    ax = axs[0,0]
+    ax.bar(epochs, fg_per_img, color='steelblue', alpha=0.6, label='FG / img')
+    ax2 = ax.twinx()
+    ax2.plot(epochs, fg0, 'o-', color='firebrick', label='% images with FG=0')
+    ax.set_ylabel('FG / img'); ax2.set_ylabel('FG=0 %')
+    ax.grid(ls='--', alpha=.5)
+    h,l = ax.get_legend_handles_labels(); h2,l2 = ax2.get_legend_handles_labels(); ax2.legend(h+h2, l+l2, loc='upper right')
+
+    # IoU stats
+    ax = axs[0,1]
+    ax.plot(epochs, mean_fg_iou, 'o-', color='darkgreen', label='mean FG IoU')
+    ax2 = ax.twinx()
+    ax2.plot(epochs, low_iou, 's--', color='orange', label='FG IoU <0.05 %')
+    ax.set_ylabel('Mean FG IoU'); ax2.set_ylabel('Low IoU %')
+    ax.grid(ls='--', alpha=.5)
+    h,l = ax.get_legend_handles_labels(); h2,l2 = ax2.get_legend_handles_labels(); ax2.legend(h+h2, l+l2, loc='upper right')
+
+    # centre / dynamic-k
+    ax = axs[1,0]
+    ax.plot(epochs, ctr_hit, 'o-', color='slategray', label='ctr hit rate')
+    ax.plot(epochs, [m/100 for m in min_k], 's--', color='navy', label='min_k % (scaled)')
+    ax.plot(epochs, k_mean, '^-', color='purple', label='k mean')
+    ax.set_ylabel('Ratio / k'); ax.grid(ls='--', alpha=.5); ax.legend()
+
+    # classification vs loc cost / switches
+    ax = axs[1,1]
+    ax.plot(epochs, cls_cost, 'o-', color='tomato', label='cls cost')
+    ax.plot(epochs, loc_cost, 's--', color='teal', label='loc cost')
+    ax2 = ax.twinx()
+    ax2.plot(epochs, switch, '^-', color='black', label='switch %')
+    ax.set_ylabel('Cost'); ax2.set_ylabel('Switch %')
+    ax.grid(ls='--', alpha=.5)
+    h,l = ax.get_legend_handles_labels(); h2,l2 = ax2.get_legend_handles_labels(); ax2.legend(h+h2, l+l2, loc='upper right')
+
+    for ax in axs.ravel(): ax.xaxis.set_major_locator(mticker.MaxNLocator(integer=True))
+    axs[1,0].set_xlabel('Epoch'); axs[1,1].set_xlabel('Epoch')
+    plt.tight_layout(rect=[0,0,1,0.95]); plt.show()
+
 if __name__ == '__main__':
     final_history = main()
     plot_training_history(final_history, title="PicoDet Training Progress")
+    plot_assignment_history(final_history, title="Assignment Diagnostics")
 
     temp_onnx_path = "picodet_v5_int8_temp_no_nms.onnx"
 
