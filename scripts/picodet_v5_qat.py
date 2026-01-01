@@ -1,13 +1,10 @@
 # train_picodet_qat.py – minimal pipeline: COCO ➜ FP32 ➜ QAT ➜ INT8 ➜ ONNX (with NMS)
-# built on pytorch version 2.7
+# built on pytorch version 2.7, use the test_picodet_qat.py for basic tests
 from __future__ import annotations
-import argparse, random, time, warnings, math, copy, os, json
-import functools
+import argparse, random, time, warnings, math, copy, os, json, functools, traceback
 from typing import List, Tuple
-import traceback
 import numpy as np
-
-import torch, torch.nn as nn
+import torch, torch.nn as nn, torch.nn.functional as F
 from torchvision.transforms import v2 as T
 from torchvision.datasets import CocoDetection
 from torchvision.tv_tensors import BoundingBoxes
@@ -15,23 +12,17 @@ import torchvision.ops as tvops
 from torch.utils.data import DataLoader
 from torch.optim import SGD, AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
-import torch.nn.functional as F
-
 import onnx
 from onnx import TensorProto as TP, helper as oh
 import onnxruntime as ort
 
 from pycocotools.coco import COCO
 
-if False:  # this is just here for a quirk in testing, imports are still available when run
-    try: 
-        from picodet_lib_v2 import (
-            PicoDet, get_backbone, VarifocalLoss, dfl_loss,
-            build_dfl_targets, PicoDetHead, ResizeNorm, QualityFocalLoss
-        )
-    except Exception:
-        # when running manually in console, these are already loaded
-        pass
+# Import required classes from picodet_lib_v2
+from picodet_lib_v2 import (
+    PicoDet, get_backbone, VarifocalLoss, dfl_loss,
+    build_dfl_targets, PicoDetHead, ResizeNorm, QualityFocalLoss
+)
 
 warnings.filterwarnings('ignore', category=UserWarning)
 SEED = 42; random.seed(SEED); torch.manual_seed(SEED)
@@ -39,37 +30,21 @@ IMG_SIZE = 256  # PicoDet's anchors assume stride-divisible sizes. Divisible by 
 
 # ───────────────────── ONNX optimization helper ─────────────────────────
 def optimize_onnx_with_ort(input_path: str, output_path: str):
-    """
-    Optimizes an ONNX model using ONNX Runtime's graph optimization.
-    
-    Args:
-        input_path: Path to the input ONNX model
-        output_path: Path to save the optimized ONNX model
-    """
+    """Optimizes an ONNX model using ONNX Runtime's graph optimization."""
     print(f"[INFO] Optimizing ONNX model with ORT_ENABLE_ALL: {input_path}")
-    
     try:
         sess_options = ort.SessionOptions()
-        # Set graph optimization level to ALL for most aggressive optimization
         sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        
-        # Set up the output path for the optimized model
         sess_options.optimized_model_filepath = output_path
-        
-        # Create a session with the model and options to trigger optimization and save
-        # We don't actually need to run inference here
         _ = ort.InferenceSession(input_path, sess_options, providers=['CPUExecutionProvider'])
-        
         if os.path.exists(output_path):
             print(f"[SAVE] Optimized ONNX model → {output_path}")
             return True
         else:
             print(f"[WARN] Optimized model was not saved to {output_path}")
             return False
-            
     except Exception as e:
         print(f"[ERROR] Failed to optimize ONNX model with ORT: {e}")
-        import traceback
         traceback.print_exc()
         return False
 
@@ -177,72 +152,59 @@ def create_class_balanced_sampler(dataset: CocoDetectionV2, target_weights: dict
 
 def contiguous_id_to_name(coco_api: COCO) -> dict[int, str]:
     """Return {0-79 → class-name} using the official 80-class list."""
-    return {
-        i: coco_api.loadCats([coco_id])[0]["name"]
-        for i, coco_id in enumerate(CANONICAL_COCO80_IDS)
-    }
+    return {i: coco_api.loadCats([coco_id])[0]["name"] for i, coco_id in enumerate(CANONICAL_COCO80_IDS)}
 
 # ---------- COCO → tv_tensors utility ----------
 def _coco_to_tvt(annots, lb_map, canvas):
     boxes, labels = [], []
-    W, H = canvas                                    # PIL size is (W,H)
+    W, H = canvas  # PIL size is (W,H)
     for a in annots:
         if a.get("iscrowd", 0):
             continue
         cid = a["category_id"]
-        if cid not in lb_map:                        # skip classes >79
+        if cid not in lb_map:  # skip classes >79
             continue
-        x, y, w, h = a["bbox"]                       # COCO XYWH
+        x, y, w, h = a["bbox"]  # COCO XYWH
         boxes.append([x, y, x + w, y + h])
         labels.append(lb_map[cid])
-
-    if not boxes:                                    # keep training stable
-        boxes  = torch.zeros((0, 4), dtype=torch.float32)
-        labels = torch.zeros((0,),  dtype=torch.int64)
-
-    bbx = BoundingBoxes(
-        torch.as_tensor(boxes, dtype=torch.float32),
-        format="XYXY", canvas_size=(H, W)
-    )
+    if not boxes:  # keep training stable
+        boxes = torch.zeros((0, 4), dtype=torch.float32)
+        labels = torch.zeros((0,), dtype=torch.int64)
+    bbx = BoundingBoxes(torch.as_tensor(boxes, dtype=torch.float32), format="XYXY", canvas_size=(H, W))
     return {"boxes": bbx, "labels": torch.as_tensor(labels, dtype=torch.int64)}
 
 # ---------- dataset wrapper ----------
 class CocoDetectionV2(CocoDetection):
     """COCO dataset ready for torchvision-v2 transforms."""
     def __init__(self, img_dir, ann_file, lb_map, transforms=None):
-        super().__init__(img_dir, ann_file)           # PIL, list[dict]
+        super().__init__(img_dir, ann_file)
         self.lb_map = lb_map
-        self._tf    = transforms
+        self._tf = transforms
 
     def __getitem__(self, idx):
         img, anns = super().__getitem__(idx)
         tgt = _coco_to_tvt(anns, self.lb_map, img.size)
-        if self._tf is not None:                      # v2 ops work on (img,tgt)
+        if self._tf is not None:
             img, tgt = self._tf(img, tgt)
         return img, tgt
 
 def build_label_map_and_names_from_ann(ann_path: str):
     with open(ann_path, 'r') as f:
         d = json.load(f)
-    # Keep a stable order
     cats = sorted(d['categories'], key=lambda c: c['id'])
-    catid2contig = {c['id']: i for i, c in enumerate(cats)}   # {1:0, 2:1, 3:2}
-    id2name      = {i: c['name'] for i, c in enumerate(cats)}
+    catid2contig = {c['id']: i for i, c in enumerate(cats)}
+    id2name = {i: c['name'] for i, c in enumerate(cats)}
     return catid2contig, id2name
 
 # ---------- transforms ----------
 def build_transforms(size, train):
-    aug = [
-        T.ToImage(),
-        T.RandomHorizontalFlip(0.25) if train else T.Identity(),
-        T.RandomPhotometricDistort(p=0.2) if train else T.Identity(),
-        T.RandomAdjustSharpness(sharpness_factor=2, p=0.05) if train else T.Identity(),
-        T.RandomAutocontrast(p=0.1) if train else T.Identity(),
-        T.RandomEqualize(p=0.1) if train else T.Identity(),
-        # T.Resize(size, antialias=True),
-        T.RandomResizedCrop(size, scale=(0.75, 1.05), antialias=True) if train else T.Resize(size, antialias=True),
-        T.ToDtype(torch.uint8, scale=True),  # keep uint8, model normalises
-    ]
+    aug = [T.ToImage(), T.RandomHorizontalFlip(0.25) if train else T.Identity(),
+           T.RandomPhotometricDistort(p=0.2) if train else T.Identity(),
+           T.RandomAdjustSharpness(sharpness_factor=2, p=0.05) if train else T.Identity(),
+           T.RandomAutocontrast(p=0.1) if train else T.Identity(),
+           T.RandomEqualize(p=0.1) if train else T.Identity(),
+           T.RandomResizedCrop(size, scale=(0.75, 1.05), antialias=True) if train else T.Resize(size, antialias=True),
+           T.ToDtype(torch.uint8, scale=True)]
     return T.Compose(aug)
 
 
@@ -394,7 +356,6 @@ def collate_and_filter_more(
     return torch.stack(good_imgs, 0), good_tgts
 
 
-# ---------- collate ----------
 def collate_v2(batch):
     imgs, tgts = zip(*batch)
     return torch.stack(imgs, 0), list(tgts)
@@ -1005,137 +966,68 @@ from torch.ao.quantization.quantize_fx import prepare_qat_fx, convert_fx
 
 
 def qat_prepare(model: nn.Module, example_input: torch.Tensor) -> torch.fx.GraphModule:
-    """
-    Prepares the model for Quantization-Aware Training (QAT) using FX graph mode.
-
-    Args:
-        model: The PyTorch nn.Module to prepare for QAT.
-        example_input: A representative example input tensor for tracing the model.
-
-    Returns:
-        A torch.fx.GraphModule prepared for QAT.
-    """
-    # 1. Define the desired QConfig for most layers
-    #    Activations: per-tensor, affine, quint8
-    #    Weights: per-channel, symmetric, qint8 (common for conv/linear layers)
+    """Prepares the model for Quantization-Aware Training (QAT) using FX graph mode."""
     global_qconfig = QConfig(
-        activation=MovingAverageMinMaxObserver.with_args(
-            dtype=torch.quint8, qscheme=torch.per_tensor_affine
-        ),
-        weight=MovingAveragePerChannelMinMaxObserver.with_args(
-            dtype=torch.qint8, qscheme=torch.per_channel_symmetric
-        )
-    )
-
-    # 2. Get the default QAT qconfig mapping for the chosen backend
-    #    'x86' or 'qnnpack' (for ARM) are common backends.
-    backend_config = "x86"  # Or "qnnpack" explicitly
+        activation=MovingAverageMinMaxObserver.with_args(dtype=torch.quint8, qscheme=torch.per_tensor_affine),
+        weight=MovingAveragePerChannelMinMaxObserver.with_args(dtype=torch.qint8, qscheme=torch.per_channel_symmetric))
+    backend_config = "x86"
     qconfig_mapping = get_default_qat_qconfig_mapping(backend_config)
-
-    # 3. Apply the global QConfig to the mapping
-    #    This will apply `global_qconfig` to all quantizable module types
-    #    unless overridden by more specific settings (e.g., per module type/instance).
     qconfig_mapping = qconfig_mapping.set_global(global_qconfig)
-
-    # 4. Specify modules to skip quantization
-    #    The 'pre' module (ResizeNorm) handles uint8 input and normalization;
     qconfig_mapping = qconfig_mapping.set_module_name('pre', None)
     qconfig_mapping = qconfig_mapping.set_object_type(ResizeNorm, None)
-
-    # 5. Prepare the model for QAT using FX graph mode
-    model.cpu().train() # Ensure model is on CPU and in train mode
-    
-    prepared_model = prepare_qat_fx(
-        model,
-        qconfig_mapping,
-        example_input # Must also be on CPU
-    )
-    
+    model.cpu().train()
+    prepared_model = prepare_qat_fx(model, qconfig_mapping, example_input)
     return prepared_model
 
 
 def unwrap_dataset(ds):
-    while isinstance(ds, torch.utils.data.Subset):
-        ds = ds.dataset
+    while isinstance(ds, torch.utils.data.Subset): ds = ds.dataset
     return ds
 
 
 def apply_nms_and_padding_to_raw_outputs_with_debug( # Renamed
-    raw_boxes_batch: torch.Tensor, # (B, Total_Anchors, 4)
-    raw_scores_batch: torch.Tensor, # (B, Total_Anchors, NC)
-    score_thresh: float,
-    iou_thresh: float,
-    max_detections: int
+    raw_boxes_batch: torch.Tensor,  # (B, Total_Anchors, 4)
+    raw_scores_batch: torch.Tensor,  # (B, Total_Anchors, NC)
+    score_thresh: float, iou_thresh: float, max_detections: int
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[int], List[int]]:
-    
     device = raw_boxes_batch.device
     batch_size = raw_boxes_batch.shape[0]
-
-    final_boxes_list = []
-    final_scores_list = []
-    final_labels_list = []
-    
-    num_preds_before_nms_list = [] # Debug
-    num_preds_after_nms_list = []  # Debug
+    final_boxes_list, final_scores_list, final_labels_list = [], [], []
+    num_preds_before_nms_list, num_preds_after_nms_list = [], []
 
     for b_idx in range(batch_size):
-        boxes_img = raw_boxes_batch[b_idx]     # (Total_Anchors, 4)
-        scores_img = raw_scores_batch[b_idx]   # (Total_Anchors, NC)
-
-        # For each anchor, find the max score across classes and the corresponding class label
-        conf_per_anchor, labels_per_anchor = torch.max(scores_img, dim=1) # (Total_Anchors,)
-        
-        # Filter by score_thresh BEFORE NMS
+        boxes_img = raw_boxes_batch[b_idx]
+        scores_img = raw_scores_batch[b_idx]
+        conf_per_anchor, labels_per_anchor = torch.max(scores_img, dim=1)
         keep_by_score_mask = conf_per_anchor >= score_thresh
-        
         boxes_above_thresh = boxes_img[keep_by_score_mask]
         scores_above_thresh = conf_per_anchor[keep_by_score_mask]
         labels_above_thresh = labels_per_anchor[keep_by_score_mask]
-
         num_preds_before_nms_this_img = boxes_above_thresh.shape[0]
         num_preds_before_nms_list.append(num_preds_before_nms_this_img)
-
         num_preds_after_nms_this_img = 0
         if boxes_above_thresh.numel() == 0:
-            # Pad and append if no boxes pass threshold
             padded_boxes = torch.zeros((max_detections, 4), dtype=boxes_img.dtype, device=device)
             padded_scores = torch.zeros((max_detections,), dtype=scores_img.dtype, device=device)
-            padded_labels = torch.full((max_detections,), -1, dtype=torch.long, device=device) # Use -1 for padding label
+            padded_labels = torch.full((max_detections,), -1, dtype=torch.long, device=device)
         else:
-            # Perform NMS
-            nms_keep_indices = tvops.batched_nms(
-                boxes_above_thresh,    # boxes
-                scores_above_thresh,   # scores
-                labels_above_thresh,   # class indexes
-                iou_thresh             # iou_threshold
-            )
-
-            # Keep only up to max_detections
+            nms_keep_indices = tvops.batched_nms(boxes_above_thresh, scores_above_thresh, labels_above_thresh, iou_thresh)
             boxes_after_nms = boxes_above_thresh[nms_keep_indices[:max_detections]]
             scores_after_nms = scores_above_thresh[nms_keep_indices[:max_detections]]
             labels_after_nms = labels_above_thresh[nms_keep_indices[:max_detections]]
-            
             num_preds_after_nms_this_img = boxes_after_nms.shape[0]
-            
-            # Pad to max_detections
             num_current_dets = boxes_after_nms.shape[0]
             pad_size = max_detections - num_current_dets
-            
             padded_boxes = F.pad(boxes_after_nms, (0, 0, 0, pad_size), mode='constant', value=0.0)
             padded_scores = F.pad(scores_after_nms, (0, pad_size), mode='constant', value=0.0)
-            padded_labels = F.pad(labels_after_nms, (0, pad_size), mode='constant', value=-1) # Use -1 for padding label
+            padded_labels = F.pad(labels_after_nms, (0, pad_size), mode='constant', value=-1)
 
         final_boxes_list.append(padded_boxes)
         final_scores_list.append(padded_scores)
         final_labels_list.append(padded_labels)
         num_preds_after_nms_list.append(num_preds_after_nms_this_img)
-
-
-    return (torch.stack(final_boxes_list),
-            torch.stack(final_scores_list),
-            torch.stack(final_labels_list),
-            num_preds_before_nms_list, # Return debug info
-            num_preds_after_nms_list)  # Return debug info
+    return (torch.stack(final_boxes_list), torch.stack(final_scores_list),
+            torch.stack(final_labels_list), num_preds_before_nms_list, num_preds_after_nms_list)
 
 
 @torch.no_grad()
@@ -1262,130 +1154,60 @@ def quick_val_iou(
 
 @torch.no_grad()
 def run_epoch_validation(model: nn.Module, loader, device, epoch_num: int, head_ref: PicoDetHead):
-    """
-    Runs a comprehensive validation for an epoch, testing at multiple score thresholds.
-
-    Args:
-        model: The model to evaluate.
-        loader: The validation DataLoader.
-        device: The device to run on.
-        epoch_num: The current epoch number for logging.
-        head_ref: A reference to the model's head to get NMS parameters.
-
-    Returns:
-        A dictionary containing key metrics for the epoch.
-    """
+    """Runs comprehensive validation for an epoch, testing at multiple score thresholds."""
     model.eval()
-    
-    # Define the score thresholds you want to track
     score_thresholds_to_track = [0.05, 0.25, 0.50]
-    
     epoch_summary = {}
-
     print(f"\n--- Running Validation for Epoch {epoch_num} ---")
     for score_th in score_thresholds_to_track:
         run_name = f"val_ep{epoch_num}_score{score_th}"
-        
-        # We set debug_prints=False to keep the console clean during this automated run
-        iou, acc = quick_val_iou(
-            model, loader, device,
-            score_thresh=score_th,
-            iou_thresh=head_ref.iou_th,
-            max_detections=head_ref.max_det,
-            epoch_num=epoch_num, 
-            run_name=run_name,
-            debug_prints=False, # Keep logs clean
-        )
-        
-        # Use a descriptive key for the summary dictionary
+        iou, acc = quick_val_iou(model, loader, device, score_thresh=score_th, iou_thresh=head_ref.iou_th,
+                                  max_detections=head_ref.max_det, epoch_num=epoch_num, run_name=run_name,
+                                  debug_prints=False)
         key_iou = f"iou_at_{int(score_th*100)}".replace('.', '')
         key_acc = f"acc_at_{int(score_th*100)}".replace('.', '')
-        
         epoch_summary[key_iou] = iou
         epoch_summary[key_acc] = acc
         print(f"  [Score > {score_th:.2f}] --> Mean IoU: {iou:.4f}, Accuracy: {acc:.4f}")
-        
     return epoch_summary
 
 
 class PostprocessorForONNX(nn.Module):
-    def __init__(self, head_ref: PicoDetHead): # Pass original PicoDetHead instance
+    def __init__(self, head_ref: PicoDetHead):
         super().__init__()
         self.nc = head_ref.nc
         self.reg_max = head_ref.reg_max
-        self.nl = head_ref.nl # Number of FPN levels (e.g., 3)
-
-        # Register buffers needed for decoding, cloned from the original head.
-        # These will be part of the ONNX graph as constants if not inputs.
+        self.nl = head_ref.nl
         self.register_buffer('strides_buffer', head_ref.strides_buffer.clone().detach(), persistent=False)
         self.register_buffer('dfl_project_buffer', head_ref.dfl_project_buffer.clone().detach(), persistent=False)
-        # self.register_buffer('logit_scale', head_ref.logit_scale.clone().detach(), persistent=False)
         for i in range(self.nl):
             anchor_points = getattr(head_ref, f'anchor_points_level_{i}')
             self.register_buffer(f'anchor_points_level_{i}', anchor_points.clone().detach(), persistent=False)
 
     def _dfl_to_ltrb_inference_onnx(self, x_reg_logits_3d: torch.Tensor) -> torch.Tensor:
-        # x_reg_logits_3d shape: (B, N_anchors_img_level, 4 * (reg_max + 1))
-        # Using .size() for ONNX compatibility with dynamic shapes
-        b = x_reg_logits_3d.size(0)
-        n_anchors_img_level = x_reg_logits_3d.size(1)
-
-        # Reshape for softmax and projection. self.reg_max + 1 is constant.
-        # Target shape: (B, N_anchors_img_level, 4, self.reg_max + 1)
+        b, n_anchors_img_level = x_reg_logits_3d.size(0), x_reg_logits_3d.size(1)
         x_reg_logits_reshaped = x_reg_logits_3d.view(b, n_anchors_img_level, 4, self.reg_max + 1)
-        x_softmax = F.softmax(x_reg_logits_reshaped, dim=3) # Apply softmax over reg_max+1 dimension
-
-        # self.dfl_project_buffer has shape (reg_max+1)
-        # Unsqueeze for broadcasting: (1, 1, 1, reg_max+1)
-        proj = self.dfl_project_buffer.view(1, 1, 1, self.reg_max + 1) # Use self.reg_max + 1 for shape
-        ltrb_offsets = (x_softmax * proj).sum(dim=3) # Sum over reg_max+1 dim
+        x_softmax = F.softmax(x_reg_logits_reshaped, dim=3)
+        proj = self.dfl_project_buffer.view(1, 1, 1, self.reg_max + 1)
+        ltrb_offsets = (x_softmax * proj).sum(dim=3)
         return ltrb_offsets
 
-    def _decode_predictions_for_level_onnx(
-            self,
-            cls_logit: torch.Tensor,  # (B, NC, H_feat, W_feat)
-            # obj_logit: torch.Tensor,  # (B, 1,  H_feat, W_feat)
-            reg_logit: torch.Tensor,  # (B, 4*(reg_max+1), H_feat, W_feat)
-            level_idx: int
-        ) -> Tuple[torch.Tensor, torch.Tensor]:
-
-        # B can be dynamic, H_feat, W_feat might be if input image size is dynamic
-        B = cls_logit.size(0)
-        H_feat = cls_logit.size(2)
-        W_feat = cls_logit.size(3)
-
-        stride_val = self.strides_buffer[level_idx] # Scalar tensor for this level
+    def _decode_predictions_for_level_onnx(self, cls_logit: torch.Tensor, reg_logit: torch.Tensor, level_idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        B, H_feat, W_feat = cls_logit.size(0), cls_logit.size(2), cls_logit.size(3)
+        stride_val = self.strides_buffer[level_idx]
         num_anchors_level = H_feat * W_feat
-
-        # anchor_points_center shape: (Max_H_feat_for_level * Max_W_feat_for_level, 2)
-        # If H_feat, W_feat are dynamic and smaller than max, slicing/selection might be needed.
-        # For fixed IMG_SIZE during QAT, H_feat, W_feat will be fixed for each level.
         anchor_points_center = getattr(self, f'anchor_points_level_{level_idx}')
-
-        # Permute and reshape logits
-        # (B, C, H, W) -> (B, H, W, C) -> (B, H*W, C)
-        # For ONNX, ensure reshape uses -1 carefully if B or H*W is dynamic.
         cls_logit_perm = cls_logit.permute(0, 2, 3, 1).contiguous().view(B, num_anchors_level, self.nc)
-        # obj_logit_perm = obj_logit.permute(0, 2, 3, 1).contiguous().view(B, num_anchors_level, 1)
         reg_logit_perm = reg_logit.permute(0, 2, 3, 1).contiguous().view(B, num_anchors_level, 4 * (self.reg_max + 1))
-
         ltrb_offsets = self._dfl_to_ltrb_inference_onnx(reg_logit_perm)
-        ltrb_offsets_scaled = ltrb_offsets * stride_val # Element-wise with broadcasting (stride_val is scalar)
-
-        # ap_expanded shape: (1, num_anchors_level, 2) for broadcasting with B
+        ltrb_offsets_scaled = ltrb_offsets * stride_val
         ap_expanded = anchor_points_center.unsqueeze(0)
-
-        # Calculate box coordinates
         x1 = ap_expanded[..., 0] - ltrb_offsets_scaled[..., 0]
         y1 = ap_expanded[..., 1] - ltrb_offsets_scaled[..., 1]
         x2 = ap_expanded[..., 0] + ltrb_offsets_scaled[..., 2]
         y2 = ap_expanded[..., 1] + ltrb_offsets_scaled[..., 3]
-        boxes_xyxy_level = torch.stack([x1, y1, x2, y2], dim=-1) # Shape (B, num_anchors_level, 4)
-
-        # scores_level = torch.sigmoid(cls_logit_perm + self.logit_scale * obj_logit_perm)
-        # scores_level = torch.sigmoid((cls_logit_perm + 0.5) / 0.8)
+        boxes_xyxy_level = torch.stack([x1, y1, x2, y2], dim=-1)
         scores_level = torch.sigmoid(cls_logit_perm)
-
         return boxes_xyxy_level, scores_level
 
     def forward(self, raw_model_outputs_nested_tuple: Tuple[Tuple[torch.Tensor, ...], ...]):
@@ -1434,9 +1256,7 @@ class PostprocessorForONNX(nn.Module):
 
 
 class ONNXExportablePicoDet(nn.Module):
-    def __init__(self,
-                 quantized_core_model: nn.Module,
-                 head_postprocessor: PostprocessorForONNX):
+    def __init__(self, quantized_core_model: nn.Module, head_postprocessor: PostprocessorForONNX):
         super().__init__()
         self.core_model = quantized_core_model
         self.postprocessor = head_postprocessor
@@ -1446,57 +1266,30 @@ class ONNXExportablePicoDet(nn.Module):
         self.core_model.train()
         raw_feature_outputs_tuple = self.core_model(x)
         self.core_model.training = is_training_before
-
-        # The postprocessor takes this tuple and decodes it to the inference outputs
         return self.postprocessor(raw_feature_outputs_tuple)
 
 # ────────────────── append_nms_to_onnx ────────────────────
-def append_nms_to_onnx(
-        in_path: str,
-        out_path: str,
-        score_thresh: float,
-        iou_thresh: float,
-        max_det: int,
-        *,
-        raw_boxes: str = "raw_boxes",     # [B , A , 4]
-        raw_scores: str = "raw_scores",   # [B , A , C]
-        top_k_before_nms: bool = True,
-        k_value: int = 600,
-):
+def append_nms_to_onnx(in_path: str, out_path: str, score_thresh: float, iou_thresh: float, max_det: int, *,
+                        raw_boxes: str = "raw_boxes", raw_scores: str = "raw_scores",
+                        top_k_before_nms: bool = True, k_value: int = 600):
     m = onnx.load(in_path)
     g = m.graph
-
-    # ───────── constants ─────────
-    g.initializer.extend([
-        oh.make_tensor("nms_iou_th",   TP.FLOAT, [], [iou_thresh]),
-        oh.make_tensor("nms_score_th", TP.FLOAT, [], [score_thresh]),
-        oh.make_tensor("nms_max_det",  TP.INT64, [], [max_det]),
-        # oh.make_tensor("nms_axis0", TP.INT64, [1], [0]),
-        oh.make_tensor("nms_axis1", TP.INT64, [1], [1]),
-        oh.make_tensor("nms_axis2", TP.INT64, [1], [2]),
-        oh.make_tensor("nms_shape_boxes3d",  TP.INT64, [3], [0, -1, 4]),
-        oh.make_tensor("nms_shape_scores3d", TP.INT64, [3], [0, 0, -1]),
-    ])
+    g.initializer.extend([oh.make_tensor("nms_iou_th", TP.FLOAT, [], [iou_thresh]),
+                          oh.make_tensor("nms_score_th", TP.FLOAT, [], [score_thresh]),
+                          oh.make_tensor("nms_max_det", TP.INT64, [], [max_det]),
+                          oh.make_tensor("nms_axis1", TP.INT64, [1], [1]),
+                          oh.make_tensor("nms_axis2", TP.INT64, [1], [2]),
+                          oh.make_tensor("nms_shape_boxes3d", TP.INT64, [3], [0, -1, 4]),
+                          oh.make_tensor("nms_shape_scores3d", TP.INT64, [3], [0, 0, -1])])
     if top_k_before_nms:
-        g.initializer.extend([
-            oh.make_tensor("nms_k_topk", TP.INT64, [1], [k_value]),
-        ])
+        g.initializer.extend([oh.make_tensor("nms_k_topk", TP.INT64, [1], [k_value])])
 
-    # ───────── reshape / transpose raw outputs ─────────
     boxes3d = "nms_boxes3d"
-    g.node.append(oh.make_node(
-        "Reshape", [raw_boxes, "nms_shape_boxes3d"], [boxes3d],
-        name="nms_Reshape_Boxes3D"))
-
+    g.node.append(oh.make_node("Reshape", [raw_boxes, "nms_shape_boxes3d"], [boxes3d], name="nms_Reshape_Boxes3D"))
     scores3d = "nms_scores3d"
-    g.node.append(oh.make_node(
-        "Reshape", [raw_scores, "nms_shape_scores3d"], [scores3d],
-        name="nms_Reshape_Scores3D"))
-
+    g.node.append(oh.make_node("Reshape", [raw_scores, "nms_shape_scores3d"], [scores3d], name="nms_Reshape_Scores3D"))
     scores_bca = "nms_scores_bca"
-    g.node.append(oh.make_node(
-        "Transpose", [scores3d], [scores_bca],
-        perm=[0, 2, 1], name="nms_Transpose_BCA"))  # [B , C , A]
+    g.node.append(oh.make_node("Transpose", [scores3d], [scores_bca], perm=[0, 2, 1], name="nms_Transpose_BCA"))
 
     # ───────── optional Top-K filter ─────────
     if top_k_before_nms:
@@ -1545,66 +1338,33 @@ def append_nms_to_onnx(
         nms_boxes  = boxes3d
         nms_scores = scores_bca
 
-    # ───────── Non-Max Suppression ─────────
-    sel = "nms_selected"                          # [N , 3]
-    g.node.append(oh.make_node(
-        "NonMaxSuppression",
-        [nms_boxes, nms_scores,
-         "nms_max_det", "nms_iou_th", "nms_score_th"],
-        [sel], name="nms_NMS"))
-
-    # split indices (batch , class , anchor)
-    g.initializer.extend([
-        oh.make_tensor("nms_split111", TP.INT64, [3], [1, 1, 1]),
-    ])
+    sel = "nms_selected"
+    g.node.append(oh.make_node("NonMaxSuppression",
+                               [nms_boxes, nms_scores, "nms_max_det", "nms_iou_th", "nms_score_th"],
+                               [sel], name="nms_NMS"))
+    g.initializer.extend([oh.make_tensor("nms_split111", TP.INT64, [3], [1, 1, 1])])
     b_col, c_col, a_col = "nms_b", "nms_c", "nms_a"
-    g.node.append(oh.make_node(
-        "Split", [sel, "nms_split111"], [b_col, c_col, a_col],
-        axis=1, name="nms_SplitSel"))
+    g.node.append(oh.make_node("Split", [sel, "nms_split111"], [b_col, c_col, a_col], axis=1, name="nms_SplitSel"))
 
-    # squeeze to 1-D
     b_idx, class_idx, anc_idx = "batch_idx", "class_idx", "anchor_idx"
     for src, dst in [(b_col, b_idx), (c_col, class_idx), (a_col, anc_idx)]:
-        g.node.append(oh.make_node(
-            "Squeeze", [src, "nms_axis1"], [dst],
-            name=f"nms_Squeeze_{dst}"))
-
-    # ───── gather det_boxes  (batch_dims=1, indices=[anchor]) ─────
+        g.node.append(oh.make_node("Squeeze", [src, "nms_axis1"], [dst], name=f"nms_Squeeze_{dst}"))
     a_unsq = "nms_a_unsq"
-    g.node.append(oh.make_node(
-        "Unsqueeze", [anc_idx, "nms_axis1"], [a_unsq],
-        name="nms_UnsqAnchor"))
-
+    g.node.append(oh.make_node("Unsqueeze", [anc_idx, "nms_axis1"], [a_unsq], name="nms_UnsqAnchor"))
     det_boxes = "det_boxes"
-    g.node.append(oh.make_node(
-        "GatherND", [nms_boxes, a_unsq], [det_boxes],
-        batch_dims=1, name="nms_GatherDetBoxes"))
+    g.node.append(oh.make_node("GatherND", [nms_boxes, a_unsq], [det_boxes], batch_dims=1, name="nms_GatherDetBoxes"))
 
-    # ───── gather det_scores  (batch_dims=1, indices=[class,anchor]) ─────
     cls_unsq = "nms_cls_unsq"
-    g.node.append(oh.make_node(
-        "Unsqueeze", [class_idx, "nms_axis1"], [cls_unsq],
-        name="nms_UnsqClass"))
-
-    idx_scores = "nms_idx_scores"                 # [N , 2]
-    g.node.append(oh.make_node(
-        "Concat", [cls_unsq, a_unsq], [idx_scores],
-        axis=1, name="nms_CatClassAnchor"))
-
+    g.node.append(oh.make_node("Unsqueeze", [class_idx, "nms_axis1"], [cls_unsq], name="nms_UnsqClass"))
+    idx_scores = "nms_idx_scores"
+    g.node.append(oh.make_node("Concat", [cls_unsq, a_unsq], [idx_scores], axis=1, name="nms_CatClassAnchor"))
     det_scores = "det_scores"
-    g.node.append(oh.make_node(
-        "GatherND", [nms_scores, idx_scores], [det_scores],
-        batch_dims=1, name="nms_GatherDetScores"))
-
-    # ───────── declare final outputs ─────────
-    del g.output[:]   # remove existing outputs
-    g.output.extend([
-        oh.make_tensor_value_info(det_boxes,  TP.FLOAT, ['N', 4]),
-        oh.make_tensor_value_info(det_scores, TP.FLOAT, ['N']),
-        oh.make_tensor_value_info(class_idx,    TP.INT64, ['N']),
-        oh.make_tensor_value_info(b_idx,      TP.INT64, ['N']),
-    ])
-
+    g.node.append(oh.make_node("GatherND", [nms_scores, idx_scores], [det_scores], batch_dims=1, name="nms_GatherDetScores"))
+    del g.output[:]
+    g.output.extend([oh.make_tensor_value_info(det_boxes, TP.FLOAT, ['N', 4]),
+                     oh.make_tensor_value_info(det_scores, TP.FLOAT, ['N']),
+                     oh.make_tensor_value_info(class_idx, TP.INT64, ['N']),
+                     oh.make_tensor_value_info(b_idx, TP.INT64, ['N'])])
     onnx.checker.check_model(m)
     onnx.save(m, out_path)
     print(f"[SAVE] Final ONNX with NMS → {out_path}")
