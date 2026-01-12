@@ -11,13 +11,14 @@ Usage:
 """
 
 import sys
+import copy
 import torch
 import torch.nn as nn
 
 sys.path.insert(0, 'scripts')
 from picodet_lib_v2 import PicoDet, get_backbone, PicoDetHead, ResizeNorm
 from picodet_v5_qat import (
-    qat_prepare, PostprocessorForONNX, ONNXExportablePicoDet,
+    qat_prepare, PostprocessorForONNX, ONNXExportablePicoDet, ModelEMA,
     build_transforms, contiguous_id_to_name, unwrap_dataset,
     CANONICAL_COCO80_MAP
 )
@@ -216,6 +217,32 @@ def test_qat_preparation(model):
     return qat_model
 
 
+def test_qat_ema_and_convert_fx(model):
+    """Ensure EMA works with QAT models and convert_fx on EMA weights succeeds."""
+    from torch.ao.quantization.quantize_fx import convert_fx
+
+    model.cpu().eval()
+    if 'qnnpack' in torch.backends.quantized.supported_engines:
+        torch.backends.quantized.engine = 'qnnpack'
+    dummy_input = torch.randint(0, 256, (1, 3, IMG_SIZE, IMG_SIZE), dtype=torch.uint8)
+    qat_model = qat_prepare(model, dummy_input)
+    qat_model.train()
+
+    ema = ModelEMA(qat_model, decay=0.9, device=DEVICE)
+    # Drive observers and ensure EMA update path runs at least once.
+    with torch.no_grad():
+        _ = qat_model(dummy_input)
+    ema.update(qat_model)
+
+    ema_qat_copy = copy.deepcopy(ema.ema).cpu().eval()
+    int8_model = convert_fx(ema_qat_copy)
+
+    with torch.no_grad():
+        out = int8_model(dummy_input)
+    assert out is not None, "INT8 model forward should produce output"
+    assert isinstance(out, tuple) and len(out) in (2, 3), "Unexpected INT8 model output structure"
+
+
 def test_postprocessor(model):
     """Test ONNX postprocessor creation and execution."""
     postprocessor = PostprocessorForONNX(model.head)
@@ -364,15 +391,16 @@ def main():
     if qat_model is None:
         print("     Skipping remaining QAT tests due to preparation failure")
     else:
-        postprocessor = runner.test("2.2 PostprocessorForONNX creation", 
+        runner.test("2.2 QAT EMA + convert_fx", test_qat_ema_and_convert_fx, model)
+        postprocessor = runner.test("2.3 PostprocessorForONNX creation", 
                                     test_postprocessor, model)
         if postprocessor is not None:
-            runner.test("2.3 ONNX exportable wrapper", 
+            runner.test("2.4 ONNX exportable wrapper", 
                        test_onnx_exportable_wrapper, qat_model, postprocessor)
-            runner.test("2.4 ONNX wrapper mode toggling",
+            runner.test("2.5 ONNX wrapper mode toggling",
                        test_onnx_exportable_wrapper_mode_toggling, qat_model)
     
-    runner.test("2.5 ONNX module availability", test_onnx_compatibility)
+    runner.test("2.6 ONNX module availability", test_onnx_compatibility)
     
     # Part 3: Preprocessing Tests
     runner.section("Part 3: Data Preprocessing")

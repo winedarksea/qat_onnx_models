@@ -685,31 +685,61 @@ class ModelEMA:
     """
     def __init__(self, model: nn.Module, decay: float = 0.9998, device: torch.device | None = None):
         self.decay = float(decay)
-        self._param_keys = {k for k, _ in model.named_parameters()}
         self.ema = copy.deepcopy(model).eval()
         for p in self.ema.parameters():
             p.requires_grad_(False)
         if device is not None:
             self.ema.to(device)
         self.num_updates = 0
+    
+    @staticmethod
+    def _set_attr_by_dotted_name(root: nn.Module, dotted_name: str, value):
+        parts = dotted_name.split(".")
+        obj = root
+        for p in parts[:-1]:
+            if p.isdigit() and isinstance(obj, (nn.ModuleList, nn.Sequential)):
+                obj = obj[int(p)]
+            elif isinstance(obj, nn.ModuleDict) and p in obj:
+                obj = obj[p]
+            else:
+                obj = getattr(obj, p)
+        setattr(obj, parts[-1], value)
 
     @torch.no_grad()
     def update(self, model: nn.Module):
-        # EMA only parameters; copy all buffers (e.g., BatchNorm stats, QAT observers).
+        # EMA parameters; copy buffers (BN stats / QAT observers). Some buffers (e.g. QAT
+        # observers) can be lazily resized from shape [0] after first forward; handle that.
         self.num_updates += 1
         d = self.decay
-        msd = model.state_dict()
-        for k, v in self.ema.state_dict().items():
-            if k not in msd:
+
+        model_params = dict(model.named_parameters())
+        ema_params = dict(self.ema.named_parameters())
+        for name, ema_p in ema_params.items():
+            model_p = model_params.get(name)
+            if model_p is None:
                 continue
-            model_v = msd[k]
-            if k not in self._param_keys:
-                v.copy_(model_v)
-                continue
-            if not torch.is_floating_point(v):
-                v.copy_(model_v)
+            if not torch.is_floating_point(ema_p):
+                ema_p.copy_(model_p)
             else:
-                v.mul_(d).add_(model_v, alpha=1.0 - d)
+                ema_p.mul_(d).add_(model_p, alpha=1.0 - d)
+
+        model_buffers = dict(model.named_buffers())
+        ema_buffers = dict(self.ema.named_buffers())
+        for name, model_b in model_buffers.items():
+            if name not in ema_buffers:
+                continue
+            ema_b = ema_buffers[name]
+            if model_b is None:
+                continue
+            if (
+                ema_b is None
+                or ema_b.shape != model_b.shape
+                or ema_b.dtype != model_b.dtype
+                or ema_b.device != model_b.device
+            ):
+                self._set_attr_by_dotted_name(self.ema, name, model_b.detach().clone())
+            else:
+                ema_b.copy_(model_b)
 
     @torch.no_grad()
     def copy_to(self, model: nn.Module):
@@ -1470,6 +1500,17 @@ def save_fp32_onnx_reference(model, cfg):
 
 
 def save_intermediate_onnx(qat_model, cfg, model):
+    # Ensure a valid quantized engine is selected for convert_fx on CPU.
+    # (macOS often defaults to 'none' unless explicitly set.)
+    try:
+        if torch.backends.quantized.engine == 'none':
+            if 'fbgemm' in torch.backends.quantized.supported_engines:
+                torch.backends.quantized.engine = 'fbgemm'
+            elif 'qnnpack' in torch.backends.quantized.supported_engines:
+                torch.backends.quantized.engine = 'qnnpack'
+    except Exception:
+        pass
+
     # --- Convert QAT model to INT8 ---
     qat_copy = copy.deepcopy(qat_model).cpu().eval()
 
