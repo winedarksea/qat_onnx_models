@@ -280,8 +280,8 @@ def collate_and_filter_more(
     imgs, tgts = zip(*batch)
 
     # persistent running stats
-    if not hasattr(collate_and_filter, "stats"):
-        collate_and_filter.stats = {
+    if not hasattr(collate_and_filter_more, "stats"):
+        collate_and_filter_more.stats = {
             "batches": 0,
             "boxes_in": 0,
             "boxes_out": 0,
@@ -291,7 +291,7 @@ def collate_and_filter_more(
             "kept_neg": 0,
             "dropped_empty": 0,
         }
-    S = collate_and_filter.stats
+    S = collate_and_filter_more.stats
 
     good_imgs: List[torch.Tensor] = []
     good_tgts: List[dict] = []
@@ -607,11 +607,10 @@ class SimOTACache:
         # giou = tvops.generalized_box_iou(gt_boxes, anchor_candidate_boxes)  # (M,A)
         # cost_loc = 6.0 * (1.0 - giou)
         # -- VFL-style cost --------------------------------------
-        cls_prob = logit_cls_gt.sigmoid().clamp(1e-6, 1.0 - 1e-6)
         # Use the square of the standard IoU as a powerful quality weight
         quality_weight = iou.pow(self.power)
-        cost_cls = self.cls_cost_weight * quality_weight * F.binary_cross_entropy(
-            cls_prob, torch.ones_like(cls_prob), reduction='none'
+        cost_cls = self.cls_cost_weight * quality_weight * F.binary_cross_entropy_with_logits(
+            logit_cls_gt, torch.ones_like(logit_cls_gt), reduction='none'
         )
         # Combine costs with a large penalty for invalid anchors
         large_pen = torch.tensor(1e4, device=device, dtype=cost_loc.dtype)
@@ -671,17 +670,6 @@ class SimOTACache:
             k_min_hits_img = (dynamic_ks == self.dynamic_k_min).sum().item()
             self._debug_stats["k_min_hits"].append((k_min_hits_img, M))
 
-        # 7. lightweight debug  -----------------------------------------
-        if self.is_debug_mode and (self._dbg_iter % (2000 * self._dbg_mod) == 0):
-            num_fg   = fg_final.sum().item()
-            num_cand = fg_cand_mask.sum().item()
-            mean_iou = iou_out[fg_final].mean().item() if num_fg else 0
-            k_bar    = dynamic_ks.float().mean().item()
-            print(f"[SimOTA] fg={num_fg:4d} cand={num_cand:4d} "
-                  f"avgIoU={mean_iou:4.3f} k̄={k_bar:3.1f}")
-            if num_fg and (iou_out[fg_final] < 0.05).float().mean() > 0.2:
-                print("  ⚠️  >20 % FG IoU < 0.05 – verify anchor order / scales")
-
         self._dbg_iter += 1
         self.mean_fg_iou = iou_out[fg_final].mean().item() if fg_final.any() else 0.0
         # ----------------------------------------------------------------
@@ -690,6 +678,38 @@ class SimOTACache:
 
 
 # ───────────────────── train / val loops ────────────────────────
+class ModelEMA:
+    """
+    Exponential Moving Average of model weights.
+    Improves eval/export accuracy without affecting inference runtime.
+    """
+    def __init__(self, model: nn.Module, decay: float = 0.9998, device: torch.device | None = None):
+        self.decay = float(decay)
+        self.ema = copy.deepcopy(model).eval()
+        for p in self.ema.parameters():
+            p.requires_grad_(False)
+        if device is not None:
+            self.ema.to(device)
+        self.num_updates = 0
+
+    @torch.no_grad()
+    def update(self, model: nn.Module):
+        self.num_updates += 1
+        d = self.decay
+        msd = model.state_dict()
+        for k, v in self.ema.state_dict().items():
+            if k not in msd:
+                continue
+            model_v = msd[k]
+            if not torch.is_floating_point(v):
+                v.copy_(model_v)
+            else:
+                v.mul_(d).add_(model_v, alpha=1.0 - d)
+
+    @torch.no_grad()
+    def copy_to(self, model: nn.Module):
+        model.load_state_dict(self.ema.state_dict(), strict=True)
+
 def train_epoch(
     model: torch.nn.Module,
     loader,
@@ -712,6 +732,8 @@ def train_epoch(
     gamma_loss: float = 2.0,
     alpha_loss: float = 0.75,
     q_gamma: float = 0.5,
+    ema: ModelEMA | None = None,
+    require_anchor_inside_gt_for_cls: bool = True,
 ):
     """
     Runs a single training epoch, refactored for batch-centric loss calculation
@@ -760,6 +782,10 @@ def train_epoch(
         batch_fg_mask = torch.zeros_like(cls_p_batch[..., 0], dtype=torch.bool)
         total_num_fg_batch = 0
 
+        strides_all_anchors = torch.cat([
+            s[2].expand(s[0] * s[1]) for s in fmap_shapes
+        ]).to(device)
+
         for b_idx in range(bs):
             tgt_i = tgts_batch[b_idx]
             gt_boxes_img = tgt_i["boxes"].to(dtype=torch.float32, device=device)
@@ -770,18 +796,29 @@ def train_epoch(
                 cls_logits=cls_p_batch[b_idx], model_head=model.head,
             )
 
-            num_fg_img = fg_mask_img.sum().item()
+            pos_indices = fg_mask_img.nonzero(as_tuple=False).view(-1)
+            if require_anchor_inside_gt_for_cls and pos_indices.numel() > 0:
+                assigned_boxes_pos = gt_boxes_assigned[pos_indices]
+                anchor_centers_pos = anchor_centers_batch[pos_indices]
+                inside_mask_pos = (
+                    (anchor_centers_pos[:, 0] >= assigned_boxes_pos[:, 0]) &
+                    (anchor_centers_pos[:, 0] <= assigned_boxes_pos[:, 2]) &
+                    (anchor_centers_pos[:, 1] >= assigned_boxes_pos[:, 1]) &
+                    (anchor_centers_pos[:, 1] <= assigned_boxes_pos[:, 3])
+                )
+                pos_indices = pos_indices[inside_mask_pos]
+
+            num_fg_img = int(pos_indices.numel())
             total_num_fg_batch += num_fg_img
             fg_total += num_fg_img
             img_total += 1
             fg_zero_imgs += int(num_fg_img == 0)
             if num_fg_img > 0:
-                fg_iou_vals = iou_out_img[fg_mask_img]
+                fg_iou_vals = iou_out_img[pos_indices]
                 low_iou_fg += (fg_iou_vals < 0.05).sum().item()
                 total_fg_count += num_fg_img
 
             if num_fg_img > 0:
-                pos_indices = fg_mask_img.nonzero(as_tuple=False).view(-1)  # Use view(-1) for safety
                 batch_fg_mask[b_idx, pos_indices] = True
                 batch_box_targets[b_idx, pos_indices] = gt_boxes_assigned[pos_indices]
 
@@ -790,9 +827,6 @@ def train_epoch(
                 else:
                     with torch.no_grad():
                         reg_p_fg_img = reg_p_batch[b_idx, pos_indices]
-                        strides_all_anchors = torch.cat([
-                            s[2].expand(s[0] * s[1]) for s in fmap_shapes
-                        ]).to(device)
                         strides_fg_img = strides_all_anchors[pos_indices].unsqueeze(-1)
 
                         pred_ltrb = PicoDetHead.dfl_decode_for_training(
@@ -824,8 +858,7 @@ def train_epoch(
             box_targets_fg_batch = batch_box_targets[batch_fg_mask]
             anchor_centers_fg_batch = anchor_centers_batch.unsqueeze(0).expand(bs, -1, -1)[batch_fg_mask]
             
-            strides_all = torch.cat([s[2].expand(s[0] * s[1]) for s in fmap_shapes]).to(device)
-            strides_fg_batch = strides_all.unsqueeze(0).expand(bs, -1)[batch_fg_mask].unsqueeze(-1)
+            strides_fg_batch = strides_all_anchors.unsqueeze(0).expand(bs, -1)[batch_fg_mask].unsqueeze(-1)
 
             # Filter out anchors whose centers are outside their assigned GT box
             # This avoids training the model to predict degenerate zero-area boxes
@@ -893,6 +926,8 @@ def train_epoch(
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=6.0)
             scaler.step(opt)
             scaler.update()
+            if ema is not None:
+                ema.update(model)
             tot_loss_accum += batch_total_loss.item()
             successful_updates += 1
         else:
@@ -1059,6 +1094,8 @@ def quick_val_iou(
         print(f"Params: score_thresh={score_thresh}, iou_thresh={iou_thresh}, max_detections={max_detections}")
 
     for batch_idx, (imgs_batch, tgts_batch) in enumerate(loader):
+        if imgs_batch is None or (isinstance(imgs_batch, torch.Tensor) and imgs_batch.numel() == 0):
+            continue
         raw_pred_boxes_batch, raw_pred_scores_batch = model(imgs_batch.to(device))
 
         if debug_prints and batch_idx == 0:
@@ -1262,10 +1299,24 @@ class ONNXExportablePicoDet(nn.Module):
         self.postprocessor = head_postprocessor
 
     def forward(self, x: torch.Tensor):
-        is_training_before = self.core_model.training
-        self.core_model.train()
+        # We want raw per-level logits (head "training" path) while keeping BN/etc in eval.
+        core_was_training = bool(self.core_model.training)
+        head = getattr(self.core_model, "head", None)
+        head_was_training = bool(head.training) if head is not None else None
+
+        self.core_model.eval()
+        if head is not None:
+            head.train(True)
+        else:
+            # Fallback: if we can't reach a head module, preserve previous behavior.
+            self.core_model.train(True)
+
         raw_feature_outputs_tuple = self.core_model(x)
-        self.core_model.training = is_training_before
+
+        self.core_model.train(core_was_training)
+        if head is not None and head_was_training is not None:
+            head.train(head_was_training)
+
         return self.postprocessor(raw_feature_outputs_tuple)
 
 # ────────────────── append_nms_to_onnx ────────────────────
@@ -1476,7 +1527,15 @@ def save_intermediate_onnx(qat_model, cfg, model):
     return final_exportable_int8_model, int8_model_with_preprocessor, actual_onnx_input_example, temp_onnx_path
 
 
-def save_checkpoint(model: nn.Module, optimizer: torch.optim.Optimizer, epoch: int, cfg: argparse.Namespace, out_path: str):
+def save_checkpoint(
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    epoch: int,
+    cfg: argparse.Namespace,
+    out_path: str,
+    *,
+    ema: ModelEMA | None = None,
+):
     """
     Saves a comprehensive checkpoint.
 
@@ -1507,13 +1566,23 @@ def save_checkpoint(model: nn.Module, optimizer: torch.optim.Optimizer, epoch: i
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
     }
+    if ema is not None:
+        checkpoint['ema_state_dict'] = ema.ema.state_dict()
+        checkpoint['ema_decay'] = ema.decay
 
     # 3. Save the checkpoint
     torch.save(checkpoint, out_path)
     print(f"[SAVE] Checkpoint saved to {out_path} (Epoch: {epoch})")
 
 
-def load_checkpoint(new_model: nn.Module, ckpt_path: str, optimizer: torch.optim.Optimizer | None = None, device: torch.device = 'cpu'):
+def load_checkpoint(
+    new_model: nn.Module,
+    ckpt_path: str,
+    optimizer: torch.optim.Optimizer | None = None,
+    device: torch.device = 'cpu',
+    *,
+    ema: ModelEMA | None = None,
+):
     if not os.path.exists(ckpt_path):
         print(f"[WARN] Checkpoint file not found at {ckpt_path}. Starting from scratch.")
         return 0
@@ -1585,6 +1654,12 @@ def load_checkpoint(new_model: nn.Module, ckpt_path: str, optimizer: torch.optim
             optimizer.load_state_dict(ckpt['optimizer_state_dict'])
         else:
             print("[WARN] No optimizer provided. Optimizer state not loaded.")
+        if ema is not None and 'ema_state_dict' in ckpt:
+            try:
+                ema.ema.load_state_dict(ckpt['ema_state_dict'], strict=True)
+                print("[INFO] Loaded EMA weights from checkpoint.")
+            except Exception as e:
+                print(f"[WARN] Failed to load EMA weights: {e!r}")
         print(f"[INFO] Resuming from epoch {start_epoch}.")
         return start_epoch
 
@@ -1651,6 +1726,7 @@ def main(argv: List[str] | None = None):
     coco_label_map = CANONICAL_COCO80_MAP
 
     use_coco = True
+    train_sampler = None
     if not use_coco:
         NUM_CLASS = 3
         root = cfg.data_root
@@ -1725,6 +1801,8 @@ def main(argv: List[str] | None = None):
         neck_out_ch=out_ch,  # 96
         img_size=IMG_SIZE,
         head_reg_max=9 if IMG_SIZE < 320 else int((2 * math.ceil(IMG_SIZE / 128) + 3)),
+        head_score_thresh=0.05,
+        head_nms_iou=0.60,
         reg_conv_depth=reg_conv_depth,
         cls_conv_depth=cls_conv_depth,
         lat_k=lat_k,
@@ -1732,11 +1810,13 @@ def main(argv: List[str] | None = None):
     ).to(dev)
     
     # ------- (optional) random subset for quick runs -------
-    train_sampler = None
+    subset_sampler = None
     if TRAIN_SUBSET is not None:
-        train_sampler = torch.utils.data.RandomSampler(
-            train_ds, replacement=False,
-            num_samples=min(TRAIN_SUBSET, len(train_ds))
+        subset_base_ds = train_ds_subset if (not use_coco) else train_ds
+        subset_sampler = torch.utils.data.RandomSampler(
+            subset_base_ds,
+            replacement=False,
+            num_samples=min(TRAIN_SUBSET, len(subset_base_ds))
         )
     val_sampler = None
     if VAL_SUBSET is not None:
@@ -1765,13 +1845,16 @@ def main(argv: List[str] | None = None):
     # Create a dictionary of DataLoaders, one for each stage of the curriculum
     train_loaders = {}
     total_scheduled_epochs = 0
+    effective_train_sampler = subset_sampler or train_sampler
+    shuffle_train = effective_train_sampler is None
     for i, (num_epochs, min_size) in enumerate(curriculum_schedule):
         collate_fn = functools.partial(collate_and_filter_more, min_box_size=min_size)
 
         train_loaders[i] = DataLoader(
             train_ds_subset if not use_coco else train_ds, # Use the subset for training
             batch_size=cfg.batch,
-            sampler=train_sampler,
+            shuffle=shuffle_train,
+            sampler=effective_train_sampler,
             num_workers=cfg.workers,
             collate_fn=collate_fn,
             pin_memory=True, persistent_workers=bool(cfg.workers)
@@ -1880,6 +1963,7 @@ def main(argv: List[str] | None = None):
             milestones=[warmup_epochs]
         )
     scaler = torch.amp.GradScaler(enabled=dev.type == 'cuda')
+    ema = ModelEMA(model, decay=0.9998, device=dev)
 
     assigner = SimOTACache(
         nc=model.head.nc,
@@ -1892,7 +1976,7 @@ def main(argv: List[str] | None = None):
     # ── Resume / Finetune from checkpoint (optional) ─────────────────
     start_epoch = 0
     if cfg.load_from:
-        start_epoch = load_checkpoint(model, cfg.load_from, opt, dev)  # returns next epoch index
+        start_epoch = load_checkpoint(model, cfg.load_from, opt, dev, ema=ema)  # returns next epoch index
         # Align the LR scheduler with the starting epoch
         # (SequentialLR respects last_epoch; set and do NOT step here)
         sch.last_epoch = start_epoch - 1
@@ -2028,10 +2112,12 @@ def main(argv: List[str] | None = None):
             gamma_loss=gamma_loss,
             alpha_loss=alpha_loss,
             q_gamma=q_gamma,
+            ema=ema,
         )
         model.eval()
         try:
-            epoch_metrics = run_epoch_validation(model, vl_loader, dev, ep + 1, model.head)
+            val_model = ema.ema if ema is not None else model
+            epoch_metrics = run_epoch_validation(val_model, vl_loader, dev, ep + 1, val_model.head)
             epoch_metrics['train_loss'] = l if l is not None else -1.0
             epoch_metrics.update(diag)
             training_history[ep + 1] = epoch_metrics
@@ -2061,9 +2147,11 @@ def main(argv: List[str] | None = None):
         assigner._dbg_iter = 0   
         
         ckpt_path = "picodet.pt"
-        save_checkpoint(model, opt, ep + 1, cfg, ckpt_path)
+        save_checkpoint(model, opt, ep + 1, cfg, ckpt_path, ema=ema)
 
     print("[INFO] Evaluating FP32 model...")
+    if ema is not None:
+        ema.copy_to(model)
     model.eval()
     try:
         iou_05, acc = quick_val_iou(model, vl_loader, dev,
@@ -2124,6 +2212,7 @@ def main(argv: List[str] | None = None):
     # )
     qat_model = qat_model.to(dev)
     print("[INFO] QAT model prepared and moved to device.")
+    ema_qat = ModelEMA(qat_model, decay=0.999, device=dev)
 
     # --- QAT Finetuning ---
     qat_model.train()
@@ -2162,6 +2251,7 @@ def main(argv: List[str] | None = None):
             use_focal_loss=use_focal_loss,
             alpha_loss=alpha_loss,
             q_gamma=q_gamma,
+            ema=ema_qat,
         )
         scheduler_q.step() # Step the QAT LR scheduler
 
@@ -2175,7 +2265,8 @@ def main(argv: List[str] | None = None):
         qat_model.eval() # Switch qat_model to eval for validation
 
         try:
-            eval_compatible_qat_model = ONNXExportablePicoDet(qat_model, PostprocessorForONNX(model.head))
+            qat_eval_core = ema_qat.ema if ema_qat is not None else qat_model
+            eval_compatible_qat_model = ONNXExportablePicoDet(qat_eval_core, PostprocessorForONNX(model.head))
             eval_compatible_qat_model.to(dev).eval() # Ensure it's on device and in eval mode
 
             # Using a consistent score_thresh for tracking QAT progress, e.g., 0.05 or 0.25
@@ -2194,7 +2285,7 @@ def main(argv: List[str] | None = None):
             if current_qat_val_iou > best_qat_iou:
                 best_qat_iou = current_qat_val_iou
                 final_exportable_int8_model, int8_model_with_preprocessor, actual_onnx_input_example, temp_onnx_path = save_intermediate_onnx(
-                    qat_model, cfg, model
+                    qat_eval_core, cfg, model
                 )
                 print(f"[QAT] New best QAT validation IoU: {best_qat_iou:.4f}. Model saved.")
 
@@ -2206,7 +2297,8 @@ def main(argv: List[str] | None = None):
 
 
     if final_exportable_int8_model is None:
-        final_exportable_int8_model, int8_model_with_preprocessor, actual_onnx_input_example, temp_onnx_path = save_intermediate_onnx(qat_model, cfg, model)
+        qat_export_core = ema_qat.ema if ema_qat is not None else qat_model
+        final_exportable_int8_model, int8_model_with_preprocessor, actual_onnx_input_example, temp_onnx_path = save_intermediate_onnx(qat_export_core, cfg, model)
 
     if debug_prints:
         # DEBUG: Inspect intermediate ONNX model outputs
@@ -2464,6 +2556,7 @@ def plot_assignment_history(history: dict, title: str = 'Assignment Diagnostics'
 
 if __name__ == '__main__':
     final_history = main()
+    # history_df = pd.DataFrame(final_history).transpose()
     plot_training_history(final_history, title="PicoDet Training Progress")
     plot_assignment_history(final_history, title="Assignment Diagnostics")
 
