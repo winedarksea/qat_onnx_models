@@ -1304,28 +1304,10 @@ class ONNXExportablePicoDet(nn.Module):
         self.postprocessor = head_postprocessor
 
     def forward(self, x: torch.Tensor):
-        # Prefer stable eval for backbone/neck (BN, etc) but force the PicoDetHead
-        # into "training" mode so it emits raw per-level logits instead of decoded boxes.
-        core_was_training = bool(self.core_model.training)
-        target_head: nn.Module | None = getattr(self.core_model, "head", None)
-        if not isinstance(target_head, PicoDetHead):
-            target_head = None
-            for m in self.core_model.modules():
-                if isinstance(m, PicoDetHead):
-                    target_head = m
-                    break
-        head_was_training = bool(target_head.training) if target_head is not None else None
-
-        self.core_model.eval()
-        if target_head is not None:
-            target_head.train(True)
-
+        is_training_before = self.core_model.training
+        self.core_model.train()
         raw_feature_outputs_tuple = self.core_model(x)
-
-        self.core_model.train(core_was_training)
-        if target_head is not None and head_was_training is not None:
-            target_head.train(head_was_training)
-
+        self.core_model.training = is_training_before
         return self.postprocessor(raw_feature_outputs_tuple)
 
 # ────────────────── append_nms_to_onnx ────────────────────
