@@ -685,6 +685,7 @@ class ModelEMA:
     """
     def __init__(self, model: nn.Module, decay: float = 0.9998, device: torch.device | None = None):
         self.decay = float(decay)
+        self._param_keys = {k for k, _ in model.named_parameters()}
         self.ema = copy.deepcopy(model).eval()
         for p in self.ema.parameters():
             p.requires_grad_(False)
@@ -694,6 +695,7 @@ class ModelEMA:
 
     @torch.no_grad()
     def update(self, model: nn.Module):
+        # EMA only parameters; copy all buffers (e.g., BatchNorm stats, QAT observers).
         self.num_updates += 1
         d = self.decay
         msd = model.state_dict()
@@ -701,6 +703,9 @@ class ModelEMA:
             if k not in msd:
                 continue
             model_v = msd[k]
+            if k not in self._param_keys:
+                v.copy_(model_v)
+                continue
             if not torch.is_floating_point(v):
                 v.copy_(model_v)
             else:
@@ -1299,23 +1304,27 @@ class ONNXExportablePicoDet(nn.Module):
         self.postprocessor = head_postprocessor
 
     def forward(self, x: torch.Tensor):
-        # We want raw per-level logits (head "training" path) while keeping BN/etc in eval.
+        # Prefer stable eval for backbone/neck (BN, etc) but force the PicoDetHead
+        # into "training" mode so it emits raw per-level logits instead of decoded boxes.
         core_was_training = bool(self.core_model.training)
-        head = getattr(self.core_model, "head", None)
-        head_was_training = bool(head.training) if head is not None else None
+        target_head: nn.Module | None = getattr(self.core_model, "head", None)
+        if not isinstance(target_head, PicoDetHead):
+            target_head = None
+            for m in self.core_model.modules():
+                if isinstance(m, PicoDetHead):
+                    target_head = m
+                    break
+        head_was_training = bool(target_head.training) if target_head is not None else None
 
         self.core_model.eval()
-        if head is not None:
-            head.train(True)
-        else:
-            # Fallback: if we can't reach a head module, preserve previous behavior.
-            self.core_model.train(True)
+        if target_head is not None:
+            target_head.train(True)
 
         raw_feature_outputs_tuple = self.core_model(x)
 
         self.core_model.train(core_was_training)
-        if head is not None and head_was_training is not None:
-            head.train(head_was_training)
+        if target_head is not None and head_was_training is not None:
+            target_head.train(head_was_training)
 
         return self.postprocessor(raw_feature_outputs_tuple)
 
@@ -1675,6 +1684,8 @@ def main(argv: List[str] | None = None):
     pa.add_argument('--out', default='picodet_v5_int8.onnx')
     pa.add_argument('--no_inplace_head_neck', default=True, action='store_true', help="Disable inplace activations in head/neck")
     pa.add_argument('--min_box_size', type=int, default=8, help="Minimum pixel width/height for a GT box to be used in training.")
+    pa.add_argument('--no_anchor_inside_gt_for_cls', action='store_true',
+                    help="Disable requiring positive anchors' centers to lie inside their assigned GT box for classification targets.")
     pa.add_argument('--load_from', type=str, default="picodet_50coco.pt", help="Path to a checkpoint to resume or finetune from (e.g., picodet_50coco.pt)")
     pa.add_argument('--data_root', default='test')
     pa.add_argument('--ann', default='test/annotations/instances.json')
@@ -2113,6 +2124,7 @@ def main(argv: List[str] | None = None):
             alpha_loss=alpha_loss,
             q_gamma=q_gamma,
             ema=ema,
+            require_anchor_inside_gt_for_cls=not cfg.no_anchor_inside_gt_for_cls,
         )
         model.eval()
         try:
@@ -2252,6 +2264,7 @@ def main(argv: List[str] | None = None):
             alpha_loss=alpha_loss,
             q_gamma=q_gamma,
             ema=ema_qat,
+            require_anchor_inside_gt_for_cls=not cfg.no_anchor_inside_gt_for_cls,
         )
         scheduler_q.step() # Step the QAT LR scheduler
 

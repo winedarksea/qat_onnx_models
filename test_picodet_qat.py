@@ -259,6 +259,37 @@ def test_onnx_exportable_wrapper(qat_model, postprocessor):
     return exportable_model
 
 
+def test_onnx_exportable_wrapper_mode_toggling(qat_model):
+    """Verify ONNXExportablePicoDet forces head to train while keeping core eval."""
+    class SpyPostprocessor(nn.Module):
+        def __init__(self, core):
+            super().__init__()
+            self.core = core
+            self.observed = None
+
+        def forward(self, raw_outputs):
+            head = getattr(self.core, "head", None)
+            self.observed = (bool(self.core.training), bool(head.training) if head is not None else None)
+            return (
+                torch.zeros((1, 1, 4), dtype=torch.float32),
+                torch.zeros((1, 1, NUM_CLASSES), dtype=torch.float32),
+            )
+
+    spy = SpyPostprocessor(qat_model)
+    exportable_model = ONNXExportablePicoDet(qat_model, spy).cpu()
+
+    qat_model.eval()
+    dummy_input = torch.randint(0, 256, (1, 3, IMG_SIZE, IMG_SIZE), dtype=torch.uint8)
+    with torch.no_grad():
+        _ = exportable_model(dummy_input)
+
+    assert spy.observed is not None, "SpyPostprocessor should have observed training states"
+    core_training, head_training = spy.observed
+    assert core_training is False, "Core model should be eval() during forward"
+    assert head_training in (True, None), "Head should be forced to train() when present"
+    assert qat_model.training is False, "Core model training state should be restored after forward"
+
+
 def test_onnx_compatibility():
     """Test ONNX module availability and version."""
     try:
@@ -337,8 +368,10 @@ def main():
         if postprocessor is not None:
             runner.test("2.3 ONNX exportable wrapper", 
                        test_onnx_exportable_wrapper, qat_model, postprocessor)
+            runner.test("2.4 ONNX wrapper mode toggling",
+                       test_onnx_exportable_wrapper_mode_toggling, qat_model)
     
-    runner.test("2.4 ONNX module availability", test_onnx_compatibility)
+    runner.test("2.5 ONNX module availability", test_onnx_compatibility)
     
     # Part 3: Preprocessing Tests
     runner.section("Part 3: Data Preprocessing")
