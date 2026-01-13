@@ -16,6 +16,9 @@ import onnx
 from onnx import TensorProto as TP, helper as oh
 import onnxruntime as ort
 
+import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
+import pandas as pd
 from pycocotools.coco import COCO
 
 # Import required classes from picodet_lib_v2
@@ -417,6 +420,7 @@ class SimOTACache:
                  ctr: float = 2.5,
                  topk: int = 10,
                  cls_cost_weight: float = 1.0,
+                 cls_cost_iou_power: float = 0.0,
                  debug_epochs: int = 0,         # 0 = silent
                  dynamic_k_min: int = 2,
                  min_iou_threshold: float = 0.02,  # Reject assignments with IoU below this
@@ -429,7 +433,7 @@ class SimOTACache:
         self.simota_prefilter = False
         self.dynamic_k_min = dynamic_k_min  # 3, or 1-2
         self.min_iou_threshold = min_iou_threshold
-        self.power = 0.0 
+        self.power = float(cls_cost_iou_power)
         self.mean_fg_iou = 0.0
 
         # --- State for debugging system ---
@@ -769,6 +773,7 @@ def train_epoch(
     q_gamma: float = 0.5,
     ema: ModelEMA | None = None,
     require_anchor_inside_gt_for_cls: bool = True,
+    anchor_inside_gt_margin: float = 0.0,
 ):
     """
     Runs a single training epoch, refactored for batch-centric loss calculation
@@ -780,6 +785,7 @@ def train_epoch(
     fg_zero_imgs = 0
     low_iou_fg = 0
     total_fg_count = 0
+    fg_iou_sum = 0.0
     tot_loss_accum = 0.
 
     for i, (imgs, tgts_batch) in enumerate(loader):
@@ -835,11 +841,16 @@ def train_epoch(
             if require_anchor_inside_gt_for_cls and pos_indices.numel() > 0:
                 assigned_boxes_pos = gt_boxes_assigned[pos_indices]
                 anchor_centers_pos = anchor_centers_batch[pos_indices]
+                if anchor_inside_gt_margin > 0:
+                    strides_pos = strides_all_anchors[pos_indices].to(dtype=assigned_boxes_pos.dtype, device=assigned_boxes_pos.device)
+                    margin = strides_pos * float(anchor_inside_gt_margin)
+                else:
+                    margin = torch.zeros((pos_indices.numel(),), dtype=assigned_boxes_pos.dtype, device=assigned_boxes_pos.device)
                 inside_mask_pos = (
-                    (anchor_centers_pos[:, 0] >= assigned_boxes_pos[:, 0]) &
-                    (anchor_centers_pos[:, 0] <= assigned_boxes_pos[:, 2]) &
-                    (anchor_centers_pos[:, 1] >= assigned_boxes_pos[:, 1]) &
-                    (anchor_centers_pos[:, 1] <= assigned_boxes_pos[:, 3])
+                    (anchor_centers_pos[:, 0] >= assigned_boxes_pos[:, 0] - margin) &
+                    (anchor_centers_pos[:, 0] <= assigned_boxes_pos[:, 2] + margin) &
+                    (anchor_centers_pos[:, 1] >= assigned_boxes_pos[:, 1] - margin) &
+                    (anchor_centers_pos[:, 1] <= assigned_boxes_pos[:, 3] + margin)
                 )
                 pos_indices = pos_indices[inside_mask_pos]
 
@@ -851,6 +862,7 @@ def train_epoch(
             if num_fg_img > 0:
                 fg_iou_vals = iou_out_img[pos_indices]
                 low_iou_fg += (fg_iou_vals < 0.05).sum().item()
+                fg_iou_sum += fg_iou_vals.sum().item()
                 total_fg_count += num_fg_img
 
             if num_fg_img > 0:
@@ -898,16 +910,15 @@ def train_epoch(
             # Filter out anchors whose centers are outside their assigned GT box
             # This avoids training the model to predict degenerate zero-area boxes
             anchor_inside_gt_mask = (
-                (anchor_centers_fg_batch[:, 0] >= box_targets_fg_batch[:, 0]) &  # anchor_x >= gt_x1
-                (anchor_centers_fg_batch[:, 0] <= box_targets_fg_batch[:, 2]) &  # anchor_x <= gt_x2
-                (anchor_centers_fg_batch[:, 1] >= box_targets_fg_batch[:, 1]) &  # anchor_y >= gt_y1
-                (anchor_centers_fg_batch[:, 1] <= box_targets_fg_batch[:, 3])    # anchor_y <= gt_y2
+                (anchor_centers_fg_batch[:, 0] >= box_targets_fg_batch[:, 0] - (strides_fg_batch[:, 0] * float(anchor_inside_gt_margin))) &  # anchor_x >= gt_x1
+                (anchor_centers_fg_batch[:, 0] <= box_targets_fg_batch[:, 2] + (strides_fg_batch[:, 0] * float(anchor_inside_gt_margin))) &  # anchor_x <= gt_x2
+                (anchor_centers_fg_batch[:, 1] >= box_targets_fg_batch[:, 1] - (strides_fg_batch[:, 0] * float(anchor_inside_gt_margin))) &  # anchor_y >= gt_y1
+                (anchor_centers_fg_batch[:, 1] <= box_targets_fg_batch[:, 3] + (strides_fg_batch[:, 0] * float(anchor_inside_gt_margin)))    # anchor_y <= gt_y2
             )
             
             num_inside = anchor_inside_gt_mask.sum().item()
             num_outside = total_num_fg_batch - num_inside
-            if num_outside > 0 and debug_prints and i == 0:
-                print(f"  [INFO] Filtered {num_outside} anchors outside GT boxes ({100*num_outside/total_num_fg_batch:.1f}%)")
+            # Suppressed per-batch filtering info
             
             # Only proceed with regression loss if we have valid inside anchors
             if num_inside > 0:
@@ -969,12 +980,6 @@ def train_epoch(
             if debug_prints: print(f"WARNING: Non-finite loss in batch {i}. Skipping update.")
             continue
 
-        if debug_prints and (i == 0 or (i > 0 and i % 1000 == 0)):
-            avg_loss_so_far = tot_loss_accum / successful_updates if successful_updates > 0 else 0.
-            print(f"E{epoch:<3} {i:04d}/{len(loader)} | "
-                  f"Loss: {batch_total_loss.item():.4f} (Avg: {avg_loss_so_far:.4f}) | "
-                  f"FG/Batch: {total_num_fg_batch} | Norm: {loss_normalizer}")
-
     if successful_updates > 0:
         avg_epoch_loss = tot_loss_accum / successful_updates
         # --- Aggregate assignment diagnostics for the epoch ---
@@ -1008,10 +1013,13 @@ def train_epoch(
         else:
             switch_rate = float("nan")
 
+        mean_fg_iou = (fg_iou_sum / total_fg_count) if total_fg_count > 0 else 0.0
+        assigner.mean_fg_iou = mean_fg_iou
+
         epoch_diag = {
             "fg_per_img": fg_total / max(img_total, 1),
             "fg_zero_img_pct": (fg_zero_imgs / max(img_total, 1)) * 100.0,
-            "mean_fg_iou": assigner.mean_fg_iou if hasattr(assigner, "mean_fg_iou") else float("nan"),
+            "mean_fg_iou": mean_fg_iou,
             "pct_fg_iou_lt_0_05": (low_iou_fg / total_fg_count) * 100 if total_fg_count > 0 else 0.0,
             "centre_hit": centre_hit,
             "pct_gt_at_min_k": pct_gt_at_min_k,
@@ -1123,6 +1131,12 @@ def quick_val_iou(
     # Add counters for classification accuracy
     total_matched_preds = 0
     correctly_classified_preds = 0
+    # Recall/precision (IoU-thresholded, simple matching)
+    total_gt_hits_loc = 0
+    total_gt_hits_cls = 0
+    total_tp_loc = 0
+    total_tp_cls = 0
+    total_fp = 0
 
     if debug_prints:
         print(f"\n--- quick_val_iou Start (Epoch: {epoch_num}, Run: {run_name}) ---")
@@ -1133,11 +1147,7 @@ def quick_val_iou(
             continue
         raw_pred_boxes_batch, raw_pred_scores_batch = model(imgs_batch.to(device))
 
-        if debug_prints and batch_idx == 0:
-            print(f"[Debug Eval Batch 0] raw_pred_boxes_batch shape: {raw_pred_boxes_batch.shape}")
-            print(f"[Debug Eval Batch 0] raw_pred_scores_batch shape: {raw_pred_scores_batch.shape}")
-            bb = tgts_batch[0]["boxes"]
-            print(f"  [DEBUG] batch {batch_idx} images: {imgs_batch.shape}, boxes: {bb.shape}, sample: {bb[:2]}")
+        # Suppressed per-batch validation debug info
 
         (pred_boxes_batch_padded,
          pred_scores_batch_padded,
@@ -1154,6 +1164,8 @@ def quick_val_iou(
         for i in range(imgs_batch.size(0)):
             num_images_processed += 1
             current_img_annots_raw = tgts_batch[i]
+            num_actual_dets_this_img = debug_num_preds_after_nms_batch[i]
+            total_preds_after_nms_filter_across_images += num_actual_dets_this_img
 
             # Make sure to get both boxes and labels for the ground truth
             gt_boxes_xyxy = current_img_annots_raw["boxes"]
@@ -1167,19 +1179,16 @@ def quick_val_iou(
                 gt_labels_tensor = torch.empty((0,), dtype=torch.long, device=device)
 
             if gt_boxes_tensor.numel() == 0:
+                total_fp += int(num_actual_dets_this_img)
                 continue
 
             num_images_with_gt += 1
             total_gt_boxes_across_images += gt_boxes_tensor.shape[0]
 
-            num_actual_dets_this_img = debug_num_preds_after_nms_batch[i]
-            total_preds_after_nms_filter_across_images += num_actual_dets_this_img
-
-            if debug_prints and batch_idx == 0 and i < 2:
+            if False:
                 print(f"[Debug Eval Img {num_images_processed-1}] GTs: {gt_boxes_tensor.shape[0]}.")
                 print(f"  Num Preds BEFORE NMS (passed score_thresh): {debug_num_preds_before_nms_batch[i]}")
                 print(f"  Num Preds AFTER NMS (final): {num_actual_dets_this_img}")
-                # The problematic debug line that accessed model.head.cls_pred was here and has been removed.
 
             if num_actual_dets_this_img == 0:
                 continue
@@ -1193,6 +1202,7 @@ def quick_val_iou(
             if iou_matrix.numel() > 0:
                 max_iou_per_gt, _ = iou_matrix.max(dim=0)
                 total_iou_sum += max_iou_per_gt.sum().item()
+                total_gt_hits_loc += int((max_iou_per_gt > iou_match_thresh).sum().item())
 
                 # --- Logic for Classification Accuracy ---
                 max_iou_per_pred, best_gt_indices_for_pred = iou_matrix.max(dim=1)
@@ -1202,6 +1212,13 @@ def quick_val_iou(
                 matches_are_correctly_classified = (matched_pred_labels == matched_gt_labels).sum().item()
                 total_matched_preds += matched_mask.sum().item()
                 correctly_classified_preds += matches_are_correctly_classified
+                total_tp_loc += int(matched_mask.sum().item())
+                total_tp_cls += int(matches_are_correctly_classified)
+                total_fp += int((~matched_mask).sum().item())
+
+                correct_class = actual_predicted_labels.unsqueeze(1) == gt_labels_tensor.unsqueeze(0)  # (P, G)
+                gt_hit_cls = ((iou_matrix > iou_match_thresh) & correct_class).any(dim=0)
+                total_gt_hits_cls += int(gt_hit_cls.sum().item())
 
     if debug_prints:
         print(f"--- quick_val_iou End (Epoch: {epoch_num}, Run: {run_name}) ---")
@@ -1211,6 +1228,13 @@ def quick_val_iou(
         avg_preds_after_nms = total_preds_after_nms_filter_across_images / num_images_processed if num_images_processed > 0 else 0
         print(f"Avg preds/img (passed score_thresh, before NMS): {avg_preds_before_nms:.2f}")
         print(f"Avg preds/img (after NMS & final filter): {avg_preds_after_nms:.2f}")
+        recall_loc = (total_gt_hits_loc / total_gt_boxes_across_images) if total_gt_boxes_across_images > 0 else 0.0
+        recall_cls = (total_gt_hits_cls / total_gt_boxes_across_images) if total_gt_boxes_across_images > 0 else 0.0
+        precision_loc = (total_tp_loc / (total_tp_loc + total_fp)) if (total_tp_loc + total_fp) > 0 else 0.0
+        precision_cls = (total_tp_cls / (total_tp_loc + total_fp)) if (total_tp_loc + total_fp) > 0 else 0.0
+        avg_fp_per_img = (total_fp / num_images_processed) if num_images_processed > 0 else 0.0
+        print(f"Recall@IoU>{iou_match_thresh:.2f}: loc={recall_loc:.3f} cls={recall_cls:.3f}")
+        print(f"Precision@IoU>{iou_match_thresh:.2f}: loc={precision_loc:.3f} cls={precision_cls:.3f} | FP/img={avg_fp_per_img:.2f}")
 
     if total_gt_boxes_across_images > 0:
         final_mean_iou = total_iou_sum / total_gt_boxes_across_images
@@ -1709,7 +1733,16 @@ def main(argv: List[str] | None = None):
     pa.add_argument('--min_box_size', type=int, default=8, help="Minimum pixel width/height for a GT box to be used in training.")
     pa.add_argument('--no_anchor_inside_gt_for_cls', action='store_true',
                     help="Disable requiring positive anchors' centers to lie inside their assigned GT box for classification targets.")
-    pa.add_argument('--load_from', type=str, default="picodet_50coco.pt", help="Path to a checkpoint to resume or finetune from (e.g., picodet_50coco.pt)")
+    pa.add_argument('--anchor_inside_gt_margin', type=float, default=0.0,
+                    help="Allow positives within a margin of the GT box edges, in units of stride (e.g. 0.5 = half a stride).")
+    pa.add_argument('--simota_ctr', type=float, default=3.5)
+    pa.add_argument('--simota_topk', type=int, default=10)
+    pa.add_argument('--simota_dynamic_k_min', type=int, default=2)
+    pa.add_argument('--simota_min_iou_threshold', type=float, default=0.02)
+    pa.add_argument('--simota_cls_cost_weight', type=float, default=2.0)
+    pa.add_argument('--simota_cls_cost_iou_power', type=float, default=0.0,
+                    help="Weights SimOTA classification cost by IoU^p (p>0 reduces class-cost influence for low-IoU anchors).")
+    pa.add_argument('--load_from', type=str, default=False, help="Path to a checkpoint to resume or finetune from (e.g., 'picodet_50coco.pt')")
     pa.add_argument('--data_root', default='test')
     pa.add_argument('--ann', default='test/annotations/instances.json')
     pa.add_argument('--val_pct', type=float, default=0.05)
@@ -2001,11 +2034,13 @@ def main(argv: List[str] | None = None):
 
     assigner = SimOTACache(
         nc=model.head.nc,
-        ctr=3.5,  # Increased from 2.5/4.0 - 5.14% hit rate was too low
-        topk=10,  # 10
-        cls_cost_weight=2.0,  # Reduced from 3.0 - 21.85% switch rate too high
+        ctr=cfg.simota_ctr,
+        topk=cfg.simota_topk,
+        cls_cost_weight=cfg.simota_cls_cost_weight,
+        cls_cost_iou_power=cfg.simota_cls_cost_iou_power,
         debug_epochs=5 if debug_prints else 0,
-        dynamic_k_min=2,
+        dynamic_k_min=cfg.simota_dynamic_k_min,
+        min_iou_threshold=cfg.simota_min_iou_threshold,
     )
     # ── Resume / Finetune from checkpoint (optional) ─────────────────
     start_epoch = 0
@@ -2126,10 +2161,8 @@ def main(argv: List[str] | None = None):
             assigner.power = 0.0
         elif assigner.mean_fg_iou < 0.45:
             assigner.power = min(1.0, assigner.power + 0.20)
-            print(f"epoch {ep} and assigner IoU weighting power is {assigner.power}")
         else:
             assigner.power = min(2.0, assigner.power + 0.25)
-            print(f"epoch {ep} and assigner IoU weighting power is {assigner.power}")
 
         model.train()
         l, diag = train_epoch(
@@ -2148,6 +2181,7 @@ def main(argv: List[str] | None = None):
             q_gamma=q_gamma,
             ema=ema,
             require_anchor_inside_gt_for_cls=not cfg.no_anchor_inside_gt_for_cls,
+            anchor_inside_gt_margin=cfg.anchor_inside_gt_margin,
         )
         model.eval()
         try:
@@ -2288,6 +2322,7 @@ def main(argv: List[str] | None = None):
             q_gamma=q_gamma,
             ema=ema_qat,
             require_anchor_inside_gt_for_cls=not cfg.no_anchor_inside_gt_for_cls,
+            anchor_inside_gt_margin=cfg.anchor_inside_gt_margin,
         )
         scheduler_q.step() # Step the QAT LR scheduler
 
@@ -2297,7 +2332,6 @@ def main(argv: List[str] | None = None):
             print(f'[QAT] Epoch {qep + 1}/{qat_epochs} Train Loss N/A (no samples contributed)')
 
         # --- QAT Validation after each epoch ---
-        print(f"[QAT] Evaluating after Epoch {qep + 1}...")
         qat_model.eval() # Switch qat_model to eval for validation
 
         try:
@@ -2452,9 +2486,6 @@ def main(argv: List[str] | None = None):
     return training_history
 
 
-import matplotlib.pyplot as plt
-import matplotlib.ticker as mticker
-
 def plot_training_history(history: dict, title: str = 'Training Progress'):
     """
     Plots the key metrics from a training‑history dictionary.
@@ -2592,7 +2623,7 @@ def plot_assignment_history(history: dict, title: str = 'Assignment Diagnostics'
 
 if __name__ == '__main__':
     final_history = main()
-    # history_df = pd.DataFrame(final_history).transpose()
+    history_df = pd.DataFrame(final_history).transpose()
     plot_training_history(final_history, title="PicoDet Training Progress")
     plot_assignment_history(final_history, title="Assignment Diagnostics")
 
