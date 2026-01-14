@@ -287,15 +287,22 @@ class PicoDetHead(nn.Module):
         self.register_buffer('dfl_project_buffer', dfl_project_tensor, persistent=False)
 
         if self.cls_conv_depth <= 1:
-            self.cls_conv = nn.Sequential(
-                GhostConv(num_feats, num_feats, k=first_cls_conv_k, inplace_act=inplace_act)
-            )
+            self.cls_conv = nn.ModuleList([
+                nn.Sequential(
+                    GhostConv(num_feats, num_feats, k=first_cls_conv_k, inplace_act=inplace_act)
+                ) for _ in range(self.nl)
+            ])
         else:
-            self.cls_conv = nn.Sequential(
-                GhostConv(num_feats, num_feats, k=first_cls_conv_k, inplace_act=inplace_act),
-                *[GhostConv(num_feats, num_feats, inplace_act=inplace_act) for _ in range(self.cls_conv_depth - 1)]
-            )
-        self.reg_conv = nn.Sequential(*[GhostConv(num_feats, num_feats, ratio=2.0, inplace_act=inplace_act) for _ in range(self.reg_conv_depth)])
+            self.cls_conv = nn.ModuleList([
+                nn.Sequential(
+                    GhostConv(num_feats, num_feats, k=first_cls_conv_k, inplace_act=inplace_act),
+                    *[GhostConv(num_feats, num_feats, inplace_act=inplace_act) for _ in range(self.cls_conv_depth - 1)]
+                ) for _ in range(self.nl)
+            ])
+        self.reg_conv = nn.ModuleList([
+            nn.Sequential(*[GhostConv(num_feats, num_feats, ratio=2.0, inplace_act=inplace_act) for _ in range(self.reg_conv_depth)])
+            for _ in range(self.nl)
+        ])
         self.cls_pred = nn.ModuleList([nn.Conv2d(num_feats, self.nc, 1) for _ in range(self.nl)])
         self.reg_pred = nn.ModuleList(
             [nn.Conv2d(num_feats, 4 * (self.reg_max + 1), 1) for _ in range(self.nl)]
@@ -416,9 +423,10 @@ class PicoDetHead(nn.Module):
         raw_reg_logits_levels: List[torch.Tensor] = []
 
         for i, f_map_level in enumerate(neck_feature_maps):
-            cls_common_feat = self.cls_ese[i](self.cls_conv(f_map_level))
+            # Unshared head: Use cls_conv[i] and reg_conv[i]
+            cls_common_feat = self.cls_ese[i](self.cls_conv[i](f_map_level))
             raw_cls_logits_levels.append(self.cls_pred[i](cls_common_feat))
-            raw_reg_logits_levels.append(self.reg_pred[i](self.reg_conv(f_map_level)))
+            raw_reg_logits_levels.append(self.reg_pred[i](self.reg_conv[i](f_map_level)))
 
         if self.training:
             return (
