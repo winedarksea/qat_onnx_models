@@ -1733,13 +1733,13 @@ def main(argv: List[str] | None = None):
     pa.add_argument('--min_box_size', type=int, default=8, help="Minimum pixel width/height for a GT box to be used in training.")
     pa.add_argument('--no_anchor_inside_gt_for_cls', action='store_true',
                     help="Disable requiring positive anchors' centers to lie inside their assigned GT box for classification targets.")
-    pa.add_argument('--anchor_inside_gt_margin', type=float, default=0.25,
+    pa.add_argument('--anchor_inside_gt_margin', type=float, default=0.0,
                     help="Allow positives within a margin of the GT box edges, in units of stride (e.g. 0.5 = half a stride).")
-    pa.add_argument('--simota_ctr', type=float, default=5.0)
-    pa.add_argument('--simota_topk', type=int, default=12)
-    pa.add_argument('--simota_dynamic_k_min', type=int, default=3)
-    pa.add_argument('--simota_min_iou_threshold', type=float, default=0.10)
-    pa.add_argument('--simota_cls_cost_weight', type=float, default=0.5)
+    pa.add_argument('--simota_ctr', type=float, default=3.5)
+    pa.add_argument('--simota_topk', type=int, default=10)
+    pa.add_argument('--simota_dynamic_k_min', type=int, default=2)
+    pa.add_argument('--simota_min_iou_threshold', type=float, default=0.02)
+    pa.add_argument('--simota_cls_cost_weight', type=float, default=2.0)
     pa.add_argument('--simota_cls_cost_iou_power', type=float, default=0.0,
                     help="Weights SimOTA classification cost by IoU^p (p>0 reduces class-cost influence for low-IoU anchors).")
     pa.add_argument('--load_from', type=str, default=False, help="Path to a checkpoint to resume or finetune from (e.g., 'picodet_50coco.pt')")
@@ -1753,7 +1753,7 @@ def main(argv: List[str] | None = None):
     debug_prints = True
     BACKBONE_FREEZE_EPOCHS = 2 if cfg.epochs < 12 else 3  # 0 to disable
     use_focal_loss = False
-    FOCAL_LOSS_WARMUP_EPOCHS = 15 if cfg.epochs >= 25 else max(8, int(cfg.epochs * 0.6))
+    FOCAL_LOSS_WARMUP_EPOCHS = 10
 
     if cfg.device is None:
         cfg.device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -1779,10 +1779,10 @@ def main(argv: List[str] | None = None):
         # assigner ctr often needs to be larger with larger images as well
     gamma_loss = 2.0
     alpha_loss = 0.75
-    quality_floor_vfl = 0.02
+    quality_floor_vfl = 0.04
     q_gamma = 0.5
-    CLS_WEIGHT = 2.5
-    IOU_WEIGHT = 2.5
+    CLS_WEIGHT = 2.0
+    IOU_WEIGHT = 2.0
 
     # Load data
     root = cfg.coco_root
@@ -1840,6 +1840,8 @@ def main(argv: List[str] | None = None):
             CocoDetectionV2(f"{root}/images", ann_path, label_map, transforms=full_val_tf),
             val_idx
         )
+
+        # --- NEW: Create and assign the class-balanced sampler ---
         # Class 0 is over-represented. Target is 3:1:1
         target_class_weights = {0: 3.0, 1: 1.0, 2: 1.0}
         train_sampler = create_class_balanced_sampler(train_ds_sampler_subset, target_class_weights)
@@ -2102,97 +2104,65 @@ def main(argv: List[str] | None = None):
             use_focal_loss_for_epoch = ep < FOCAL_LOSS_WARMUP_EPOCHS
             if ep == FOCAL_LOSS_WARMUP_EPOCHS:
                 print("[INFO] Switching from Focal Loss warmup to Varifocal Loss for subsequent epochs.")
-                quality_floor_vfl = quality_floor_vfl * 1.5  # More gradual transition
+                quality_floor_vfl = quality_floor_vfl * 2
             elif ep == (FOCAL_LOSS_WARMUP_EPOCHS + 1):
-                quality_floor_vfl = quality_floor_vfl / 1.5
+                quality_floor_vfl = quality_floor_vfl / 2
         else:
             use_focal_loss_for_epoch = use_focal_loss
-        
         if ep < 2:
-            assigner.k = 14
+            assigner.k = 12
             assigner.dynamic_k_min = 5
-            assigner.cls_cost_weight = 0.3
-            assigner.r = 6.0
-            assigner.min_iou_threshold = 0.08
-            CLS_WEIGHT = 2.0
+            assigner.cls_cost_weight = 2.0
+            assigner.r = 5.25
+            CLS_WEIGHT = 0.4
             IOU_WEIGHT = 4.0
-            quality_floor_vfl = 0.0
         elif ep < 4:
-            assigner.cls_cost_weight = 0.4
-            assigner.r = 5.5
-            assigner.dynamic_k_min = 4
-            assigner.min_iou_threshold = 0.10
-            CLS_WEIGHT = 2.5
-            quality_floor_vfl = 0.0
+            assigner.cls_cost_weight = 2.2
+            CLS_WEIGHT = 0.5
         elif ep < 6:
             assigner.dynamic_k_min = 4
-            assigner.r = 5.0
-            assigner.k = 12
-            assigner.cls_cost_weight = 0.5
-            assigner.min_iou_threshold = 0.12
-            CLS_WEIGHT = 3.0
-            IOU_WEIGHT = 3.5
-            quality_floor_vfl = 0.0
+            assigner.r = 4.6
+            assigner.k = 10
+            assigner.cls_cost_weight = 3.0
+            CLS_WEIGHT = 1.0
         elif ep < 8:
-            assigner.r = 4.5
-            assigner.dynamic_k_min = 3
-            assigner.cls_cost_weight = 0.6
-            assigner.min_iou_threshold = 0.15
-            CLS_WEIGHT = 3.0
-            IOU_WEIGHT = 3.0
-        elif ep < 10:
             assigner.r = 4.0
-            assigner.cls_cost_weight = 0.7
-            assigner.min_iou_threshold = 0.18
-            CLS_WEIGHT = 3.0
-            IOU_WEIGHT = 3.0
-            quality_floor_vfl = 0.02
-        elif ep < 12:
-            assigner.r = 3.8
             assigner.dynamic_k_min = 2
-            assigner.cls_cost_weight = 0.8
-            assigner.min_iou_threshold = 0.20
-            CLS_WEIGHT = 3.0
-            IOU_WEIGHT = 2.8
-        elif ep < 15:
-            assigner.cls_cost_weight = 0.9
-            assigner.min_iou_threshold = 0.22
-            CLS_WEIGHT = 3.0
+            assigner.cls_cost_weight = 3.5
+            CLS_WEIGHT = 1.8
+        elif ep < 10:
+            CLS_WEIGHT = 2.5
+        elif ep == 14:
             IOU_WEIGHT = 2.5
+        elif ep == 15:
+            assigner.cls_cost_weight = 4.0
+            CLS_WEIGHT = 3.0
+        elif ep == 17:
             quality_floor_vfl = 0.02
-        elif ep < 18:
-            assigner.cls_cost_weight = 1.0
-            assigner.min_iou_threshold = 0.25
-            CLS_WEIGHT = 2.8
-            quality_floor_vfl = 0.02
-        elif ep < 22:
-            assigner.dynamic_k_min = 2
-            assigner.cls_cost_weight = 1.0
-            CLS_WEIGHT = 2.8
-            quality_floor_vfl = 0.01
-        elif ep < 25:
+        elif ep == 22:
             assigner.dynamic_k_min = 1
-            assigner.cls_cost_weight = 1.0
-            quality_floor_vfl = 0.01
-        elif ep < 30:
-            assigner.r = 3.5
-            assigner.cls_cost_weight = 1.0
-            CLS_WEIGHT = 2.8
-        elif ep < 50:
-            assigner.r = 3.0
-            CLS_WEIGHT = 2.8
-        elif ep < 70:
+            quality_floor_vfl = 0.005
+        elif ep == 55:
             q_gamma = 0.4
-        elif ep >= 70 and assigner.mean_fg_iou > 0.45:
-            q_gamma = 0.35
+        elif ep == 60:
+            assigner.r = 3.0
+        elif ep == 65 and assigner.mean_fg_iou > 0.45:
+            q_gamma = 0.3
+        elif ep == 70:
             gamma_loss = 2.25
+        elif ep == 80:
+            assigner.cls_cost_weight = 4.0
+        elif ep > 100:
+            assigner.dynamic_k_min = 1
+            assigner.r = 2.5
+            CLS_WEIGHT = 4.0
 
         if assigner.mean_fg_iou < 0.35 or ep < 5:
             assigner.power = 0.0
         elif assigner.mean_fg_iou < 0.45:
-            assigner.power = min(1.0, assigner.power + 0.15)
+            assigner.power = min(1.0, assigner.power + 0.20)
         else:
-            assigner.power = min(1.5, assigner.power + 0.15)
+            assigner.power = min(2.0, assigner.power + 0.25)
 
         model.train()
         l, diag = train_epoch(
