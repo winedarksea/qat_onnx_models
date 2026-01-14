@@ -2227,7 +2227,7 @@ def main(argv: List[str] | None = None):
                                score_thresh=0.05,
                                iou_thresh=model.head.iou_th,
                                max_detections=model.head.max_det,
-                               epoch_num=ep,
+                               epoch_num=ep + 1,
                                run_name="score_thresh_0.05",
                                debug_prints=debug_prints,
                                )
@@ -2238,7 +2238,7 @@ def main(argv: List[str] | None = None):
                                score_thresh=0.25,
                                iou_thresh=model.head.iou_th,
                                max_detections=model.head.max_det,
-                               epoch_num=ep,
+                               epoch_num=ep + 1,
                                run_name="score_thresh_0.25",
                                debug_prints=debug_prints,
                                )
@@ -2346,7 +2346,7 @@ def main(argv: List[str] | None = None):
                                    score_thresh=0.05, # Consistent validation score_thresh
                                    iou_thresh=model.head.iou_th,
                                    max_detections=model.head.max_det,
-                                   epoch_num=qep, # Pass QAT epoch number
+                                   epoch_num=qep + 1, # Pass QAT epoch number (1-based for logging)
                                    run_name=f"QAT_ep{qep+1}_score0.05",
                                    debug_prints=debug_prints,
                                 )
