@@ -317,18 +317,22 @@ class PicoDetHead(nn.Module):
             self.register_buffer(f'anchor_points_level_{i}', anchor_points_center, persistent=False)
 
     def _initialize_biases(self):
+        # Initialize classification head
         cls_prior = 0.02
         cls_bias = -math.log((1 - cls_prior) / cls_prior)
         for conv in self.cls_pred:
             nn.init.constant_(conv.bias, cls_bias)
-    
+            nn.init.normal_(conv.weight, std=0.01)  # Crucial for Focal Loss stability
+
+        # Initialize regression head
         peak_prob = 0.90
         delta = math.log(peak_prob / (1 - peak_prob))
         pattern = torch.zeros(4 * (self.reg_max + 1), device=self.cls_pred[0].weight.device)
         for i in range(4):
             pattern[i * (self.reg_max + 1)] = delta
+            
         for conv in self.reg_pred:
-            nn.init.zeros_(conv.weight)
+            nn.init.normal_(conv.weight, std=0.01)  # Allow gradient flow from start
             conv.bias.data.copy_(pattern)
 
     def _dfl_to_ltrb_inference(self, x_reg_logits_3d: torch.Tensor) -> torch.Tensor:

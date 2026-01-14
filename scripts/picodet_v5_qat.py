@@ -1738,7 +1738,7 @@ def main(argv: List[str] | None = None):
     pa.add_argument('--simota_ctr', type=float, default=3.5)
     pa.add_argument('--simota_topk', type=int, default=10)
     pa.add_argument('--simota_dynamic_k_min', type=int, default=2)
-    pa.add_argument('--simota_min_iou_threshold', type=float, default=0.02)
+    pa.add_argument('--simota_min_iou_threshold', type=float, default=0.05)
     pa.add_argument('--simota_cls_cost_weight', type=float, default=2.0)
     pa.add_argument('--simota_cls_cost_iou_power', type=float, default=0.0,
                     help="Weights SimOTA classification cost by IoU^p (p>0 reduces class-cost influence for low-IoU anchors).")
@@ -2114,29 +2114,29 @@ def main(argv: List[str] | None = None):
             assigner.dynamic_k_min = 5
             assigner.cls_cost_weight = 2.0
             assigner.r = 5.25
-            CLS_WEIGHT = 0.4
+            CLS_WEIGHT = 0.5
             IOU_WEIGHT = 4.0
         elif ep < 4:
-            assigner.cls_cost_weight = 2.2
-            CLS_WEIGHT = 0.5
+            assigner.cls_cost_weight = 2.1
+            CLS_WEIGHT = 0.8
         elif ep < 6:
             assigner.dynamic_k_min = 4
             assigner.r = 4.6
             assigner.k = 10
-            assigner.cls_cost_weight = 3.0
-            CLS_WEIGHT = 1.0
+            assigner.cls_cost_weight = 2.3
+            CLS_WEIGHT = 1.5
         elif ep < 8:
             assigner.r = 4.0
             assigner.dynamic_k_min = 2
-            assigner.cls_cost_weight = 3.5
-            CLS_WEIGHT = 1.8
+            assigner.cls_cost_weight = 2.5
+            CLS_WEIGHT = 2.2
         elif ep < 10:
-            CLS_WEIGHT = 2.5
+            CLS_WEIGHT = 3.0
         elif ep == 14:
             IOU_WEIGHT = 2.5
         elif ep == 15:
-            assigner.cls_cost_weight = 4.0
-            CLS_WEIGHT = 3.0
+            assigner.cls_cost_weight = 3.0
+            CLS_WEIGHT = 3.8
         elif ep == 17:
             quality_floor_vfl = 0.02
         elif ep == 22:
