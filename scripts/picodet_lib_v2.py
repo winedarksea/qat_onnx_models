@@ -32,6 +32,88 @@ except Exception as e: # Catch other potential errors like incorrect path struct
     MobileNetV4ConvSmallPico = None
 
 # ───────────────────────────── layers ──────────────────────────────
+class ConvBNAct(nn.Module):
+    def __init__(self, c_in: int, c_out: int, k: int = 1, s: int = 1, p: int = None, groups: int = 1, bias: bool = False, inplace_act: bool = False, act_layer=nn.ReLU6):
+        super().__init__()
+        if p is None:
+            p = (k - 1) // 2
+        self.conv = nn.Conv2d(c_in, c_out, k, s, p, groups=groups, bias=bias)
+        self.bn = nn.BatchNorm2d(c_out)
+        self.act = act_layer(inplace=inplace_act)
+
+    def forward(self, x):
+        return self.act(self.bn(self.conv(x)))
+
+
+class RepConv1x1(nn.Module):
+    """
+    MobileOne-style Reparameterized 1x1 Conv.
+    
+    TRAINING: Multiple parallel 1x1 branches for better gradient flow.
+    INFERENCE: Fuses into a single 1x1 Conv (zero latency overhead).
+    
+    CRITICAL FOR QAT: Call switch_to_deploy() AFTER FP32 training,
+    BEFORE qat_prepare(). This ensures QAT trains the fused topology.
+    """
+    def __init__(self, in_channels, out_channels, act_layer=nn.ReLU6, inplace_act=False, deploy=False):
+        super().__init__()
+        self.deploy = deploy
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.act = act_layer(inplace=inplace_act)
+
+        if deploy:
+            # Inference mode: single 1x1 conv
+            self.rbr_reparam = nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=1, bias=True)
+        else:
+            # Training mode: Multi-branch for over-parameterization
+            self.rbr_dense = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=1, bias=False),
+                nn.BatchNorm2d(out_channels)
+            )
+            self.rbr_scale = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=1, bias=False),
+                nn.BatchNorm2d(out_channels)
+            )
+
+    def forward(self, x):
+        if self.deploy:
+            return self.act(self.rbr_reparam(x))
+        return self.act(self.rbr_dense(x) + self.rbr_scale(x))
+
+    def switch_to_deploy(self):
+        """Fuses multi-branch into single conv. Must be called before QAT!"""
+        if self.deploy:
+            return
+        
+        k_dense, b_dense = self._fuse_bn_tensor(self.rbr_dense[0], self.rbr_dense[1])
+        k_scale, b_scale = self._fuse_bn_tensor(self.rbr_scale[0], self.rbr_scale[1])
+        
+        final_weight = k_dense + k_scale
+        final_bias = b_dense + b_scale
+
+        self.rbr_reparam = nn.Conv2d(self.in_channels, self.out_channels, 1, 1, bias=True)
+        self.rbr_reparam.weight.data = final_weight
+        self.rbr_reparam.bias.data = final_bias
+
+        del self.rbr_dense
+        del self.rbr_scale
+        self.deploy = True
+
+    def _fuse_bn_tensor(self, conv, bn):
+        """Fuse Conv + BN into single Conv."""
+        kernel = conv.weight
+        running_mean = bn.running_mean
+        running_var = bn.running_var
+        gamma = bn.weight
+        beta = bn.bias
+        eps = bn.eps
+        
+        std = (running_var + eps).sqrt()
+        t = (gamma / std).reshape(-1, 1, 1, 1)
+        return kernel * t, beta - running_mean * gamma / std
+
+
 class GhostConv(nn.Module):
     def __init__(
             self,
@@ -104,24 +186,22 @@ class CSPPAN(nn.Module):
             out_ch: int = 96,
             lat_k: int = 5,
             inplace_act: bool = False,
-            act_layer=nn.ReLU6
+            act_layer=nn.ReLU6,
+            use_rep_conv: bool = True  # Enable RepConv for better training
     ):
         super().__init__()
         self.in_chs = in_chs
         self.num_levels = len(in_chs)
         assert self.num_levels >= 2, f"CSPPAN requires at least 2 feature levels, got {self.num_levels}"
         
-        # Reduce convs: GhostConv for all but the last level, plain 1x1 for deepest
+        # Reduce convs: RepConv1x1 for superior training, fuses to standard 1x1 for inference
+        ReduceBlock = RepConv1x1 if use_rep_conv else ConvBNAct
         reduce_list = []
         for i, c in enumerate(in_chs):
-            if i == self.num_levels - 1:  # Last (deepest) level
-                reduce_list.append(nn.Sequential(
-                    nn.Conv2d(c, out_ch, 1, bias=False),
-                    nn.BatchNorm2d(out_ch),
-                    act_layer(inplace=inplace_act),
-                ))
+            if use_rep_conv:
+                reduce_list.append(RepConv1x1(c, out_ch, act_layer=act_layer, inplace_act=inplace_act))
             else:
-                reduce_list.append(GhostConv(c, out_ch, 1, inplace_act=inplace_act))
+                reduce_list.append(ConvBNAct(c, out_ch, 1, inplace_act=inplace_act))
         self.reduce = nn.ModuleList(reduce_list)
         
         # Lateral convs for all but the deepest level
@@ -151,6 +231,13 @@ class CSPPAN(nn.Module):
             p[i] = p[i] + F.max_pool2d(p[i - 1], 2)
         
         return tuple(self.out[i](p[i]) for i in range(self.num_levels))
+    
+    def switch_to_deploy(self):
+        """Fuse RepConv branches. Call AFTER FP32 training, BEFORE QAT!"""
+        for m in self.reduce:
+            if hasattr(m, 'switch_to_deploy'):
+                m.switch_to_deploy()
+        print("[INFO] CSPPAN neck switched to deploy mode (RepConv branches fused).")
 
 
 # --- tiny ESE gate ----------------------------------------

@@ -2254,6 +2254,13 @@ def main(argv: List[str] | None = None):
 
     # --- QAT Preparation ---
     print("[INFO] Preparing model for QAT...")
+    
+    # CRITICAL: Fuse RepConv branches BEFORE QAT preparation
+    # This ensures QAT trains the final inference topology (fused 1x1 convs)
+    if hasattr(model, 'neck') and hasattr(model.neck, 'switch_to_deploy'):
+        print("[INFO] Fusing RepConv branches in neck before QAT...")
+        model.neck.switch_to_deploy()
+    
     dummy_uint8_input_cpu = torch.randint(0, 256, (1, 3, IMG_SIZE, IMG_SIZE), dtype=torch.uint8, device='cpu')
 
     example_input_for_qat_entire_model = dummy_uint8_input_cpu.cpu()
