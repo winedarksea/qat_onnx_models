@@ -526,8 +526,8 @@ class SimOTACache:
                  device: torch.device,  # Use a consistent device key string in order to avoid a cache miss
                  tgt: dict,              # {"boxes":(M,4), "labels":(M,)}
                  cls_logits: torch.Tensor, # Raw class logits (A, C) from model
-                 # obj_logits: torch.Tensor | None = None,
                  model_head = None,
+                 pred_boxes: torch.Tensor | None = None, # Predicted boxes (XYXY) (A, 4)
                  ):
 
         # 0. early-exit if no GT
@@ -556,10 +556,16 @@ class SimOTACache:
         A = anchor_centers.size(0)
 
         # 2. IoU and centre-radius mask
-        s_div_2 = anchor_strides.unsqueeze(1) / 2.0
-        anchor_candidate_boxes = torch.cat([anchor_centers - s_div_2,
-                                            anchor_centers + s_div_2], 1)
-        iou = tvops.box_iou(gt_boxes, anchor_candidate_boxes)     # (M,A)
+        if pred_boxes is not None:
+            # Use real predicted boxes for assignment (SimOTA standard)
+            iou = tvops.box_iou(gt_boxes, pred_boxes)             # (M,A)
+        else:
+            # Fallback to tiny fixed squares if no predictions provided
+            s_div_2 = anchor_strides.unsqueeze(1) / 2.0
+            anchor_candidate_boxes = torch.cat([anchor_centers - s_div_2,
+                                                anchor_centers + s_div_2], 1)
+            iou = tvops.box_iou(gt_boxes, anchor_candidate_boxes)     # (M,A)
+
         if iou.max() <= 0:
             print("SimOTA: No overlap found between any ground-truth box and candidate anchors")
             # Return empty/background tensors, matching the function's output signature
@@ -809,6 +815,10 @@ def train_epoch(
             [getattr(model.head, f'anchor_points_level_{i}').to(device) for i in range(model.head.nl)]
         )
 
+        strides_all_anchors = torch.cat([
+            s[2].expand(s[0] * s[1]) for s in fmap_shapes
+        ]).to(device)
+
         cls_p_batch = torch.cat([
             lvl.permute(0, 2, 3, 1).reshape(bs, -1, head_nc_for_loss)
             for lvl in cls_preds_levels
@@ -818,14 +828,27 @@ def train_epoch(
             for lvl in reg_preds_levels
         ], dim=1)
 
+        # Pre-decode boxes for SimOTA assignment (Batch-wide)
+        with torch.no_grad():
+            reg_p_reshaped = reg_p_batch.view(-1, 4 * (head_reg_max_for_loss + 1))
+            # dfl_decode_for_training handles the softmax and projection
+            ap_ltrb = PicoDetHead.dfl_decode_for_training(
+                reg_p_reshaped, dfl_project_buffer_for_decode.to(device), head_reg_max_for_loss
+            ).view(bs, -1, 4)
+            # Scale LTRB by anchor strides
+            ap_ltrb = ap_ltrb * strides_all_anchors.unsqueeze(0).unsqueeze(-1)
+            # Convert to XYXY
+            ap_xyxy = torch.stack([
+                anchor_centers_batch[:, 0].unsqueeze(0) - ap_ltrb[..., 0],
+                anchor_centers_batch[:, 1].unsqueeze(0) - ap_ltrb[..., 1],
+                anchor_centers_batch[:, 0].unsqueeze(0) + ap_ltrb[..., 2],
+                anchor_centers_batch[:, 1].unsqueeze(0) + ap_ltrb[..., 3],
+            ], dim=-1) # (bs, A, 4)
+
         batch_cls_targets = torch.zeros_like(cls_p_batch)
         batch_box_targets = torch.zeros(bs, reg_p_batch.shape[1], 4, device=device)
         batch_fg_mask = torch.zeros_like(cls_p_batch[..., 0], dtype=torch.bool)
         total_num_fg_batch = 0
-
-        strides_all_anchors = torch.cat([
-            s[2].expand(s[0] * s[1]) for s in fmap_shapes
-        ]).to(device)
 
         for b_idx in range(bs):
             tgt_i = tgts_batch[b_idx]
@@ -835,6 +858,7 @@ def train_epoch(
             fg_mask_img, gt_labels_assigned, gt_boxes_assigned, iou_out_img = assigner(
                 fmap_shapes, device, {'boxes': gt_boxes_img, 'labels': gt_labels_img},
                 cls_logits=cls_p_batch[b_idx], model_head=model.head,
+                pred_boxes=ap_xyxy[b_idx],
             )
 
             pos_indices = fg_mask_img.nonzero(as_tuple=False).view(-1)
