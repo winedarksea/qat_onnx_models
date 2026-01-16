@@ -40,11 +40,12 @@ except ImportError:
     
         keep_prob: Final[float] = 1.0 - drop_prob
         # broadcast mask over all non‑batch dims
-        mask = torch.rand(
-            (x.shape[0],) + (1,) * (x.ndim - 1),
-            dtype=x.dtype,
-            device=x.device
-        ).floor_().add_(keep_prob).floor_()      # faster than bernoulli_
+        # Use a technique that avoids tuple/list arithmetic in the graph
+        mask = torch.rand(x.shape[0], device=x.device, dtype=x.dtype)
+        for _ in range(x.ndim - 1):
+            mask = mask.unsqueeze(-1)
+        mask = mask.floor_().add_(keep_prob).floor_()      # faster than bernoulli_
+    
     
         if scale_by_keep and keep_prob > 0:
             mask.div_(keep_prob)
