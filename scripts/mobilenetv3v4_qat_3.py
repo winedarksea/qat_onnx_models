@@ -528,7 +528,7 @@ pretrain_str = "_pretrained" if pretrained else ""
 # Extract dataset name and clean it for filename
 dataset_name_clean = Path(data_dir).name.replace('_', '')
 # Using a more descriptive name that includes QAT status, dataset, and image size
-output_base_name = f"mobilenet_w{str(width_mult).replace('.', '_')}_{arch}{pretrain_str}_drp{str(drop_rate).replace('.', '_')}_data:{dataset_name_clean}_{IMG_SIZE}px"
+output_base_name = f"mobilenet_w{str(width_mult).replace('.', '_')}_{arch}{pretrain_str}_drp{str(drop_rate).replace('.', '_')}_{dataset_name_clean}_{IMG_SIZE}px"
 pt_path = f"{output_base_name}_qat_int8.pt" # For PyTorch INT8 state_dict
 onnx_fp32_path = f"{output_base_name}_fp32_from_qat.onnx"
 onnx_path = f"{output_base_name}_qat_int8.onnx" # For ONNX INT8 model
