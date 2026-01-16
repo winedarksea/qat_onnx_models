@@ -633,6 +633,7 @@ else:
 
 print("[INFO] Starting FP32 training...")
 ema = ExponentialMovingAverage(model, decay=ema_decay) if use_ema else None
+best_val_acc = 0.0
 
 for ep in range(epochs):
     l = train_epoch(model, tr, crit, opt, scaler, dev, ep, qat_mode_active=False, ema=ema)
@@ -640,7 +641,9 @@ for ep in range(epochs):
     a = evaluate(eval_model, vl, dev)
     sched.step()
     print(f"FP32 Epoch {ep+1}/{epochs}  loss {l:.4f}  val@1 {a*100:.2f}%  lr {opt.param_groups[0]['lr']:.5f}")
-    if ep % 50 == 0:
+    if a > best_val_acc:
+        best_val_acc = a
+        print(f"[INFO] New best validation accuracy: {a*100:.2f}% - Saving checkpoint...")
         try:
             save_backbone(eval_model,  output_base_name, dev)
         except Exception as e:
