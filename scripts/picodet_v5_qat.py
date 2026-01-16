@@ -1090,7 +1090,8 @@ def unwrap_dataset(ds):
 def apply_nms_and_padding_to_raw_outputs_with_debug( # Renamed
     raw_boxes_batch: torch.Tensor,  # (B, Total_Anchors, 4)
     raw_scores_batch: torch.Tensor,  # (B, Total_Anchors, NC)
-    score_thresh: float, iou_thresh: float, max_detections: int
+    score_thresh: float, iou_thresh: float, max_detections: int,
+    class_agnostic_nms: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[int], List[int]]:
     device = raw_boxes_batch.device
     batch_size = raw_boxes_batch.shape[0]
@@ -1113,7 +1114,10 @@ def apply_nms_and_padding_to_raw_outputs_with_debug( # Renamed
             padded_scores = torch.zeros((max_detections,), dtype=scores_img.dtype, device=device)
             padded_labels = torch.full((max_detections,), -1, dtype=torch.long, device=device)
         else:
-            nms_keep_indices = tvops.batched_nms(boxes_above_thresh, scores_above_thresh, labels_above_thresh, iou_thresh)
+            if class_agnostic_nms:
+                nms_keep_indices = tvops.nms(boxes_above_thresh, scores_above_thresh, iou_thresh)
+            else:
+                nms_keep_indices = tvops.batched_nms(boxes_above_thresh, scores_above_thresh, labels_above_thresh, iou_thresh)
             boxes_after_nms = boxes_above_thresh[nms_keep_indices[:max_detections]]
             scores_after_nms = scores_above_thresh[nms_keep_indices[:max_detections]]
             labels_after_nms = labels_above_thresh[nms_keep_indices[:max_detections]]
@@ -1143,6 +1147,7 @@ def quick_val_iou(
     epoch_num: int = -1,
     run_name: str = "N/A",
     debug_prints: bool = True,
+    class_agnostic_nms: bool = False,
 ):
     model.eval()
     total_iou_sum = 0.
@@ -1180,7 +1185,8 @@ def quick_val_iou(
          debug_num_preds_after_nms_batch
          ) = apply_nms_and_padding_to_raw_outputs_with_debug(
                 raw_pred_boxes_batch, raw_pred_scores_batch,
-                score_thresh, iou_thresh, max_detections
+                score_thresh, iou_thresh, max_detections,
+                class_agnostic_nms=class_agnostic_nms,
             )
 
         total_preds_before_nms_filter_across_images += sum(debug_num_preds_before_nms_batch)
@@ -1273,7 +1279,7 @@ def quick_val_iou(
     return final_mean_iou, final_accuracy
 
 @torch.no_grad()
-def run_epoch_validation(model: nn.Module, loader, device, epoch_num: int, head_ref: PicoDetHead):
+def run_epoch_validation(model: nn.Module, loader, device, epoch_num: int, head_ref: PicoDetHead, *, class_agnostic_nms: bool = False):
     """Runs comprehensive validation for an epoch, testing at multiple score thresholds."""
     model.eval()
     score_thresholds_to_track = [0.05, 0.25, 0.50]
@@ -1283,7 +1289,7 @@ def run_epoch_validation(model: nn.Module, loader, device, epoch_num: int, head_
         run_name = f"val_ep{epoch_num}_score{score_th}"
         iou, acc = quick_val_iou(model, loader, device, score_thresh=score_th, iou_thresh=head_ref.iou_th,
                                   max_detections=head_ref.max_det, epoch_num=epoch_num, run_name=run_name,
-                                  debug_prints=False)
+                                  debug_prints=False, class_agnostic_nms=class_agnostic_nms)
         key_iou = f"iou_at_{int(score_th*100)}".replace('.', '')
         key_acc = f"acc_at_{int(score_th*100)}".replace('.', '')
         epoch_summary[key_iou] = iou
@@ -1755,16 +1761,24 @@ def main(argv: List[str] | None = None):
     pa.add_argument('--out', default='picodet_v5_int8.onnx')
     pa.add_argument('--no_inplace_head_neck', default=True, action='store_true', help="Disable inplace activations in head/neck")
     pa.add_argument('--min_box_size', type=int, default=8, help="Minimum pixel width/height for a GT box to be used in training.")
+    pa.add_argument('--focal_warmup_epochs', type=int, default=12,
+                    help="Epochs to use sigmoid focal loss before switching to Varifocal Loss. Set to -1 to disable warmup.")
+    pa.add_argument('--vfl_q_gamma_after_warmup', type=float, default=1.0,
+                    help="Exponent for IoU→quality target after warmup (higher emphasizes high-IoU positives; tends to improve precision).")
+    pa.add_argument('--vfl_q_gamma_refine', type=float, default=1.3,
+                    help="Exponent for IoU→quality target during late refinement (higher generally increases precision).")
+    pa.add_argument('--class_agnostic_nms', action='store_false',
+                    help="Use class-agnostic NMS in quick_val (suppresses duplicates across classes; can improve precision).")
     pa.add_argument('--no_anchor_inside_gt_for_cls', action='store_true',
                     help="Disable requiring positive anchors' centers to lie inside their assigned GT box for classification targets.")
     pa.add_argument('--anchor_inside_gt_margin', type=float, default=0.0,
                     help="Allow positives within a margin of the GT box edges, in units of stride (e.g. 0.5 = half a stride).")
     pa.add_argument('--simota_ctr', type=float, default=3.5)
     pa.add_argument('--simota_topk', type=int, default=10)
-    pa.add_argument('--simota_dynamic_k_min', type=int, default=2)
+    pa.add_argument('--simota_dynamic_k_min', type=int, default=1)
     pa.add_argument('--simota_min_iou_threshold', type=float, default=0.05)
-    pa.add_argument('--simota_cls_cost_weight', type=float, default=2.0)
-    pa.add_argument('--simota_cls_cost_iou_power', type=float, default=0.0,
+    pa.add_argument('--simota_cls_cost_weight', type=float, default=1.0)
+    pa.add_argument('--simota_cls_cost_iou_power', type=float, default=0.5,
                     help="Weights SimOTA classification cost by IoU^p (p>0 reduces class-cost influence for low-IoU anchors).")
     pa.add_argument('--load_from', type=str, default=False, help="Path to a checkpoint to resume or finetune from (e.g., 'picodet_50coco.pt')")
     pa.add_argument('--data_root', default='test')
@@ -1777,7 +1791,7 @@ def main(argv: List[str] | None = None):
     debug_prints = True
     BACKBONE_FREEZE_EPOCHS = 2 if cfg.epochs < 12 else 3  # 0 to disable
     use_focal_loss = False
-    FOCAL_LOSS_WARMUP_EPOCHS = 10
+    FOCAL_LOSS_WARMUP_EPOCHS = None if cfg.focal_warmup_epochs < 0 else int(cfg.focal_warmup_epochs)
 
     if cfg.device is None:
         cfg.device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -1892,8 +1906,8 @@ def main(argv: List[str] | None = None):
         neck_out_ch=out_ch,  # 96
         img_size=IMG_SIZE,
         head_reg_max=9 if IMG_SIZE < 320 else int((2 * math.ceil(IMG_SIZE / 128) + 3)),
-        head_score_thresh=0.05,
-        head_nms_iou=0.60,
+        head_score_thresh=0.10,  # Raised from 0.05 for better precision
+        head_nms_iou=0.55,  # Lowered from 0.60 to reduce overlapping boxes
         reg_conv_depth=reg_conv_depth,
         cls_conv_depth=cls_conv_depth,
         lat_k=lat_k,
@@ -2129,42 +2143,68 @@ def main(argv: List[str] | None = None):
             if ep == FOCAL_LOSS_WARMUP_EPOCHS:
                 print("[INFO] Switching from Focal Loss warmup to Varifocal Loss for subsequent epochs.")
                 quality_floor_vfl = quality_floor_vfl * 2
+                q_gamma = float(cfg.vfl_q_gamma_after_warmup)
             elif ep == (FOCAL_LOSS_WARMUP_EPOCHS + 1):
                 quality_floor_vfl = quality_floor_vfl / 2
         else:
             use_focal_loss_for_epoch = use_focal_loss
         if ep < 2:
+            # Bootstrap phase: prioritize localization, many anchors per GT
             assigner.k = 12
             assigner.dynamic_k_min = 5
-            assigner.cls_cost_weight = 2.0
+            assigner.cls_cost_weight = 0.5  # Start low to avoid early classification noise
             assigner.r = 5.25
             CLS_WEIGHT = 0.5
             IOU_WEIGHT = 4.0
         elif ep < 4:
-            assigner.cls_cost_weight = 2.1
+            # Gentle warmup of classification influence
+            assigner.cls_cost_weight = 0.8
             CLS_WEIGHT = 0.8
         elif ep < 6:
+            # Begin tightening anchor selection
             assigner.dynamic_k_min = 4
             assigner.r = 4.6
             assigner.k = 10
-            assigner.cls_cost_weight = 2.3
-            CLS_WEIGHT = 1.5
+            assigner.cls_cost_weight = 1.0  # Stabilize here during volatile phase
+            CLS_WEIGHT = 1.2
         elif ep < 8:
+            # Gradual increase - this is where switch rate was spiking before
             assigner.r = 4.0
             assigner.dynamic_k_min = 2
-            assigner.cls_cost_weight = 2.5
-            CLS_WEIGHT = 2.2
+            assigner.cls_cost_weight = 1.2  # Slower ramp (was 2.5)
+            CLS_WEIGHT = 1.5
         elif ep < 10:
-            CLS_WEIGHT = 3.0
+            # Continue gradual ramp
+            assigner.cls_cost_weight = 1.5
+            CLS_WEIGHT = 2.0
+        elif ep < 12:
+            # Now we can be more aggressive - model is stable
+            assigner.cls_cost_weight = 2.0
+            CLS_WEIGHT = 2.5
         elif ep == 14:
             IOU_WEIGHT = 2.5
+            assigner.r = 3.5
+            assigner.simota_prefilter = True  # Anchor center MUST be inside GT box
         elif ep == 15:
-            assigner.cls_cost_weight = 3.0
-            CLS_WEIGHT = 3.8
+            assigner.cls_cost_weight = 2.5
+            CLS_WEIGHT = 3.0
         elif ep == 17:
             quality_floor_vfl = 0.02
-        elif ep == 22:
+            q_gamma = max(q_gamma, float(cfg.vfl_q_gamma_after_warmup))
+            # Start reducing positives per GT once localization stabilizes.
+            assigner.k = min(assigner.k, 8)
+            assigner.min_iou_threshold = max(assigner.min_iou_threshold, 0.06)
+        elif ep == 20:
+            # Precision refinement phase
             assigner.dynamic_k_min = 1
+            assigner.cls_cost_weight = 3.0
+            CLS_WEIGHT = 3.5
+            q_gamma = max(q_gamma, float(cfg.vfl_q_gamma_refine))  # e.g., 2.0
+            assigner.k = 6  # Fewer, higher-quality anchors
+            assigner.min_iou_threshold = 0.08
+            alpha_loss = 0.85
+            assigner.r = 3.0
+        elif ep == 22:
             quality_floor_vfl = 0.005
         elif ep == 55:
             q_gamma = 0.4
@@ -2210,7 +2250,10 @@ def main(argv: List[str] | None = None):
         model.eval()
         try:
             val_model = ema.ema if ema is not None else model
-            epoch_metrics = run_epoch_validation(val_model, vl_loader, dev, ep + 1, val_model.head)
+            epoch_metrics = run_epoch_validation(
+                val_model, vl_loader, dev, ep + 1, val_model.head,
+                class_agnostic_nms=bool(cfg.class_agnostic_nms),
+            )
             epoch_metrics['train_loss'] = l if l is not None else -1.0
             epoch_metrics.update(diag)
             training_history[ep + 1] = epoch_metrics
@@ -2254,6 +2297,7 @@ def main(argv: List[str] | None = None):
                                epoch_num=ep + 1,
                                run_name="score_thresh_0.05",
                                debug_prints=debug_prints,
+                               class_agnostic_nms=bool(cfg.class_agnostic_nms),
                                )
         print(f"[INFO] Validation IoU (score_th=0.05): {iou_05:.4f}")
         
@@ -2265,6 +2309,7 @@ def main(argv: List[str] | None = None):
                                epoch_num=ep + 1,
                                run_name="score_thresh_0.25",
                                debug_prints=debug_prints,
+                               class_agnostic_nms=bool(cfg.class_agnostic_nms),
                                )
         print(f"[INFO] Validation IoU (score_th=0.25): {iou_25:.4f}")
     except Exception as e:
@@ -2380,6 +2425,7 @@ def main(argv: List[str] | None = None):
                                    epoch_num=qep + 1, # Pass QAT epoch number (1-based for logging)
                                    run_name=f"QAT_ep{qep+1}_score0.05",
                                    debug_prints=debug_prints,
+                                   class_agnostic_nms=bool(cfg.class_agnostic_nms),
                                 )
             print(f"[QAT Eval] Epoch {qep + 1}/{qat_epochs} Val IoU (score_th=0.05): {current_qat_val_iou:.4f}  Acc {acc:.3f}")
 
