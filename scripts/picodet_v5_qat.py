@@ -1388,11 +1388,28 @@ class ONNXExportablePicoDet(nn.Module):
         self.postprocessor = head_postprocessor
 
     def forward(self, x: torch.Tensor):
-        is_training_before = self.core_model.training
+        # PicoDetHead only returns raw logits in .train() mode.
+        # We must restore the state recursively using .train()/.eval() calls, 
+        # as manual attribute assignment (training=False) does not flip child modules.
+        was_training = self.core_model.training
+        
         self.core_model.train()
-        raw_feature_outputs_tuple = self.core_model(x)
-        self.core_model.training = is_training_before
-        return self.postprocessor(raw_feature_outputs_tuple)
+        # If we were in eval mode, we force BatchNorms to stay in eval mode 
+        # so they use running statistics instead of noisy batch statistics.
+        if not was_training:
+            for m in self.core_model.modules():
+                if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d, nn.SyncBatchNorm)):
+                    m.eval()
+                    
+        raw_outputs = self.core_model(x)
+        
+        # Restore original recursive state
+        if was_training:
+            self.core_model.train()
+        else:
+            self.core_model.eval()
+            
+        return self.postprocessor(raw_outputs)
 
 # ────────────────── append_nms_to_onnx ────────────────────
 def append_nms_to_onnx(in_path: str, out_path: str, score_thresh: float, iou_thresh: float, max_det: int, *,
