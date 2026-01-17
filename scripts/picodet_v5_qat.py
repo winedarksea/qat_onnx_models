@@ -1773,12 +1773,12 @@ def main(argv: List[str] | None = None):
                     help="Disable requiring positive anchors' centers to lie inside their assigned GT box for classification targets.")
     pa.add_argument('--anchor_inside_gt_margin', type=float, default=0.0,
                     help="Allow positives within a margin of the GT box edges, in units of stride (e.g. 0.5 = half a stride).")
-    pa.add_argument('--simota_ctr', type=float, default=3.5)
+    pa.add_argument('--simota_ctr', type=float, default=4.0)
     pa.add_argument('--simota_topk', type=int, default=10)
     pa.add_argument('--simota_dynamic_k_min', type=int, default=1)
     pa.add_argument('--simota_min_iou_threshold', type=float, default=0.05)
-    pa.add_argument('--simota_cls_cost_weight', type=float, default=1.0)
-    pa.add_argument('--simota_cls_cost_iou_power', type=float, default=0.5,
+    pa.add_argument('--simota_cls_cost_weight', type=float, default=1.5)
+    pa.add_argument('--simota_cls_cost_iou_power', type=float, default=0.4,
                     help="Weights SimOTA classification cost by IoU^p (p>0 reduces class-cost influence for low-IoU anchors).")
     pa.add_argument('--load_from', type=str, default=False, help="Path to a checkpoint to resume or finetune from (e.g., 'picodet_50coco.pt')")
     pa.add_argument('--data_root', default='test')
@@ -2158,54 +2158,44 @@ def main(argv: List[str] | None = None):
             IOU_WEIGHT = 4.0
         elif ep < 4:
             # Gentle warmup of classification influence
-            assigner.cls_cost_weight = 0.8
-            CLS_WEIGHT = 0.8
+            assigner.cls_cost_weight = 1.0
+            CLS_WEIGHT = 1.0
         elif ep < 6:
             # Begin tightening anchor selection
             assigner.dynamic_k_min = 4
-            assigner.r = 4.6
+            assigner.r = 4.8  # Slightly more relaxed
             assigner.k = 10
-            assigner.cls_cost_weight = 1.0  # Stabilize here during volatile phase
-            CLS_WEIGHT = 1.2
+            assigner.cls_cost_weight = 1.2
+            CLS_WEIGHT = 1.5
         elif ep < 8:
             # Gradual increase - this is where switch rate was spiking before
-            assigner.r = 4.0
+            assigner.r = 4.4
             assigner.dynamic_k_min = 2
-            assigner.cls_cost_weight = 1.2  # Slower ramp (was 2.5)
-            CLS_WEIGHT = 1.5
-        elif ep < 10:
-            # Continue gradual ramp
             assigner.cls_cost_weight = 1.5
             CLS_WEIGHT = 2.0
-        elif ep < 12:
-            # Now we can be more aggressive - model is stable
+        elif ep < 10:
+            # Continue gradual ramp
             assigner.cls_cost_weight = 2.0
             CLS_WEIGHT = 2.5
         elif ep == 14:
             IOU_WEIGHT = 2.5
-            assigner.r = 3.5
+            assigner.r = 3.8  # Relaxed from 3.5
             assigner.simota_prefilter = True  # Anchor center MUST be inside GT box
         elif ep == 15:
-            assigner.cls_cost_weight = 2.5
-            CLS_WEIGHT = 3.0
+            assigner.cls_cost_weight = 3.0
+            CLS_WEIGHT = 3.8
         elif ep == 17:
             quality_floor_vfl = 0.02
             q_gamma = max(q_gamma, float(cfg.vfl_q_gamma_after_warmup))
             # Start reducing positives per GT once localization stabilizes.
             assigner.k = min(assigner.k, 8)
             assigner.min_iou_threshold = max(assigner.min_iou_threshold, 0.06)
-        elif ep == 20:
-            # Precision refinement phase
-            assigner.dynamic_k_min = 1
-            assigner.cls_cost_weight = 3.0
-            CLS_WEIGHT = 3.5
-            q_gamma = max(q_gamma, float(cfg.vfl_q_gamma_refine))  # e.g., 2.0
-            assigner.k = 6  # Fewer, higher-quality anchors
-            assigner.min_iou_threshold = 0.08
-            alpha_loss = 0.85
-            assigner.r = 3.0
         elif ep == 22:
             quality_floor_vfl = 0.005
+            assigner.cls_cost_weight = 3.5
+            CLS_WEIGHT = 4.0
+            # q_gamma = max(q_gamma, float(cfg.vfl_q_gamma_refine))
+            assigner.dynamic_k_min = 1
         elif ep == 55:
             q_gamma = 0.4
         elif ep == 60:
@@ -2365,7 +2355,7 @@ def main(argv: List[str] | None = None):
     qat_epochs = int(cfg.epochs * 0.2)
     qat_epochs = 3 if qat_epochs < 3 else qat_epochs
 
-    qat_initial_lr = 0.0001
+    qat_initial_lr = 5e-5
     
     # Filter parameters for QAT optimizer
     opt_q_params = filter(lambda p: p.requires_grad, qat_model.parameters())
@@ -2377,6 +2367,9 @@ def main(argv: List[str] | None = None):
     
     best_qat_iou = -1.0 # To save the best QAT model
     final_exportable_int8_model = None
+    
+    # Slightly raise quality floor for QAT to provide margin for quantization noise
+    quality_floor_vfl = max(quality_floor_vfl, 0.01)
 
     for qep in range(qat_epochs):
         qat_model.train() # Ensure model is in train mode for each epoch
@@ -2415,19 +2408,22 @@ def main(argv: List[str] | None = None):
             eval_compatible_qat_model = ONNXExportablePicoDet(qat_eval_core, PostprocessorForONNX(model.head))
             eval_compatible_qat_model.to(dev).eval() # Ensure it's on device and in eval mode
 
-            # Using a consistent score_thresh for tracking QAT progress, e.g., 0.05 or 0.25
-            # The one used for final ONNX NMS params can be different.
-            current_qat_val_iou, acc = quick_val_iou(
-                                   eval_compatible_qat_model, vl_loader, dev,
-                                   score_thresh=0.05, # Consistent validation score_thresh
-                                   iou_thresh=model.head.iou_th,
-                                   max_detections=model.head.max_det,
-                                   epoch_num=qep + 1, # Pass QAT epoch number (1-based for logging)
-                                   run_name=f"QAT_ep{qep+1}_score0.05",
-                                   debug_prints=debug_prints,
-                                   class_agnostic_nms=bool(cfg.class_agnostic_nms),
-                                )
-            print(f"[QAT Eval] Epoch {qep + 1}/{qat_epochs} Val IoU (score_th=0.05): {current_qat_val_iou:.4f}  Acc {acc:.3f}")
+            # Track at multiple thresholds for fair comparison with FP32
+            for q_score_th in [0.05, 0.25]:
+                q_iou, q_acc = quick_val_iou(
+                    eval_compatible_qat_model, vl_loader, dev,
+                    score_thresh=q_score_th,
+                    iou_thresh=model.head.iou_th,
+                    max_detections=model.head.max_det,
+                    epoch_num=qep + 1,
+                    run_name=f"QAT_ep{qep+1}_score{q_score_th}",
+                    debug_prints=False,
+                    class_agnostic_nms=bool(cfg.class_agnostic_nms),
+                )
+                print(f"[QAT Eval] Epoch {qep + 1}/{qat_epochs} | Score > {q_score_th:0.2f} | Val IoU: {q_iou:.4f}  Acc: {q_acc:.3f}")
+                
+                if q_score_th == 0.05:
+                    current_qat_val_iou = q_iou # Use 0.05 for "best" tracking to match logic
 
             if current_qat_val_iou > best_qat_iou:
                 best_qat_iou = current_qat_val_iou
