@@ -387,8 +387,9 @@ class ExponentialMovingAverage:
         ema_sd = self.ema.state_dict()
         model_sd = model.state_dict()
         for k, v in ema_sd.items():
-            mv = model_sd[k]
-            if v.dtype.is_floating_point:
+            if k not in model_sd: continue
+            mv = model_sd[k].to(v.device, non_blocking=True)
+            if v.is_floating_point():
                 v.mul_(self.decay).add_(mv.detach(), alpha=1.0 - self.decay)
             else:
                 v.copy_(mv)
@@ -684,21 +685,12 @@ print(f"[INFO] QAT will run on: {qat_train_device}")
 backend_config = get_native_backend_config() # For fusion patterns
 
 # 1. Create a CPU copy of the FP32-trained model FOR QAT PREPARATION
-#    Make sure it's a deepcopy to avoid altering the original FP32 model.
-#    Important: Don't directly deepcopy the EMA model as it has requires_grad=False
-#    which can cause issues with FX tracing. Instead, load EMA weights into a fresh copy.
+#    Always deepcopy the current trained model to ensure structural identity.
+model_for_qat_prep = copy.deepcopy(model).cpu()
+
 if ema is not None:
-    print("[INFO] Transferring EMA weights to a fresh model copy for QAT...")
-    model_for_qat_prep = build_model(
-        ncls, width_mult, torch.device("cpu"),
-        arch=arch,
-        pretrained=False,  # Don't reload pretrained weights
-        drop_rate=drop_rate,
-        drop_path_rate=drop_path_rate,
-    )
+    print("[INFO] Transferring EMA weights to the model copy for QAT...")
     model_for_qat_prep.load_state_dict(ema.ema.state_dict())
-else:
-    model_for_qat_prep = copy.deepcopy(model).cpu()
 
 model_for_qat_prep.train() # IMPORTANT: Set to TRAIN mode for prepare_qat_fx
 
