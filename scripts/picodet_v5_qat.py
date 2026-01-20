@@ -1388,9 +1388,6 @@ class ONNXExportablePicoDet(nn.Module):
         self.postprocessor = head_postprocessor
 
     def forward(self, x: torch.Tensor):
-        # PicoDetHead only returns raw logits in .train() mode.
-        # We must restore the state recursively using .train()/.eval() calls, 
-        # as manual attribute assignment (training=False) does not flip child modules.
         was_training = self.core_model.training
         
         self.core_model.train()
