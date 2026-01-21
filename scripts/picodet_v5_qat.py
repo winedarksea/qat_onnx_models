@@ -769,7 +769,7 @@ def train_epoch(
     dfl_project_buffer_for_decode: torch.Tensor,
     max_epochs: int = 300,
     quality_floor_vfl: float = 0.05,
-    w_cls_loss: float = 3.0,
+    w_cls_loss: float = 4.0,
     w_dfl_loss: float = 0.5,
     w_iou_loss: float = 4.0,
     use_focal_loss: bool = False,
@@ -1779,7 +1779,7 @@ def main(argv: List[str] | None = None):
                     help="Epochs to use sigmoid focal loss before switching to Varifocal Loss. Set to -1 to disable warmup.")
     pa.add_argument('--vfl_q_gamma_after_warmup', type=float, default=1.0,
                     help="Exponent for IoU→quality target after warmup (higher emphasizes high-IoU positives; tends to improve precision).")
-    pa.add_argument('--vfl_q_gamma_refine', type=float, default=1.3,
+    pa.add_argument('--vfl_q_gamma_refine', type=float, default=1.5,
                     help="Exponent for IoU→quality target during late refinement (higher generally increases precision).")
     pa.add_argument('--class_agnostic_nms', action='store_false',
                     help="Use class-agnostic NMS in quick_val (suppresses duplicates across classes; can improve precision).")
@@ -1791,7 +1791,7 @@ def main(argv: List[str] | None = None):
     pa.add_argument('--simota_topk', type=int, default=10)
     pa.add_argument('--simota_dynamic_k_min', type=int, default=1)
     pa.add_argument('--simota_min_iou_threshold', type=float, default=0.05)
-    pa.add_argument('--simota_cls_cost_weight', type=float, default=1.5)
+    pa.add_argument('--simota_cls_cost_weight', type=float, default=2.5)
     pa.add_argument('--simota_cls_cost_iou_power', type=float, default=0.4,
                     help="Weights SimOTA classification cost by IoU^p (p>0 reduces class-cost influence for low-IoU anchors).")
     pa.add_argument('--load_from', type=str, default=False, help="Path to a checkpoint to resume or finetune from (e.g., 'picodet_50coco.pt')")
@@ -1833,7 +1833,7 @@ def main(argv: List[str] | None = None):
     alpha_loss = 0.75
     quality_floor_vfl = 0.04
     q_gamma = 0.5
-    CLS_WEIGHT = 2.0
+    CLS_WEIGHT = 3.0
     IOU_WEIGHT = 2.0
 
     # Load data
@@ -1921,7 +1921,7 @@ def main(argv: List[str] | None = None):
         img_size=IMG_SIZE,
         head_reg_max=9 if IMG_SIZE < 320 else int((2 * math.ceil(IMG_SIZE / 128) + 3)),
         head_score_thresh=0.10,  # Raised from 0.05 for better precision
-        head_nms_iou=0.55,  # Lowered from 0.60 to reduce overlapping boxes
+        head_nms_iou=0.5,  # Lowered from 0.60 to reduce overlapping boxes
         reg_conv_depth=reg_conv_depth,
         cls_conv_depth=cls_conv_depth,
         lat_k=lat_k,
