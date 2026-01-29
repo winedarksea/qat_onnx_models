@@ -394,6 +394,23 @@ class ExponentialMovingAverage:
             else:
                 v.copy_(mv)
 
+def disable_drop_path_modules_for_qat(model: nn.Module) -> int:
+    """
+    FX QAT can mistakenly attach observers to Python-level tuple multiplications inside
+    stochastic depth (DropPath), producing runtime errors like:
+      fused_moving_avg_obs_fake_quant(): input must be Tensor, not tuple
+
+    During QAT fine-tuning, stochastic depth is typically not critical; replacing it with
+    Identity keeps tracing/conversion stable with minimal behavioral impact.
+    """
+    replaced = 0
+    for parent in model.modules():
+        for child_name, child in list(parent.named_children()):
+            if child.__class__.__name__ == "DropPath":
+                setattr(parent, child_name, nn.Identity())
+                replaced += 1
+    return replaced
+
 
 def train_epoch(model, loader, crit, opt, scaler, dev, ep, qat_mode_active:bool = False, ema: ExponentialMovingAverage | None = None):
     model.train(); tot = loss_sum = 0
@@ -691,6 +708,10 @@ model_for_qat_prep = copy.deepcopy(model).cpu()
 if ema is not None:
     print("[INFO] Transferring EMA weights to the model copy for QAT...")
     model_for_qat_prep.load_state_dict(ema.ema.state_dict())
+
+replaced_dp = disable_drop_path_modules_for_qat(model_for_qat_prep)
+if replaced_dp:
+    print(f"[INFO] QAT: replaced {replaced_dp} DropPath modules with Identity for FX stability.")
 
 model_for_qat_prep.train() # IMPORTANT: Set to TRAIN mode for prepare_qat_fx
 
