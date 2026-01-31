@@ -594,7 +594,8 @@ class SimOTACache:
 
         # 3. dynamic-k candidates
         iou_sum_per_gt = iou.sum(1)
-        dynamic_ks = torch.clamp(iou_sum_per_gt.ceil().int(),  # ceil not floor
+        # Scale down IoU sum to reduce k_mean - cleaner assignments with fewer FPs
+        dynamic_ks = torch.clamp((iou_sum_per_gt * 0.8).round().int(),
                                  min=self.dynamic_k_min, max=self.k)
         fg_cand_mask = torch.zeros(A, dtype=torch.bool, device=device)
 
@@ -769,13 +770,14 @@ def train_epoch(
     dfl_project_buffer_for_decode: torch.Tensor,
     max_epochs: int = 300,
     quality_floor_vfl: float = 0.05,
-    w_cls_loss: float = 4.0,
+    w_cls_loss: float = 3.0,
     w_dfl_loss: float = 0.5,
     w_iou_loss: float = 4.0,
     use_focal_loss: bool = False,
     debug_prints: bool = True,
     gamma_loss: float = 2.0,
     alpha_loss: float = 0.75,
+    background_weight: float = 1.0,  # Increase to 1.5-2.0 if FP/img is high
     q_gamma: float = 0.5,
     ema: ModelEMA | None = None,
     require_anchor_inside_gt_for_cls: bool = True,
@@ -921,7 +923,8 @@ def train_epoch(
                 cls_p_batch, batch_cls_targets, alpha=0.25, gamma=gamma_loss, reduction='sum'
             ) / loss_normalizer
         else:
-            vfl_calc = VarifocalLoss(alpha=alpha_loss, gamma=gamma_loss, reduction='sum')
+            vfl_calc = VarifocalLoss(alpha=alpha_loss, gamma=gamma_loss, 
+                                     background_weight=background_weight, reduction='sum')
             loss_cls = vfl_calc(cls_p_batch, batch_cls_targets) / loss_normalizer
 
         if total_num_fg_batch > 0:
@@ -1779,7 +1782,7 @@ def main(argv: List[str] | None = None):
                     help="Epochs to use sigmoid focal loss before switching to Varifocal Loss. Set to -1 to disable warmup.")
     pa.add_argument('--vfl_q_gamma_after_warmup', type=float, default=1.0,
                     help="Exponent for IoU→quality target after warmup (higher emphasizes high-IoU positives; tends to improve precision).")
-    pa.add_argument('--vfl_q_gamma_refine', type=float, default=1.5,
+    pa.add_argument('--vfl_q_gamma_refine', type=float, default=1.3,
                     help="Exponent for IoU→quality target during late refinement (higher generally increases precision).")
     pa.add_argument('--class_agnostic_nms', action='store_false',
                     help="Use class-agnostic NMS in quick_val (suppresses duplicates across classes; can improve precision).")
@@ -1788,7 +1791,7 @@ def main(argv: List[str] | None = None):
     pa.add_argument('--anchor_inside_gt_margin', type=float, default=0.0,
                     help="Allow positives within a margin of the GT box edges, in units of stride (e.g. 0.5 = half a stride).")
     pa.add_argument('--simota_ctr', type=float, default=4.0)
-    pa.add_argument('--simota_topk', type=int, default=10)
+    pa.add_argument('--simota_topk', type=int, default=8)
     pa.add_argument('--simota_dynamic_k_min', type=int, default=1)
     pa.add_argument('--simota_min_iou_threshold', type=float, default=0.05)
     pa.add_argument('--simota_cls_cost_weight', type=float, default=2.5)
@@ -1833,7 +1836,8 @@ def main(argv: List[str] | None = None):
     alpha_loss = 0.75
     quality_floor_vfl = 0.04
     q_gamma = 0.5
-    CLS_WEIGHT = 3.0
+    background_weight = 1.3  # Increased from 1.0 to reduce FPs (FP/img was 12)
+    CLS_WEIGHT = 2.0
     IOU_WEIGHT = 2.0
 
     # Load data
@@ -1921,7 +1925,7 @@ def main(argv: List[str] | None = None):
         img_size=IMG_SIZE,
         head_reg_max=9 if IMG_SIZE < 320 else int((2 * math.ceil(IMG_SIZE / 128) + 3)),
         head_score_thresh=0.10,  # Raised from 0.05 for better precision
-        head_nms_iou=0.5,  # Lowered from 0.60 to reduce overlapping boxes
+        head_nms_iou=0.48,  # Lowered to merge duplicate predictions
         reg_conv_depth=reg_conv_depth,
         cls_conv_depth=cls_conv_depth,
         lat_k=lat_k,
@@ -2246,6 +2250,7 @@ def main(argv: List[str] | None = None):
             w_iou_loss=IOU_WEIGHT,
             gamma_loss=gamma_loss,
             alpha_loss=alpha_loss,
+            background_weight=background_weight,
             q_gamma=q_gamma,
             ema=ema,
             require_anchor_inside_gt_for_cls=not cfg.no_anchor_inside_gt_for_cls,
@@ -2402,6 +2407,7 @@ def main(argv: List[str] | None = None):
             w_iou_loss=IOU_WEIGHT,
             use_focal_loss=use_focal_loss,
             alpha_loss=alpha_loss,
+            background_weight=background_weight,
             q_gamma=q_gamma,
             ema=ema_qat,
             require_anchor_inside_gt_for_cls=not cfg.no_anchor_inside_gt_for_cls,
