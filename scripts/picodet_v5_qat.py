@@ -423,6 +423,7 @@ class SimOTACache:
                  cls_cost_iou_power: float = 0.0,
                  debug_epochs: int = 0,         # 0 = silent
                  dynamic_k_min: int = 2,
+                 dynamic_k_scale: float = 1.0,
                  min_iou_threshold: float = 0.02,  # Reject assignments with IoU below this
                  ):
         self.nc = nc
@@ -430,8 +431,9 @@ class SimOTACache:
         self.k = topk
         self.cls_cost_weight = cls_cost_weight
         self.cache = {}               # anchor centres per (H,W,stride,device)
-        self.simota_prefilter = False
+        self.simota_prefilter = False  # testing consistently shows this as worse, so far
         self.dynamic_k_min = dynamic_k_min  # 3, or 1-2
+        self.dynamic_k_scale = float(dynamic_k_scale)
         self.min_iou_threshold = min_iou_threshold
         self.power = float(cls_cost_iou_power)
         self.mean_fg_iou = 0.0
@@ -594,8 +596,7 @@ class SimOTACache:
 
         # 3. dynamic-k candidates
         iou_sum_per_gt = iou.sum(1)
-        # Scale down IoU sum to reduce k_mean - cleaner assignments with fewer FPs
-        dynamic_ks = torch.clamp((iou_sum_per_gt * 0.8).round().int(),
+        dynamic_ks = torch.clamp((iou_sum_per_gt * self.dynamic_k_scale).ceil().int(),  # ceil not floor
                                  min=self.dynamic_k_min, max=self.k)
         fg_cand_mask = torch.zeros(A, dtype=torch.bool, device=device)
 
@@ -770,7 +771,7 @@ def train_epoch(
     dfl_project_buffer_for_decode: torch.Tensor,
     max_epochs: int = 300,
     quality_floor_vfl: float = 0.05,
-    w_cls_loss: float = 3.0,
+    w_cls_loss: float = 4.0,
     w_dfl_loss: float = 0.5,
     w_iou_loss: float = 4.0,
     use_focal_loss: bool = False,
@@ -1778,21 +1779,27 @@ def main(argv: List[str] | None = None):
     pa.add_argument('--out', default='picodet_v5_int8.onnx')
     pa.add_argument('--no_inplace_head_neck', default=True, action='store_true', help="Disable inplace activations in head/neck")
     pa.add_argument('--min_box_size', type=int, default=8, help="Minimum pixel width/height for a GT box to be used in training.")
+    pa.add_argument('--head_score_thresh', type=float, default=0.05, help="Score threshold used by quick_val and ONNX NMS.")
+    pa.add_argument('--head_nms_iou', type=float, default=0.48, help="NMS IoU threshold used by quick_val and ONNX NMS.")
+    pa.add_argument('--head_max_det', type=int, default=100, help="Max detections per image for quick_val and ONNX NMS.")
+    pa.add_argument('--background_weight', type=float, default=1.1, help="Extra VarifocalLoss penalty for background (FP suppression).")
     pa.add_argument('--focal_warmup_epochs', type=int, default=12,
                     help="Epochs to use sigmoid focal loss before switching to Varifocal Loss. Set to -1 to disable warmup.")
     pa.add_argument('--vfl_q_gamma_after_warmup', type=float, default=1.0,
                     help="Exponent for IoU→quality target after warmup (higher emphasizes high-IoU positives; tends to improve precision).")
-    pa.add_argument('--vfl_q_gamma_refine', type=float, default=1.3,
+    pa.add_argument('--vfl_q_gamma_refine', type=float, default=1.5,
                     help="Exponent for IoU→quality target during late refinement (higher generally increases precision).")
-    pa.add_argument('--class_agnostic_nms', action='store_false',
+    pa.add_argument('--class_agnostic_nms', action='store_true', default=False,
                     help="Use class-agnostic NMS in quick_val (suppresses duplicates across classes; can improve precision).")
     pa.add_argument('--no_anchor_inside_gt_for_cls', action='store_true',
                     help="Disable requiring positive anchors' centers to lie inside their assigned GT box for classification targets.")
     pa.add_argument('--anchor_inside_gt_margin', type=float, default=0.0,
                     help="Allow positives within a margin of the GT box edges, in units of stride (e.g. 0.5 = half a stride).")
     pa.add_argument('--simota_ctr', type=float, default=4.0)
-    pa.add_argument('--simota_topk', type=int, default=8)
+    pa.add_argument('--simota_topk', type=int, default=10)
     pa.add_argument('--simota_dynamic_k_min', type=int, default=1)
+    pa.add_argument('--simota_dynamic_k_scale', type=float, default=1.0,
+                    help="Scale factor applied to SimOTA dynamic_k (1.0=baseline ceil(iou_sum)).")
     pa.add_argument('--simota_min_iou_threshold', type=float, default=0.05)
     pa.add_argument('--simota_cls_cost_weight', type=float, default=2.5)
     pa.add_argument('--simota_cls_cost_iou_power', type=float, default=0.4,
@@ -1836,9 +1843,9 @@ def main(argv: List[str] | None = None):
     alpha_loss = 0.75
     quality_floor_vfl = 0.04
     q_gamma = 0.5
-    background_weight = 1.3  # Increased from 1.0 to reduce FPs (FP/img was 12)
-    CLS_WEIGHT = 2.0
-    IOU_WEIGHT = 2.0
+    background_weight = float(cfg.background_weight)
+    CLS_WEIGHT = 3.0
+    IOU_WEIGHT = 4.0
 
     # Load data
     root = cfg.coco_root
@@ -1924,13 +1931,15 @@ def main(argv: List[str] | None = None):
         neck_out_ch=out_ch,  # 96
         img_size=IMG_SIZE,
         head_reg_max=9 if IMG_SIZE < 320 else int((2 * math.ceil(IMG_SIZE / 128) + 3)),
-        head_score_thresh=0.10,  # Raised from 0.05 for better precision
-        head_nms_iou=0.48,  # Lowered to merge duplicate predictions
+        head_score_thresh=float(cfg.head_score_thresh),
+        head_nms_iou=float(cfg.head_nms_iou),
         reg_conv_depth=reg_conv_depth,
         cls_conv_depth=cls_conv_depth,
         lat_k=lat_k,
         inplace_act_for_head_neck=not cfg.no_inplace_head_neck # Control from arg
     ).to(dev)
+    if hasattr(model, "head") and hasattr(model.head, "max_det"):
+        model.head.max_det = int(cfg.head_max_det)
     
     # ------- (optional) random subset for quick runs -------
     subset_sampler = None
@@ -2096,6 +2105,7 @@ def main(argv: List[str] | None = None):
         cls_cost_iou_power=cfg.simota_cls_cost_iou_power,
         debug_epochs=5 if debug_prints else 0,
         dynamic_k_min=cfg.simota_dynamic_k_min,
+        dynamic_k_scale=cfg.simota_dynamic_k_scale,
         min_iou_threshold=cfg.simota_min_iou_threshold,
     )
     # ── Resume / Finetune from checkpoint (optional) ─────────────────
@@ -2198,7 +2208,6 @@ def main(argv: List[str] | None = None):
         elif ep == 14:
             IOU_WEIGHT = 2.5
             assigner.r = 3.8  # Relaxed from 3.5
-            assigner.simota_prefilter = True  # Anchor center MUST be inside GT box
         elif ep == 15:
             assigner.cls_cost_weight = 3.0
             CLS_WEIGHT = 3.8
@@ -2212,7 +2221,7 @@ def main(argv: List[str] | None = None):
             quality_floor_vfl = 0.005
             assigner.cls_cost_weight = 3.5
             CLS_WEIGHT = 4.0
-            # q_gamma = max(q_gamma, float(cfg.vfl_q_gamma_refine))
+            q_gamma = max(q_gamma, float(cfg.vfl_q_gamma_refine))
             assigner.dynamic_k_min = 1
         elif ep == 55:
             q_gamma = 0.4
