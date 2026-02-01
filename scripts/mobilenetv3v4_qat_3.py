@@ -146,9 +146,6 @@ def replace_timm_bn_act_with_torch_bn_and_act(module: nn.Module, module_name_pre
                 track_running_stats=child_module.track_running_stats
             )
             # Transfer state for the BN part
-            # This assumes child_module.bn.state_dict() gives the pure BN state if it has an internal .bn
-            # Or if child_module itself holds the BN params directly.
-            # For BatchNormAct2d, it seems it directly holds BN params.
             bn_state = {k: v for k, v in child_module.state_dict().items() if 'running_mean' in k or 'running_var' in k or 'num_batches_tracked' in k or k == 'weight' or k == 'bias'}
             # Filter further if activation has its own weight/bias
             bn_param_names = {'weight', 'bias', 'running_mean', 'running_var', 'num_batches_tracked'}
@@ -226,11 +223,8 @@ def get_backbone(arch: str, ncls: int, width: float,
             width_mult=width,
         )
         # 1. Get the input features for the final linear layer
-        # The default classifier is Sequential(Dropout, Linear)
-        # The in_features for the Linear layer is at classifier[1].in_features
         in_features = model.classifier[1].in_features
         # 2. Reconstruct the classification head with inplace=False for Dropout
-        # This is the most robust way when replacing the head for fine-tuning
         new_classifier_layers = []
         if drop_rate is not None and drop_rate > 0.0:
             # Use inplace=False explicitly for better tracing compatibility
@@ -247,7 +241,6 @@ def get_backbone(arch: str, ncls: int, width: float,
             drop_path_rate=drop_path_rate # For stochastic depth in blocks
         )
         # The model already has its own classifier if ncls > 0
-        # No need to replace model.classifier like for mnv3/mnv2
     elif arch == "mnv4c-s":
         model = MobileNetV4(
             variant='conv_s',
@@ -291,24 +284,7 @@ def get_backbone(arch: str, ncls: int, width: float,
         
         if (arch in {"mnv4s", "mnv4m"}):
             print(f"[INFO] Attempting to replace timm BatchNorm layers in '{timm_name}' with torch.nn.BatchNorm2d for QAT compatibility...")
-            # If pretrained, the state_dict keys for BN might differ slightly.
-            # This replacement is simpler if done BEFORE loading state_dict,
-            # or if the state_dict loading is robust to minor differences / done carefully.
-            # If you load pretrained weights for the timm model, those weights are for
-            # timm.BatchNormAct2d. When you replace with nn.BatchNorm2d, you'd ideally
-            # want to transfer these weights.
-            
-            # If model is already pretrained and loaded:
-            # Create a temporary fresh model, replace BNs, then load state_dict carefully.
-            # Or, replace BNs and then try to load state_dict from the original timm model,
-            # possibly with strict=False and manual key mapping if needed.
-
-            # For simplicity here, assuming replacement happens on a model structure that will
-            # either be trained from scratch or where state_dict loading can handle this.
-            
-            # --- Perform replacement ---
             # We need to preserve the pretrained weights if `pretrained=True`.
-            # The most robust way if weights are loaded *before* replacement:
             if pretrained:
                 # 1. Store state_dict of the original timm model
                 original_state_dict = model.state_dict()
@@ -316,25 +292,11 @@ def get_backbone(arch: str, ncls: int, width: float,
                 # 2. Create a NEW instance of the model WITHOUT pretrained weights (to modify its structure)
                 temp_model_for_structure = timm.create_model(timm_name, pretrained=False, num_classes=ncls, drop_rate=drop_rate, drop_path_rate=drop_path_rate)
                 replace_timm_bn_act_with_torch_bn_and_act(temp_model_for_structure) # Modify structure
-                
-                # 3. Load original state_dict into the modified structure.
-                # This might require careful key mapping if timm.BatchNormAct2d has different keys
-                # than nn.BatchNorm2d or if it includes activation parameters.
-                # For standard BN params (weight, bias, running_mean, running_var), keys are often the same.
-                
-                # Simplified approach: If keys mostly match for BN parts
-                # We need to handle cases where BatchNormAct2d might have extra parameters
-                # related to its activation, which nn.BatchNorm2d won't have.
-                # So, load with strict=False.
-                
+
                 # Create a new model instance that we will modify and then load state into
                 model_with_torch_bn = timm.create_model(timm_name, pretrained=False, num_classes=ncls, drop_rate=drop_rate, drop_path_rate=drop_path_rate)
                 replace_timm_bn_act_with_torch_bn_and_act(model_with_torch_bn) # Replace BNs in this new instance
-                
-                # Now, load the state from the original pretrained model into this new one
-                # We need to filter the original_state_dict to only include keys present
-                # in model_with_torch_bn, or handle mismatches.
-                
+
                 # A common pattern for state_dict loading with structural changes:
                 new_state_dict = model_with_torch_bn.state_dict()
                 for k_orig, v_orig in original_state_dict.items():
@@ -342,7 +304,6 @@ def get_backbone(arch: str, ncls: int, width: float,
                         new_state_dict[k_orig] = v_orig
                     else:
                         # This part needs careful debugging if keys don't match for BN layers.
-                        # E.g. timm's BNAct might be 'module.bn.weight' vs 'module.weight'
                         print(f"[WARN] Key mismatch or shape mismatch during state_dict transfer for QAT BN replacement: {k_orig}")
                 model_with_torch_bn.load_state_dict(new_state_dict)
                 model = model_with_torch_bn # Use the model with replaced BNs
@@ -367,8 +328,8 @@ def build_model(
     model = nn.Sequential(
         BilinearResize(IMG_SIZE),
         # T_v2.Resize((IMG_SIZE, IMG_SIZE), antialias=True), # 0: Resize, antialias=False would be faster, antialias requires opset 18
-        PreprocNorm(),                                   # 1: Preprocessing
-        backbone                                         # 2: Backbone
+        PreprocNorm(),
+        backbone
     ).to(
         dev, memory_format=torch.channels_last if _CNL(dev) else torch.contiguous_format
     )
@@ -414,7 +375,7 @@ def disable_drop_path_modules_for_qat(model: nn.Module) -> int:
 
 def train_epoch(model, loader, crit, opt, scaler, dev, ep, qat_mode_active:bool = False, ema: ExponentialMovingAverage | None = None):
     model.train(); tot = loss_sum = 0
-    for i, (img, lab) in enumerate(loader): # Consider adding tqdm here for progress
+    for i, (img, lab) in enumerate(loader):
         img = img.to(dev, non_blocking=True,
                      memory_format=torch.channels_last if _CNL(dev) else torch.contiguous_format)
         lab = lab.to(dev, non_blocking=True)
@@ -440,7 +401,7 @@ def train_epoch(model, loader, crit, opt, scaler, dev, ep, qat_mode_active:bool 
 @torch.no_grad()
 def evaluate(model, loader, dev):
     model.eval(); corr = tot = 0
-    for img, lab in loader: # Consider adding tqdm here for progress
+    for img, lab in loader:
         img = img.to(dev, memory_format=torch.channels_last if _CNL(dev) else torch.contiguous_format)
         lab = lab.to(dev); corr += (model(img).argmax(1) == lab).sum().item(); tot += lab.size(0)
     return corr / tot
@@ -469,43 +430,151 @@ def save_backbone(model,  output_base_name, dev):
         print(f"[SAVE] FP32 PyTorch backbone state_dict → {bpath}")
     # model.to(dev) (if not doing deepcopy)
 
-def load_backbone_from_checkpoint(model: nn.Module,
-                                  checkpoint_path: str,
-                                  classifier_key_patterns: list[str] = None,
-                                  map_location: str | torch.device = 'cpu'):
+def _looks_like_backbone_only_state_dict(state_dict: dict) -> bool:
+    # Heuristic: backbone-only saves (e.g., `save_backbone`) won't have the Sequential prefix `2.`
+    # and won't include preprocess buffers like `1.m`, `1.s`.
+    keys = list(state_dict.keys())
+    if not keys:
+        return False
+    has_seq_prefix = any(k.startswith(("0.", "1.", "2.")) for k in keys)
+    return not has_seq_prefix
+
+def _filter_state_dict(state_dict: dict, skip_key_substrings: list[str] | None) -> dict:
+    if not skip_key_substrings:
+        return state_dict
+    return {k: v for k, v in state_dict.items() if not any(s in k for s in skip_key_substrings)}
+
+def _extract_state_dict_from_checkpoint_obj(ckpt_obj, prefer: str = "auto") -> dict:
+    # Supports:
+    # - raw state_dict
+    # - dict with keys: model_state_dict, ema_state_dict, state_dict
+    if not isinstance(ckpt_obj, dict):
+        raise TypeError("Checkpoint must be a state_dict or a dict containing a state_dict")
+
+    if prefer not in {"auto", "model", "ema"}:
+        raise ValueError("prefer must be one of: auto, model, ema")
+
+    if prefer in {"auto", "ema"} and "ema_state_dict" in ckpt_obj:
+        return ckpt_obj["ema_state_dict"]
+    if prefer in {"auto", "model"} and "model_state_dict" in ckpt_obj:
+        return ckpt_obj["model_state_dict"]
+    if "state_dict" in ckpt_obj:
+        return ckpt_obj["state_dict"]
+    # Fall back: treat as raw state_dict if it looks like one.
+    if all(isinstance(k, str) for k in ckpt_obj.keys()):
+        return ckpt_obj
+    raise KeyError("Could not find a state_dict in checkpoint object")
+
+def load_checkpoint_weights(
+    model: nn.Module,
+    checkpoint_path: str,
+    *,
+    prefer: str = "auto",
+    skip_head: bool = True,
+    map_location: str | torch.device = "cpu",
+) -> None:
     """
-    Loads all matching weights from checkpoint_path into model, skipping keys
-    that correspond to the old classification head.
-    
-    Args:
-        model: your new nn.Module with a freshly initialized head.
-        checkpoint_path: path to .pt or .pth file saved via torch.save().
-        classifier_key_patterns: list of substrings; any key containing one of these
-                                 will be skipped. Defaults to ["classifier", "head"].
-        map_location: device mapping for torch.load().
+    Loads weights from a checkpoint into `model`.
+
+    - If `checkpoint_path` is a full-model checkpoint (Sequential keys like "2.*"), loads into `model`.
+    - If it looks like a backbone-only checkpoint (no "0./1./2." prefixes), loads into `model[2]` when available.
+    - If `skip_head=True`, skips keys containing 'classifier' or 'head' (useful when fine-tuning on a new dataset).
     """
-    ckpt = torch.load(checkpoint_path, map_location=map_location)
-    # unwrap if needed
-    state_dict = ckpt.get('state_dict', ckpt)
-    
-    # by default skip anything in "classifier" or "head"
-    if classifier_key_patterns is None:
-        classifier_key_patterns = ['classifier', 'head']
-    
-    filtered = {}
-    for k, v in state_dict.items():
-        if any(pat in k for pat in classifier_key_patterns):
-            # skip this key
-            continue
-        filtered[k] = v
-    
-    # load with strict=False so that only the filtered keys are filled
-    missing, unexpected = model.load_state_dict(filtered, strict=False)
+    ckpt_obj = torch.load(checkpoint_path, map_location=map_location)
+    state_dict = _extract_state_dict_from_checkpoint_obj(ckpt_obj if isinstance(ckpt_obj, dict) else {"state_dict": ckpt_obj}, prefer=prefer)
+
+    skip_key_substrings = ["classifier", "head"] if skip_head else []
+    state_dict = _filter_state_dict(state_dict, skip_key_substrings)
+
+    target: nn.Module = model
+    if _looks_like_backbone_only_state_dict(state_dict) and isinstance(model, nn.Sequential) and len(model) >= 3:
+        target = model[2]
+
+    missing, unexpected = target.load_state_dict(state_dict, strict=False)
     if missing:
-        print(f"[WARN] Missing keys in new model (will be randomly initialized): {missing}")
+        print(f"[WARN] Missing keys when loading '{checkpoint_path}': {missing}")
     if unexpected:
-        print(f"[WARN] Unexpected keys in checkpoint not used: {unexpected}")
-    print(f"[INFO] Loaded {len(filtered)} parameters from '{checkpoint_path}'.")
+        print(f"[WARN] Unexpected keys when loading '{checkpoint_path}': {unexpected}")
+    print(f"[INFO] Loaded weights from '{checkpoint_path}' (skip_head={skip_head}, prefer={prefer}).")
+
+def _state_dict_to_cpu(state_dict: dict) -> dict:
+    return {k: (v.detach().cpu() if torch.is_tensor(v) else v) for k, v in state_dict.items()}
+
+def save_training_checkpoint(
+    checkpoint_path: str | Path,
+    *,
+    model: nn.Module,
+    optimizer: optim.Optimizer | None,
+    scheduler,
+    scaler,
+    ema: ExponentialMovingAverage | None,
+    epoch: int,
+    best_val_acc: float,
+    config: dict,
+) -> None:
+    checkpoint_path = Path(checkpoint_path)
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+
+    payload = {
+        "epoch": int(epoch),
+        "best_val_acc": float(best_val_acc),
+        "config": dict(config),
+        "model_state_dict": _state_dict_to_cpu(model.state_dict()),
+    }
+    if ema is not None:
+        payload["ema_state_dict"] = _state_dict_to_cpu(ema.ema.state_dict())
+        payload["ema_decay"] = float(ema.decay)
+    if optimizer is not None:
+        payload["optimizer_state_dict"] = optimizer.state_dict()
+    if scheduler is not None and hasattr(scheduler, "state_dict"):
+        payload["scheduler_state_dict"] = scheduler.state_dict()
+    if scaler is not None and hasattr(scaler, "state_dict"):
+        payload["scaler_state_dict"] = scaler.state_dict()
+
+    torch.save(payload, checkpoint_path)
+    print(f"[SAVE] Training checkpoint → {checkpoint_path}")
+
+def load_training_checkpoint(
+    checkpoint_path: str | Path,
+    *,
+    model: nn.Module,
+    optimizer: optim.Optimizer | None,
+    scheduler,
+    scaler,
+    ema: ExponentialMovingAverage | None,
+    map_location: str | torch.device = "cpu",
+) -> tuple[int, float]:
+    checkpoint_path = Path(checkpoint_path)
+    ckpt = torch.load(checkpoint_path, map_location=map_location)
+    if not isinstance(ckpt, dict) or "model_state_dict" not in ckpt:
+        raise ValueError(f"Not a training checkpoint: {checkpoint_path}")
+
+    model.load_state_dict(ckpt["model_state_dict"], strict=True)
+    if ema is not None and "ema_state_dict" in ckpt:
+        ema.ema.load_state_dict(ckpt["ema_state_dict"], strict=True)
+
+    if optimizer is not None and "optimizer_state_dict" in ckpt:
+        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+    if scheduler is not None and "scheduler_state_dict" in ckpt and hasattr(scheduler, "load_state_dict"):
+        scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+    if scaler is not None and "scaler_state_dict" in ckpt and hasattr(scaler, "load_state_dict"):
+        scaler.load_state_dict(ckpt["scaler_state_dict"])
+
+    start_epoch = int(ckpt.get("epoch", -1)) + 1
+    best_val_acc = float(ckpt.get("best_val_acc", 0.0))
+    print(f"[INFO] Resumed from '{checkpoint_path}' (start_epoch={start_epoch}, best_val_acc={best_val_acc*100:.2f}%).")
+    return start_epoch, best_val_acc
+
+def load_backbone_from_checkpoint(
+    model: nn.Module,
+    checkpoint_path: str,
+    classifier_key_patterns: list[str] = None,
+    map_location: str | torch.device = "cpu",
+):
+    # Back-compat wrapper around `load_checkpoint_weights`.
+    # Note: `classifier_key_patterns` is ignored except for skip_head=True/False behavior.
+    skip_head = True if classifier_key_patterns is None else bool(classifier_key_patterns)
+    load_checkpoint_weights(model, checkpoint_path, prefer="auto", skip_head=skip_head, map_location=map_location)
 
 
 # --- Main script execution ---
@@ -524,6 +593,12 @@ drop_path_rate: float = 0.05  # train-time only; no inference cost
 
 use_ema: bool = True
 ema_decay: float = 0.9999
+
+# Optional: initialize from an existing checkpoint/backbone.
+load_init_path: str | None = None
+load_init_prefer: str = "auto"  # auto|model|ema (only applies if the file stores multiple state_dicts)
+load_init_skip_head: bool = True  # False if same dataset
+qat_init: str = "best"  # best|last
 
 if device_arg is None:
     device_name = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
@@ -550,6 +625,7 @@ output_base_name = f"mobilenet_w{str(width_mult).replace('.', '_')}_{arch}{pretr
 pt_path = f"{output_base_name}_qat_int8.pt" # For PyTorch INT8 state_dict
 onnx_fp32_path = f"{output_base_name}_fp32_from_qat.onnx"
 onnx_path = f"{output_base_name}_qat_int8.onnx" # For ONNX INT8 model
+best_fp32_backbone_path = f"{output_base_name}_fp32_backbone.pt"
 
 # Create class_mapping.json if it doesn't exist for dummy runs
 class_map_path = Path(data_dir) / "class_mapping.json"
@@ -590,7 +666,9 @@ model = build_model(
     drop_rate=drop_rate,
     drop_path_rate=drop_path_rate,
 )
-# load_backbone_from_checkpoint(model, f"{output_base_name}_fp32_backbone.pt")
+if load_init_path:
+    print(f"[INFO] Loading initial weights from: {load_init_path}")
+    load_checkpoint_weights(model, load_init_path, prefer=load_init_prefer, skip_head=load_init_skip_head, map_location="cpu")
 
 label_smoothing: float = 0.1
 crit = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
@@ -632,8 +710,6 @@ else:
     )
     
     # Cosine Annealing scheduler: Decays from peak_lr to peak_lr * cosine_decay_alpha
-    # T_max is the total number of epochs for the cosine decay phase.
-    # eta_min is the minimum learning rate. Since cosine_decay_alpha is 0.0, eta_min will be 0.
     cosine_scheduler = CosineAnnealingLR(
         opt,
         T_max=total_training_epochs - warmup_epochs, # Remaining epochs after warm-up
@@ -641,8 +717,6 @@ else:
     )
     
     # Combine them using SequentialLR
-    # The schedulers will be applied sequentially.
-    # The `milestones` define when the next scheduler in the list takes over.
     sched = SequentialLR(
         opt,
         schedulers=[warmup_scheduler, cosine_scheduler],
@@ -652,6 +726,7 @@ else:
 print("[INFO] Starting FP32 training...")
 ema = ExponentialMovingAverage(model, decay=ema_decay) if use_ema else None
 best_val_acc = 0.0
+best_fp32_eval_state_dict_cpu: dict | None = None
 
 for ep in range(epochs):
     l = train_epoch(model, tr, crit, opt, scaler, dev, ep, qat_mode_active=False, ema=ema)
@@ -659,19 +734,23 @@ for ep in range(epochs):
     a = evaluate(eval_model, vl, dev)
     sched.step()
     print(f"FP32 Epoch {ep+1}/{epochs}  loss {l:.4f}  val@1 {a*100:.2f}%  lr {opt.param_groups[0]['lr']:.5f}")
+
     if a > best_val_acc:
         best_val_acc = a
         print(f"[INFO] New best validation accuracy: {a*100:.2f}% - Saving checkpoint...")
+        best_fp32_eval_state_dict_cpu = _state_dict_to_cpu(eval_model.state_dict())
         try:
+            # Compatibility: the best backbone is always saved as `<output_base_name>_fp32_backbone.pt`.
             save_backbone(eval_model,  output_base_name, dev)
         except Exception as e:
             print("failed to export fp32 backbone: " + repr(e))
 
-# save raw training for loading into object detector on same backbone
-try:
-    save_backbone(ema.ema if ema is not None else model,  output_base_name, dev)
-except Exception as e:
-    print("failed to export fp32 backbone: " + repr(e))
+# If nothing ever beat the initial best (very unlikely), ensure there's at least one backbone file.
+if not Path(best_fp32_backbone_path).exists():
+    try:
+        save_backbone(ema.ema if ema is not None else model, output_base_name, dev)
+    except Exception as e:
+        print("failed to export fp32 backbone: " + repr(e))
 
 
 try:
@@ -705,9 +784,29 @@ backend_config = get_native_backend_config() # For fusion patterns
 #    Always deepcopy the current trained model to ensure structural identity.
 model_for_qat_prep = copy.deepcopy(model).cpu()
 
-if ema is not None:
-    print("[INFO] Transferring EMA weights to the model copy for QAT...")
-    model_for_qat_prep.load_state_dict(ema.ema.state_dict())
+if qat_init == "best":
+    if best_fp32_eval_state_dict_cpu is not None:
+        print("[INFO] QAT init: loading BEST FP32 validation weights.")
+        model_for_qat_prep.load_state_dict(best_fp32_eval_state_dict_cpu, strict=True)
+    elif Path(best_fp32_backbone_path).exists():
+        try:
+            print(f"[INFO] QAT init: loading BEST backbone from '{best_fp32_backbone_path}'.")
+            load_checkpoint_weights(model_for_qat_prep, best_fp32_backbone_path, prefer="auto", skip_head=False, map_location="cpu")
+        except Exception as e:
+            print(f"[WARN] Failed to load best backbone '{best_fp32_backbone_path}': {repr(e)}")
+    elif ema is not None:
+        print("[INFO] QAT init: best weights not found; falling back to EMA (latest).")
+        model_for_qat_prep.load_state_dict(ema.ema.state_dict(), strict=True)
+elif qat_init == "last":
+    if ema is not None:
+        print("[INFO] QAT init: using latest EMA weights.")
+        model_for_qat_prep.load_state_dict(ema.ema.state_dict(), strict=True)
+    else:
+        print("[INFO] QAT init: using latest model weights.")
+else:
+    print(f"[WARN] Unknown qat_init='{qat_init}', using latest weights.")
+    if ema is not None:
+        model_for_qat_prep.load_state_dict(ema.ema.state_dict(), strict=True)
 
 replaced_dp = disable_drop_path_modules_for_qat(model_for_qat_prep)
 if replaced_dp:
@@ -717,7 +816,6 @@ model_for_qat_prep.train() # IMPORTANT: Set to TRAIN mode for prepare_qat_fx
 
 # 2. Define example inputs for tracing.
 #    The model takes uint8 and PreprocNorm converts to FP32.
-#    The example input should be a tuple.
 example_inputs_cpu_for_prepare = (torch.randint(0, 256, (1, 3, DUMMY_H, DUMMY_W), dtype=torch.uint8),)
 
 # 3. Get QConfig mapping and Backend Config
@@ -725,9 +823,7 @@ example_inputs_cpu_for_prepare = (torch.randint(0, 256, (1, 3, DUMMY_H, DUMMY_W)
 #    For mobile, "qnnpack" might be an alternative if targeting Android.
 qconfig_mapping = get_default_qat_qconfig_mapping("x86")
 
-# Customize QConfig for per-channel weights (optional, but often good)
-# The default "x86" QAT mapping already uses good observers.s
-# If you want specific per-channel symmetric for weights globally:
+# Customize QConfig for per-channel weights
 default_activation_factory = qconfig_mapping.global_qconfig.activation
 per_channel_weight_observer = MovingAveragePerChannelMinMaxObserver.with_args(
     dtype=torch.qint8, qscheme=torch.per_channel_symmetric
@@ -743,7 +839,6 @@ qconfig_mapping = qconfig_mapping.set_global(custom_global_qconfig)
 #    This makes F.dropout an identity function ONLY during prepare_qat_fx tracing.
 _original_F_dropout = F.dropout
 # For MobileNetV4 particularly, or if tracing fails, this can be helpful.
-# If tracing works without it, you can comment this patch out.
 F.dropout = lambda x, p=0.0, training=False, inplace=False: x
 print("[INFO] F.dropout patched for prepare_qat_fx tracing.")
 
@@ -813,11 +908,6 @@ int8_model_final = convert_fx_torch(
     backend_config=backend_config # Pass backend_config here too!
 )
 
-# Optional: Print the int8_model_final structure to verify quantization and fusion
-# print("\n--- INT8 GraphModule Structure (Post convert_fx_torch) ---")
-# int8_model_final.print_readable(print_output=True) # May be very verbose
-# print("--- End of INT8 GraphModule Structure ---\n")
-
 # Ensure the model for saving/export is the core module and on CPU, in eval mode
 final_model_for_export = int8_model_final.cpu().eval()
 
@@ -828,7 +918,6 @@ print(f"[SAVE] INT8 PyTorch model state_dict → {pt_path}")
 # Export to ONNX
 print(f"[INFO] Exporting INT8 model to ONNX: {onnx_path}")
 # Dummy input for ONNX export should match the expected input of the final ONNX model
-# Your model has an internal T_v2.Resize((IMG_SIZE, IMG_SIZE)), so input can be IMG_SIZE.
 dummy_input_onnx_cpu = (torch.randint(0, 256, (1, 3, IMG_SIZE, IMG_SIZE), dtype=torch.uint8),)
 
 try:
@@ -997,8 +1086,6 @@ class DataReader:
             return None
 
 # FORCED INPUT NAME FOR CALIBRATOR:
-# The error message strongly suggests that the ORT Calibrator, when quantizing
-# for INT8/UINT8 activations, expects the calibration data feed to use the key "input_u8".
 calibrator_expected_input_key = "input_u8"
 print(f"[INFO] Using input key '{calibrator_expected_input_key}' for ONNX Runtime calibration data reader.")
 
