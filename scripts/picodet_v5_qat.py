@@ -1262,13 +1262,15 @@ def quick_val_iou(
         avg_preds_after_nms = total_preds_after_nms_filter_across_images / num_images_processed if num_images_processed > 0 else 0
         print(f"Avg preds/img (passed score_thresh, before NMS): {avg_preds_before_nms:.2f}")
         print(f"Avg preds/img (after NMS & final filter): {avg_preds_after_nms:.2f}")
-        recall_loc = (total_gt_hits_loc / total_gt_boxes_across_images) if total_gt_boxes_across_images > 0 else 0.0
-        recall_cls = (total_gt_hits_cls / total_gt_boxes_across_images) if total_gt_boxes_across_images > 0 else 0.0
-        precision_loc = (total_tp_loc / (total_tp_loc + total_fp)) if (total_tp_loc + total_fp) > 0 else 0.0
-        precision_cls = (total_tp_cls / (total_tp_loc + total_fp)) if (total_tp_loc + total_fp) > 0 else 0.0
-        avg_fp_per_img = (total_fp / num_images_processed) if num_images_processed > 0 else 0.0
+
+    recall_loc = (total_gt_hits_loc / total_gt_boxes_across_images) if total_gt_boxes_across_images > 0 else 0.0
+    recall_cls = (total_gt_hits_cls / total_gt_boxes_across_images) if total_gt_boxes_across_images > 0 else 0.0
+    precision_loc = (total_tp_loc / (total_tp_loc + total_fp)) if (total_tp_loc + total_fp) > 0 else 0.0
+    precision_cls = (total_tp_cls / (total_tp_loc + total_fp)) if (total_tp_loc + total_fp) > 0 else 0.0
+
+    if debug_prints:
         print(f"Recall@IoU>{iou_match_thresh:.2f}: loc={recall_loc:.3f} cls={recall_cls:.3f}")
-        print(f"Precision@IoU>{iou_match_thresh:.2f}: loc={precision_loc:.3f} cls={precision_cls:.3f} | FP/img={avg_fp_per_img:.2f}")
+        print(f"Precision@IoU>{iou_match_thresh:.2f}: loc={precision_loc:.3f} cls={precision_cls:.3f} | FP/img={((total_fp / num_images_processed) if num_images_processed > 0 else 0.0):.2f}")
 
     if total_gt_boxes_across_images > 0:
         final_mean_iou = total_iou_sum / total_gt_boxes_across_images
@@ -1280,7 +1282,7 @@ def quick_val_iou(
     else:
         final_accuracy = 0.0
 
-    return final_mean_iou, final_accuracy
+    return final_mean_iou, final_accuracy, recall_cls, precision_cls
 
 @torch.no_grad()
 def run_epoch_validation(model: nn.Module, loader, device, epoch_num: int, head_ref: PicoDetHead, *, class_agnostic_nms: bool = False):
@@ -1291,14 +1293,18 @@ def run_epoch_validation(model: nn.Module, loader, device, epoch_num: int, head_
     print(f"\n--- Running Validation for Epoch {epoch_num} ---")
     for score_th in score_thresholds_to_track:
         run_name = f"val_ep{epoch_num}_score{score_th}"
-        iou, acc = quick_val_iou(model, loader, device, score_thresh=score_th, iou_thresh=head_ref.iou_th,
+        iou, acc, rec, pr = quick_val_iou(model, loader, device, score_thresh=score_th, iou_thresh=head_ref.iou_th,
                                   max_detections=head_ref.max_det, epoch_num=epoch_num, run_name=run_name,
                                   debug_prints=False, class_agnostic_nms=class_agnostic_nms)
         key_iou = f"iou_at_{int(score_th*100)}".replace('.', '')
         key_acc = f"acc_at_{int(score_th*100)}".replace('.', '')
+        key_rec = f"rec_at_{int(score_th*100)}".replace('.', '')
+        key_pr  = f"pr_at_{int(score_th*100)}".replace('.', '')
         epoch_summary[key_iou] = iou
         epoch_summary[key_acc] = acc
-        print(f"  [Score > {score_th:.2f}] --> Mean IoU: {iou:.4f}, Accuracy: {acc:.4f}")
+        epoch_summary[key_rec] = rec
+        epoch_summary[key_pr]  = pr
+        print(f"  [Score > {score_th:.2f}] --> Mean IoU: {iou:.4f}, Accuracy: {acc:.4f}, Recall: {rec:.4f}, Precision: {pr:.4f}")
     return epoch_summary
 
 
@@ -2308,7 +2314,7 @@ def main(argv: List[str] | None = None):
         ema.copy_to(model)
     model.eval()
     try:
-        iou_05, acc = quick_val_iou(model, vl_loader, dev,
+        iou_05, acc, rec05, pr05 = quick_val_iou(model, vl_loader, dev,
                                score_thresh=0.05,
                                iou_thresh=model.head.iou_th,
                                max_detections=model.head.max_det,
@@ -2320,7 +2326,7 @@ def main(argv: List[str] | None = None):
         print(f"[INFO] Validation IoU (score_th=0.05): {iou_05:.4f}")
         
         # Run for score_thresh = 0.25
-        iou_25, acc = quick_val_iou(model, vl_loader, dev,
+        iou_25, acc, rec25, pr25 = quick_val_iou(model, vl_loader, dev,
                                score_thresh=0.25,
                                iou_thresh=model.head.iou_th,
                                max_detections=model.head.max_det,
@@ -2336,7 +2342,7 @@ def main(argv: List[str] | None = None):
     # --- Export FP32 reference ONNX for comparison ---
     print("[INFO] Exporting FP32 reference ONNX models...")
     fp32_onnx_path, fp32_nms_path = save_fp32_onnx_reference(model, cfg)
-    
+
     model.train()
 
     # --- QAT Preparation ---
@@ -2439,7 +2445,7 @@ def main(argv: List[str] | None = None):
 
             # Track at multiple thresholds for fair comparison with FP32
             for q_score_th in [0.05, 0.25]:
-                q_iou, q_acc = quick_val_iou(
+                q_iou, q_acc, q_rec, q_pr = quick_val_iou(
                     eval_compatible_qat_model, vl_loader, dev,
                     score_thresh=q_score_th,
                     iou_thresh=model.head.iou_th,
@@ -2449,7 +2455,7 @@ def main(argv: List[str] | None = None):
                     debug_prints=False,
                     class_agnostic_nms=bool(cfg.class_agnostic_nms),
                 )
-                print(f"[QAT Eval] Epoch {qep + 1}/{qat_epochs} | Score > {q_score_th:0.2f} | Val IoU: {q_iou:.4f}  Acc: {q_acc:.3f}")
+                print(f"[QAT Eval] Epoch {qep + 1}/{qat_epochs} | Score > {q_score_th:0.2f} | Val IoU: {q_iou:.4f}  Acc: {q_acc:.3f}  Rec: {q_rec:.3f}  Pr: {q_pr:.3f}")
                 
                 if q_score_th == 0.05:
                     current_qat_val_iou = q_iou # Use 0.05 for "best" tracking to match logic
@@ -2633,8 +2639,15 @@ def plot_training_history(history: dict, title: str = 'Training Progress'):
     ax2.plot(epochs, iou_25, '^-',   color='navy',       label='IoU@0.25')
     ax2.plot(epochs, acc_05, 's--',  color='limegreen',  label='Acc@0.05')
     ax2.plot(epochs, acc_25, '^-',   color='darkgreen',  label='Acc@0.25')
+
+    # Add Recall and Precision (using score_th=0.05 as baseline)
+    rec_05 = as_list('rec_at_5')
+    pr_05 = as_list('pr_at_5')
+    ax2.plot(epochs, rec_05, 'o-',   color='orange',     label='Rec@0.05', alpha=0.7)
+    ax2.plot(epochs, pr_05,  'x-',   color='purple',     label='Pr@0.05', alpha=0.7)
+
     ax2.set_ylabel('Metric (0‑1)')
-    ax2.set_title('Validation IoU & Accuracy')
+    ax2.set_title('Validation Metrics (IoU, Acc, Rec, Pr)')
     ax2.set_ylim(0, 1)
     ax2.grid(ls='--', alpha=.6)
     ax2.legend(loc='lower right')
@@ -2726,6 +2739,7 @@ def plot_assignment_history(history: dict, title: str = 'Assignment Diagnostics'
 if __name__ == '__main__':
     final_history = main()
     history_df = pd.DataFrame(final_history).transpose()
+    history_df.to_csv('epoch_history.csv')
     plot_training_history(final_history, title="PicoDet Training Progress")
     plot_assignment_history(final_history, title="Assignment Diagnostics")
 
@@ -2742,3 +2756,11 @@ if __name__ == '__main__':
         iou_thresh=float(iou_th),  # 0.6
         max_det=max_det,  # 100
     )
+
+"""
+Next steps to try:
+Using FusedInvertedBottleneck and RepConv1x1 more frequently in the architecture
+Implement quality/objectness branch + multiplicative scoring (tried this before, didn't help, although perhaps it will work better now with other upgrades)
+Add a top‑K pre-NMS filter (e.g., keep top 1000 anchors by max class score per image) so _decode_predictions_for_level doesn' return all anchors masked
+Utilize the SpatialAttention (built but not yet used)
+"""
