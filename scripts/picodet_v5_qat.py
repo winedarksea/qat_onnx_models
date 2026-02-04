@@ -1804,7 +1804,7 @@ def main(argv: List[str] | None = None):
     pa.add_argument('--simota_ctr', type=float, default=4.0)
     pa.add_argument('--simota_topk', type=int, default=10)
     pa.add_argument('--simota_dynamic_k_min', type=int, default=1)
-    pa.add_argument('--simota_dynamic_k_scale', type=float, default=1.0,
+    pa.add_argument('--simota_dynamic_k_scale', type=float, default=1.2,
                     help="Scale factor applied to SimOTA dynamic_k (1.0=baseline ceil(iou_sum)).")
     pa.add_argument('--simota_min_iou_threshold', type=float, default=0.05)
     pa.add_argument('--simota_cls_cost_weight', type=float, default=2.5)
@@ -2224,11 +2224,11 @@ def main(argv: List[str] | None = None):
             assigner.k = min(assigner.k, 8)
             assigner.min_iou_threshold = max(assigner.min_iou_threshold, 0.06)
         elif ep == 22:
-            quality_floor_vfl = 0.005
-            assigner.cls_cost_weight = 3.5
-            CLS_WEIGHT = 4.0
-            q_gamma = max(q_gamma, float(cfg.vfl_q_gamma_refine))
-            assigner.dynamic_k_min = 1
+            # quality_floor_vfl = 0.005
+            # assigner.cls_cost_weight = 3.5
+            CLS_WEIGHT = 3.9
+            # q_gamma = max(q_gamma, float(cfg.vfl_q_gamma_refine))
+            # assigner.dynamic_k_min = 1
         elif ep == 55:
             q_gamma = 0.4
         elif ep == 60:
@@ -2760,7 +2760,8 @@ if __name__ == '__main__':
 """
 Next steps to try:
 Using FusedInvertedBottleneck and RepConv1x1 more frequently in the architecture
-Implement quality/objectness branch + multiplicative scoring (tried this before, didn't help, although perhaps it will work better now with other upgrades)
+Implement quality/objectness branch (true IoU pred head) + multiplicative scoring (tried this before, didn't help, although perhaps it will work better now with other upgrades)
 Add a top‑K pre-NMS filter (e.g., keep top 1000 anchors by max class score per image) so _decode_predictions_for_level doesn' return all anchors masked
 Utilize the SpatialAttention (built but not yet used)
+DFL “uncertainty” as a quality proxy
 """
