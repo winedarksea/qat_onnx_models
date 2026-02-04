@@ -1808,7 +1808,7 @@ def main(argv: List[str] | None = None):
                     help="Scale factor applied to SimOTA dynamic_k (1.0=baseline ceil(iou_sum)).")
     pa.add_argument('--simota_min_iou_threshold', type=float, default=0.05)
     pa.add_argument('--simota_cls_cost_weight', type=float, default=2.5)
-    pa.add_argument('--simota_cls_cost_iou_power', type=float, default=0.4,
+    pa.add_argument('--simota_cls_cost_iou_power', type=float, default=0.0,
                     help="Weights SimOTA classification cost by IoU^p (p>0 reduces class-cost influence for low-IoU anchors).")
     pa.add_argument('--load_from', type=str, default=False, help="Path to a checkpoint to resume or finetune from (e.g., 'picodet_50coco.pt')")
     pa.add_argument('--data_root', default='test')
@@ -2223,6 +2223,8 @@ def main(argv: List[str] | None = None):
             # Start reducing positives per GT once localization stabilizes.
             assigner.k = min(assigner.k, 8)
             assigner.min_iou_threshold = max(assigner.min_iou_threshold, 0.06)
+        elif ep == 19:
+            assigner.power = 0.4
         elif ep == 22:
             # quality_floor_vfl = 0.005
             # assigner.cls_cost_weight = 3.5
@@ -2230,11 +2232,11 @@ def main(argv: List[str] | None = None):
             # q_gamma = max(q_gamma, float(cfg.vfl_q_gamma_refine))
             # assigner.dynamic_k_min = 1
         elif ep == 55:
-            q_gamma = 0.4
+            q_gamma = 0.8
         elif ep == 60:
             assigner.r = 3.0
         elif ep == 65 and assigner.mean_fg_iou > 0.45:
-            q_gamma = 0.3
+            assigner.power = 0.2
         elif ep == 70:
             gamma_loss = 2.25
         elif ep == 80:
@@ -2243,13 +2245,6 @@ def main(argv: List[str] | None = None):
             assigner.dynamic_k_min = 1
             assigner.r = 2.5
             CLS_WEIGHT = 4.0
-
-        if assigner.mean_fg_iou < 0.35 or ep < 5:
-            assigner.power = 0.0
-        elif assigner.mean_fg_iou < 0.45:
-            assigner.power = min(1.0, assigner.power + 0.20)
-        else:
-            assigner.power = min(2.0, assigner.power + 0.25)
 
         model.train()
         l, diag = train_epoch(
