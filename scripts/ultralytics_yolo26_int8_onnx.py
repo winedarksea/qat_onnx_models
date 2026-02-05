@@ -381,11 +381,28 @@ def train_ultralytics_detector(
     )
 
     # Best-effort discovery of best.pt
-    run_dir = Path(project) / name
+    # 1. Try to get it directly from the trainer if available
+    run_dir = None
+    if hasattr(model, "trainer") and model.trainer is not None and hasattr(model.trainer, "save_dir"):
+        run_dir = Path(model.trainer.save_dir)
+        log.info("Discovered run_dir from trainer: %s", run_dir)
+
+    if run_dir is None or not run_dir.exists():
+        # 2. Fallback to specified project/name
+        run_dir = Path(project) / name
+        log.info("Checking run_dir: %s", run_dir)
+
+    if not run_dir.exists():
+        # 3. Fallback to what Ultralytics often does: prepending 'runs/detect' if project is relative
+        alt_run_dir = Path("runs/detect") / project / name
+        if alt_run_dir.exists():
+            run_dir = alt_run_dir
+            log.info("Discovered run_dir at alternative path: %s", run_dir)
+
     candidates = [
         run_dir / "weights" / "best.pt",
         run_dir / "weights" / "last.pt",
-        run_dir / "weights" / "best.onnx",  # unlikely, but just in case
+        run_dir / "weights" / "best.onnx",
     ]
     for c in candidates:
         if c.exists() and c.suffix == ".pt":
@@ -393,24 +410,30 @@ def train_ultralytics_detector(
             return c, run_dir
 
     # If Ultralytics auto-appended a suffix (name2, name3, ...)
-    if Path(project).exists():
-        dirs = [p for p in Path(project).iterdir() if p.is_dir() and p.name.startswith(name)]
-        dirs.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-        for d in dirs:
-            for c in [d / "weights" / "best.pt", d / "weights" / "last.pt"]:
-                if c.exists():
-                    log.info("Using checkpoint: %s", c)
-                    return c, d
+    search_roots = [Path(project)]
+    if Path("runs/detect").exists():
+        search_roots.append(Path("runs/detect") / project)
 
-        # Last resort: search anywhere under project for a recent best.pt
-        best_pts = [p for p in Path(project).rglob("best.pt") if p.is_file()]
-        best_pts.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-        if best_pts:
-            log.info("Using checkpoint (fallback search): %s", best_pts[0])
-            # For fallback, use the parent's parent as run_dir (project/name/weights/best.pt -> project/name)
-            return best_pts[0], best_pts[0].parent.parent
+    for root in search_roots:
+        if root.exists():
+            dirs = [p for p in root.iterdir() if p.is_dir() and p.name.startswith(name)]
+            dirs.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+            for d in dirs:
+                for c in [d / "weights" / "best.pt", d / "weights" / "last.pt"]:
+                    if c.exists():
+                        log.info("Using checkpoint: %s", c)
+                        return c, d
 
-    raise FileNotFoundError(f"Could not find best.pt/last.pt under {project}/{name} (or suffixed variants).")
+    # Last resort: search for a recent best.pt anywhere that might be related
+    for root in search_roots:
+        if root.exists():
+            best_pts = [p for p in root.rglob("best.pt") if p.is_file()]
+            best_pts.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+            if best_pts:
+                log.info("Using checkpoint (fallback search): %s", best_pts[0])
+                return best_pts[0], best_pts[0].parent.parent
+
+    raise FileNotFoundError(f"Could not find best.pt/last.pt under {project}/{name} (or 'runs/detect/' variants).")
 
 
 def export_onnx_with_ultralytics(
@@ -754,7 +777,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--ultralytics_api_key", type=str, default=os.environ.get("ULTRALYTICS_API_KEY", "ul_4692c1115db32e76afc429ca608c38b6ec4b656f"),
                    help="Ultralytics API key for HUB downloads (stored in env var ULTRALYTICS_API_KEY).")
     p.add_argument("--yolo_weights", type=str, default="yolo26n.pt", help="Pretrained YOLO26 nano weights/model id.")
-    p.add_argument("--epochs", type=int, default=25)
+    p.add_argument("--epochs", type=int, default=35)
     p.add_argument("--batch", type=int, default=64)
     p.add_argument("--device", type=str, default='cuda', help="e.g. 'cuda', '0', 'mps', or 'cpu' (Ultralytics syntax).")
     p.add_argument("--workers", type=int, default=8)
@@ -848,6 +871,10 @@ def main(argv: list[str]) -> int:
     if args.ultralytics_api_key:
         # Ultralytics uses this env var in recent versions for HUB access.
         os.environ["ULTRALYTICS_API_KEY"] = args.ultralytics_api_key
+
+    # Ensure project is absolute to avoid Ultralytics prepending 'runs/detect' to relative paths.
+    args.project = str(Path(args.project).resolve())
+    log.info("Using project directory: %s", args.project)
 
     data_yaml = prepare_coco2017_yolo_dataset(
         coco_root=args.coco_root,
