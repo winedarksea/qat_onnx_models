@@ -1789,9 +1789,9 @@ def main(argv: List[str] | None = None):
     pa.add_argument('--head_nms_iou', type=float, default=0.48, help="NMS IoU threshold used by quick_val and ONNX NMS.")
     pa.add_argument('--head_max_det', type=int, default=100, help="Max detections per image for quick_val and ONNX NMS.")
     pa.add_argument('--background_weight', type=float, default=1.1, help="Extra VarifocalLoss penalty for background (FP suppression).")
-    pa.add_argument('--focal_warmup_epochs', type=int, default=12,
+    pa.add_argument('--focal_warmup_epochs', type=int, default=6,
                     help="Epochs to use sigmoid focal loss before switching to Varifocal Loss. Set to -1 to disable warmup.")
-    pa.add_argument('--vfl_q_gamma_after_warmup', type=float, default=1.0,
+    pa.add_argument('--vfl_q_gamma_after_warmup', type=float, default=1.2,
                     help="Exponent for IoU→quality target after warmup (higher emphasizes high-IoU positives; tends to improve precision).")
     pa.add_argument('--vfl_q_gamma_refine', type=float, default=1.5,
                     help="Exponent for IoU→quality target during late refinement (higher generally increases precision).")
@@ -2224,7 +2224,7 @@ def main(argv: List[str] | None = None):
             assigner.k = min(assigner.k, 8)
             assigner.min_iou_threshold = max(assigner.min_iou_threshold, 0.06)
         elif ep == 19:
-            assigner.power = 0.4
+            # assigner.power = 0.4  # this if uncommented makes it worse
         elif ep == 22:
             # quality_floor_vfl = 0.005
             # assigner.cls_cost_weight = 3.5
@@ -2759,4 +2759,11 @@ Implement quality/objectness branch (true IoU pred head) + multiplicative scorin
 Add a top‑K pre-NMS filter (e.g., keep top 1000 anchors by max class score per image) so _decode_predictions_for_level doesn' return all anchors masked
 Utilize the SpatialAttention (built but not yet used)
 DFL “uncertainty” as a quality proxy
+Investigate:
+    lowering grad_clip to 3.0 from 6.0
+    ramping min_iou_th 0.1 to 0.2 (instead of 0.05)
+    assigner.r ramp 4.0 to 2.5 (instead of 5.25 to 3.8)
+    q_gamma higher later (up to 2.0)
+    keep iou at 4.0 for entire schedule
+    dynamic_k_scale down to 1.1 or 1.0 or even 0.9
 """
