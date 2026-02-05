@@ -21,7 +21,6 @@ from pycocotools.coco import COCO as PyCOCO_COCO # Renamed to avoid class name c
 from pycocotools.cocoeval import COCOeval
 
 # --- Constants and helpers from train_picodet_qat.py (or adapted) ---
-IMG_SIZE = 256 # Should be consistent with the trained model
 COCO_EVAL_SCORE_THRESH = 0.05
 
 CANONICAL_COCO80_IDS: list[int] = [
@@ -99,7 +98,7 @@ def build_transforms_eval(img_size_tuple):
     # Transforms for evaluation, consistent with training's validation transforms
     return T.Compose([
         T.ToImage(), # PIL -> tv_tensors.Image
-        T.Resize(img_size_tuple, antialias=True), # Resize to fixed size (e.g., (IMG_SIZE, IMG_SIZE))
+        T.Resize(img_size_tuple, antialias=True), # Resize to fixed size detected from model
         T.ToDtype(torch.uint8, scale=True), # Convert to uint8, model expects this
     ])
 
@@ -111,18 +110,24 @@ def plot_detections_on_ax(ax, image_pil, boxes_xyxy, labels_contiguous, scores, 
     ax.imshow(image_pil)
     ax.axis('off')
     
+    # Use a colormap to get different colors for different classes
+    cmap = plt.cm.get_cmap("tab20")
+    
     for box, label_cont, score in zip(boxes_xyxy, labels_contiguous, scores):
         if score < score_thresh:
             continue
         
+        # Determine color based on class ID
+        color = cmap(int(label_cont) % 20)
+        
         x1, y1, x2, y2 = box
         w_box, h_box = x2 - x1, y2 - y1
-        rect = patches.Rectangle((x1, y1), w_box, h_box, linewidth=1.5, edgecolor='lime', facecolor='none')
+        rect = patches.Rectangle((x1, y1), w_box, h_box, linewidth=1.5, edgecolor=color, facecolor='none')
         ax.add_patch(rect)
         
         class_name = class_names_map.get(label_cont, f"ID:{label_cont}")
-        ax.text(x1, y1 - 5, f"{class_name} {score:.2f}", color='black', fontsize=8,
-                bbox=dict(facecolor='lime', alpha=0.7, pad=1, edgecolor='none'))
+        ax.text(x1, y1 - 5, f"{class_name} {score:.2f}", color='white', fontsize=8,
+                bbox=dict(facecolor=color, alpha=0.8, pad=1, edgecolor='none'))
 
 def evaluate_onnx_model(onnx_model_path: str, coco_root_dir: str, batch_size: int, num_workers: int, device_str: str,
                         score_thresh_plot: float = 0.3, score_thresh_basic_acc: float = 0.3, iou_thresh_basic_acc: float = 0.5,
@@ -144,7 +149,21 @@ def evaluate_onnx_model(onnx_model_path: str, coco_root_dir: str, batch_size: in
         print("Using ONNX Runtime with CPUExecutionProvider.")
             
     ort_session = onnxruntime.InferenceSession(onnx_model_path, providers=providers)
-    input_name = ort_session.get_inputs()[0].name
+    input_node = ort_session.get_inputs()[0]
+    input_name = input_node.name
+    input_shape = input_node.shape
+    
+    # --- Detect IMG_SIZE from model ---
+    # Expected NCHW format: [batch, 3, height, width]
+    try:
+        model_h = int(input_shape[2])
+        model_w = int(input_shape[3])
+    except (IndexError, ValueError, TypeError):
+        print(f"Warning: Could not determine static input shape from {input_shape}. Defaulting to 256x256.")
+        model_h, model_w = 256, 256
+    
+    print(f"Detected model input size: {model_w}x{model_h}")
+
     # Get output names directly from the session; these are the true names in the ONNX model
     output_names_from_session = [o.name for o in ort_session.get_outputs()]
     print(f"ONNX Model Loaded. Input: '{input_name}', Outputs from session: {output_names_from_session}")
@@ -161,7 +180,7 @@ def evaluate_onnx_model(onnx_model_path: str, coco_root_dir: str, batch_size: in
     class_names_map = get_contiguous_id_to_name(coco_gt) # Maps 0-79 to string names
 
     print("Setting up DataLoader...")
-    val_transforms = build_transforms_eval((IMG_SIZE, IMG_SIZE))
+    val_transforms = build_transforms_eval((model_h, model_w))
     val_dataset = CocoDetectionV2(
         str(val_img_dir), str(val_annot_file), CANONICAL_COCO80_MAP, val_transforms
     )
@@ -259,11 +278,11 @@ def evaluate_onnx_model(onnx_model_path: str, coco_root_dir: str, batch_size: in
             img_id = batch_img_ids[i]
             img_info = coco_gt.loadImgs(img_id)[0]
             orig_w, orig_h = img_info['width'], img_info['height']
-            scale_x = orig_w / IMG_SIZE
-            scale_y = orig_h / IMG_SIZE
+            scale_x = orig_w / model_w
+            scale_y = orig_h / model_h
 
             current_img_mask = (batch_idx_onnx == i)
-            img_boxes_pred_imgsize = det_boxes_batch[current_img_mask] # XYXY in IMG_SIZE space
+            img_boxes_pred_imgsize = det_boxes_batch[current_img_mask] # XYXY in model space
             img_scores_pred = det_scores_batch[current_img_mask]
             img_labels_pred_cont = cls_idx_batch[current_img_mask] # These are 0-79
 
@@ -414,7 +433,6 @@ if __name__ == "__main__":
 
 
     args = parser.parse_args()
-    print(f"Using IMG_SIZE = {IMG_SIZE} for evaluation transforms.")
     
     evaluate_onnx_model(
         args.onnx_model_path, args.coco_root, args.batch_size, args.workers, args.device,
