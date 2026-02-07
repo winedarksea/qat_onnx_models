@@ -584,7 +584,10 @@ def embed_uint8_preprocess_into_onnx(
     # which is now produced by our preprocessing nodes.
     del model.graph.input[0]
     model.graph.input.insert(0, new_input)
-    model.graph.node[:0] = nodes  # prepend
+    # ONNX graph.node is a protobuf repeated field; slice assignment is not
+    # supported in newer protobuf versions.
+    for node in reversed(nodes):
+        model.graph.node.insert(0, node)
 
     onnx.checker.check_model(model)
     onnx.save(model, str(out_onnx))
@@ -758,13 +761,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         description="Train Ultralytics YOLO26n on COCO (filtered small boxes) and export INT8 ONNX."
     )
     p.add_argument("--coco_root", type=Path, default=Path("coco"), help="COCO root with train2017/val2017/annotations/")
-    p.add_argument("--imgsz", type=int, default=312, help="Square train/export size.")
+    p.add_argument("--imgsz", type=int, default=320, help="Square train/export size. Recommended multiple of 32.")
     p.add_argument("--min_box_size", type=int, default=8, help="Drop GT boxes smaller than this after resize to imgsz.")
     p.set_defaults(letterbox_filter=True)
     p.add_argument("--no_letterbox_filter", action="store_false", dest="letterbox_filter",
                    help="Use stretch scaling for small-box filtering.")
 
-    p.add_argument("--dataset_out", type=Path, default=Path("datasets/coco2017_ultra_312"), help="Output dataset dir.")
+    p.add_argument("--dataset_out", type=Path, default=Path("datasets/coco2017_ultra_320"), help="Output dataset dir.")
     p.add_argument("--force_dataset_prep", action="store_true", default=False, help="Rebuild labels/lists even if cached.")
     p.set_defaults(write_empty_labels=True)
     p.add_argument("--no_write_empty_labels", action="store_false", dest="write_empty_labels",
@@ -777,7 +780,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--ultralytics_api_key", type=str, default=os.environ.get("ULTRALYTICS_API_KEY", "ul_4692c1115db32e76afc429ca608c38b6ec4b656f"),
                    help="Ultralytics API key for HUB downloads (stored in env var ULTRALYTICS_API_KEY).")
     p.add_argument("--yolo_weights", type=str, default="yolo26n.pt", help="Pretrained YOLO26 nano weights/model id.")
-    p.add_argument("--epochs", type=int, default=35)
+    p.add_argument("--epochs", type=int, default=45)
     p.add_argument("--batch", type=int, default=64)
     p.add_argument("--device", type=str, default='cuda', help="e.g. 'cuda', '0', 'mps', or 'cpu' (Ultralytics syntax).")
     p.add_argument("--workers", type=int, default=8)
@@ -813,6 +816,17 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     return p.parse_args(argv)
 
 
+def _print_onnx_info(onnx_path: Path, prefix: str = ""):
+    try:
+        import onnx
+        model = onnx.load(str(onnx_path))
+        inputs = [f"{i.name}{[d.dim_value or d.dim_param for d in i.type.tensor_type.shape.dim]}" for i in model.graph.input]
+        outputs = [f"{o.name}{[d.dim_value or d.dim_param for d in o.type.tensor_type.shape.dim]}" for o in model.graph.output]
+        log.info("%sONNX %s: inputs=%s, outputs=%s", prefix, onnx_path.name, inputs, outputs)
+    except Exception as e:
+        log.warning("Could not print ONNX info for %s: %s", onnx_path, e)
+
+
 def fix_onnx_outputs_to_match_pico(*, onnx_path: Path, nms: bool) -> None:
     """
     Renames/transforms ONNX outputs to match PicoDet production expectations:
@@ -820,9 +834,13 @@ def fix_onnx_outputs_to_match_pico(*, onnx_path: Path, nms: bool) -> None:
     raw_boxes, raw_scores (if nms=False)
     """
     import onnx
+    from onnx import helper, TensorProto, numpy_helper
     model = onnx.load(str(onnx_path))
     graph = model.graph
 
+    # Best effort to find the main output node
+    orig_output_names = [out.name for out in graph.output]
+    
     if nms:
         # Ultralytics nms=True outputs vary, but often:
         # [num_detections, detection_boxes, detection_scores, detection_classes]
@@ -847,17 +865,74 @@ def fix_onnx_outputs_to_match_pico(*, onnx_path: Path, nms: bool) -> None:
     else:
         # Raw output is usually [batch, 4 + classes, anchors]
         # PicoDet wants raw_boxes [batch, anchors, 4] and raw_scores [batch, anchors, classes]
-        # This requires adding a Transpose and Split node. 
-        # For simplicity in this script, we at least rename the primary output if we can't easily split.
-        if len(graph.output) == 1:
-            graph.output[0].name = "raw_combined"
-            for node in graph.node:
-                for i, out_name in enumerate(node.output):
-                    if out_name == "output0": # default name
-                        node.output[i] = "raw_combined"
+        if len(graph.output) == 1 and graph.output[0].name == "output0":
+            # We need to Split the output0 tensor into boxes and scores
+            # And then Transpose both to move anchors to the middle dimension.
+            
+            # 1. Identify input to change. output0 is produced by some node.
+            # 2. We will add a Split node and two Transpose nodes.
+            input_tensor = "output0"
+            
+            # Determine split point. Assume 80 classes + 4 box coords = 84 total.
+            # If it's different, we might need more complex logic.
+            # We can try to infer from the output shape if available.
+            num_classes = 80 # default COCO
+            dim_outputs = 4 + num_classes
+            
+            # Check if we can confirm the shape
+            try:
+                shape = [d.dim_value for d in graph.output[0].type.tensor_type.shape.dim]
+                if shape[1] > 0:
+                    dim_outputs = shape[1]
+                    num_classes = dim_outputs - 4
+            except:
+                pass
 
+            split_out_boxes = "raw_boxes_untransposed"
+            split_out_scores = "raw_scores_untransposed"
+            
+            split_name = "Pico_SplitSizes"
+            model.graph.initializer.append(
+                numpy_helper.from_array(np.array([4, num_classes], dtype=np.int64), name=split_name)
+            )
+
+            # Add Split node
+            split_node = helper.make_node(
+                "Split",
+                inputs=[input_tensor, split_name],
+                outputs=[split_out_boxes, split_out_scores],
+                axis=1,
+                name="Pico_SplitRaw"
+            )
+            
+            # Add Transpose nodes
+            trans_boxes_node = helper.make_node(
+                "Transpose",
+                inputs=[split_out_boxes],
+                outputs=["raw_boxes"],
+                perm=[0, 2, 1],
+                name="Pico_TransposeBoxes"
+            )
+            trans_scores_node = helper.make_node(
+                "Transpose",
+                inputs=[split_out_scores],
+                outputs=["raw_scores"],
+                perm=[0, 2, 1],
+                name="Pico_TransposeScores"
+            )
+            
+            graph.node.extend([split_node, trans_boxes_node, trans_scores_node])
+            
+            # Update graph outputs
+            del graph.output[:]
+            graph.output.extend([
+                helper.make_tensor_value_info("raw_boxes", TensorProto.FLOAT, ["N", "anchors", 4]),
+                helper.make_tensor_value_info("raw_scores", TensorProto.FLOAT, ["N", "anchors", num_classes]),
+            ])
+
+    onnx.checker.check_model(model)
     onnx.save(model, str(onnx_path))
-    log.info("Adjusted ONNX outputs in %s", onnx_path)
+    log.info("Adjusted ONNX outputs in %s (nms=%s)", onnx_path, nms)
 
 
 def main(argv: list[str]) -> int:
@@ -939,7 +1014,9 @@ def main(argv: list[str]) -> int:
         device=args.device,
         out_dir=args.export_dir,
     )
+    _print_onnx_info(onnx_fp32, "[Diagnostics] Post-Export: ")
     fix_onnx_outputs_to_match_pico(onnx_path=onnx_fp32, nms=args.nms)
+    _print_onnx_info(onnx_fp32, "[Diagnostics] Post-Fix: ")
 
     onnx_for_quant = onnx_fp32
     if args.embed_preprocess:
@@ -950,6 +1027,7 @@ def main(argv: list[str]) -> int:
             imgsz=args.imgsz,
             resize=args.embed_resize,
         )
+        _print_onnx_info(onnx_for_quant, "[Diagnostics] Post-Preprocess: ")
 
     if args.quantize:
         split_dir = args.dataset_out / "images" / args.calib_split

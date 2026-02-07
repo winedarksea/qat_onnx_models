@@ -2214,9 +2214,8 @@ def main(argv: List[str] | None = None):
         elif ep == 14:
             IOU_WEIGHT = 2.5
             assigner.r = 3.8  # Relaxed from 3.5
-        elif ep == 15:
-            assigner.cls_cost_weight = 3.0
-            CLS_WEIGHT = 3.8
+            # assigner.cls_cost_weight = 3.0
+            # CLS_WEIGHT = 3.8
         elif ep == 17:
             quality_floor_vfl = 0.02
             q_gamma = max(q_gamma, float(cfg.vfl_q_gamma_after_warmup))
@@ -2224,27 +2223,32 @@ def main(argv: List[str] | None = None):
             assigner.k = min(assigner.k, 8)
             assigner.min_iou_threshold = max(assigner.min_iou_threshold, 0.06)
         elif ep == 19:
+            pass
             # assigner.power = 0.4  # this if uncommented makes it worse
         elif ep == 22:
             # quality_floor_vfl = 0.005
             # assigner.cls_cost_weight = 3.5
-            CLS_WEIGHT = 3.9
+            pass
             # q_gamma = max(q_gamma, float(cfg.vfl_q_gamma_refine))
             # assigner.dynamic_k_min = 1
         elif ep == 55:
-            q_gamma = 0.8
+            pass
+            # q_gamma = 0.8
         elif ep == 60:
-            assigner.r = 3.0
+            pass
+            # assigner.r = 3.0
         elif ep == 65 and assigner.mean_fg_iou > 0.45:
-            assigner.power = 0.2
+            pass
+            # assigner.power = 0.2
         elif ep == 70:
             gamma_loss = 2.25
         elif ep == 80:
-            assigner.cls_cost_weight = 4.0
+            pass
+            # ssigner.cls_cost_weight = 4.0
         elif ep > 100:
             assigner.dynamic_k_min = 1
-            assigner.r = 2.5
-            CLS_WEIGHT = 4.0
+            # assigner.r = 2.5
+            # CLS_WEIGHT = 4.0
 
         model.train()
         l, diag = train_epoch(
@@ -2343,7 +2347,6 @@ def main(argv: List[str] | None = None):
     # --- QAT Preparation ---
     print("[INFO] Preparing model for QAT...")
     
-    # CRITICAL: Fuse RepConv branches BEFORE QAT preparation
     # This ensures QAT trains the final inference topology (fused 1x1 convs)
     if hasattr(model, 'neck') and hasattr(model.neck, 'switch_to_deploy'):
         print("[INFO] Fusing RepConv branches in neck before QAT...")
@@ -2359,7 +2362,6 @@ def main(argv: List[str] | None = None):
     print("[INFO] Running qat_prepare...")
     # qat_prepare will trace the 'model', including 'model.pre'.
     # 'model.pre' will be skipped for quantization inserts due to set_module_name('pre', None)
-    # but it will be part of the traced graph.
     qat_model = qat_prepare(model, example_input_for_qat_entire_model)
     qat_head = qat_model.head      # ObservedGraphModule
     orig_head = model.head         # FP32
@@ -2474,7 +2476,6 @@ def main(argv: List[str] | None = None):
         final_exportable_int8_model, int8_model_with_preprocessor, actual_onnx_input_example, temp_onnx_path = save_intermediate_onnx(qat_export_core, cfg, model)
 
     if debug_prints:
-        # DEBUG: Inspect intermediate ONNX model outputs
         intermediate_model_check = onnx.load(temp_onnx_path)
         print("[DEBUG] Intermediate ONNX model input ValueInfo:")
         for input_vi in intermediate_model_check.graph.input:
@@ -2766,4 +2767,6 @@ Investigate:
     q_gamma higher later (up to 2.0)
     keep iou at 4.0 for entire schedule
     dynamic_k_scale down to 1.1 or 1.0 or even 0.9
+    simota_cls_cost_weight around 2.0-2.6, and add mild --simota_cls_cost_iou_power 0.1
+Deeper architecture upgrade worth testing: add a P2 (stride-4) level
 """
