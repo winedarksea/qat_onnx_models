@@ -518,12 +518,11 @@ def embed_uint8_preprocess_into_onnx(
     new_input = helper.make_tensor_value_info(
         new_input_name,
         TensorProto.UINT8,
-        [1, 3, "H", "W"],
+        ["BatchSize", 3, "Height", "Width"],
     )
 
     cast_out = f"{orig_in_name}__cast_f32"
-    scaled_out = f"{orig_in_name}__scaled"
-    resize_out = orig_in_name  # critical: feed existing graph by producing the original input name
+    scaled_out = orig_in_name  # critical: feed existing graph by producing original input name if no resize
 
     nodes = []
     nodes.append(
@@ -536,21 +535,33 @@ def embed_uint8_preprocess_into_onnx(
         )
     )
 
+    # Guidelines encourage Mul for speed (mean=0, std=255)
     scale_name = "Preprocess_InputScale"
     scale_tensor = numpy_helper.from_array(np.array([input_scale], dtype=np.float32), name=scale_name)
     model.graph.initializer.append(scale_tensor)
 
-    nodes.append(
-        helper.make_node(
-            "Mul",
-            inputs=[cast_out, scale_name],
-            outputs=[scaled_out],
-            name="Preprocess_Scale",
+    if not resize:
+        nodes.append(
+            helper.make_node(
+                "Mul",
+                inputs=[cast_out, scale_name],
+                outputs=[scaled_out],
+                name="Preprocess_Scale",
+            )
         )
-    )
-
-    if resize:
-        # Resize(x, roi, scales, sizes) in opset 13+. Provide empty roi/scales and use sizes.
+    else:
+        # If resizing, standard practice is Mul then Resize
+        pre_resize_scaled = f"{orig_in_name}__pre_resize_scaled"
+        nodes.append(
+            helper.make_node(
+                "Mul",
+                inputs=[cast_out, scale_name],
+                outputs=[pre_resize_scaled],
+                name="Preprocess_Scale",
+            )
+        )
+        
+        # Resize(x, roi, scales, sizes) in opset 13+.
         roi_name = "Preprocess_ResizeRoi"
         scales_name = "Preprocess_ResizeScales"
         sizes_name = "Preprocess_ResizeSizes"
@@ -562,21 +573,11 @@ def embed_uint8_preprocess_into_onnx(
         nodes.append(
             helper.make_node(
                 "Resize",
-                inputs=[scaled_out, roi_name, scales_name, sizes_name],
-                outputs=[resize_out],
+                inputs=[pre_resize_scaled, roi_name, scales_name, sizes_name],
+                outputs=[scaled_out],
                 name="Preprocess_ResizeToSquare",
                 mode="linear",
                 nearest_mode="floor",
-            )
-        )
-    else:
-        # No resize, just rename tensor to original input.
-        nodes.append(
-            helper.make_node(
-                "Identity",
-                inputs=[scaled_out],
-                outputs=[resize_out],
-                name="Preprocess_IdentityToModelInput",
             )
         )
 
@@ -680,12 +681,11 @@ def quantize_onnx_int8_static(
     batches: list[np.ndarray] = []
     for p in calib_images:
         img = _load_image_rgb_uint8(p)  # HWC RGB
+        from PIL import Image  # type: ignore
         if expects_uint8_input:
             # Keep calibration shapes consistent even if the model input is dynamic.
-            from PIL import Image  # type: ignore
-
             img = np.asarray(
-                Image.fromarray(img, mode="RGB").resize((imgsz, imgsz), resample=Image.BILINEAR),
+                Image.fromarray(img).resize((imgsz, imgsz), resample=Image.BILINEAR),
                 dtype=np.uint8,
             )
             x = np.transpose(img, (2, 0, 1))[None, ...].astype(np.uint8)
@@ -694,10 +694,8 @@ def quantize_onnx_int8_static(
                 img = _letterbox_uint8(img, new_shape=imgsz)
             else:
                 # Stretch resize for calibration
-                from PIL import Image  # type: ignore
-
                 img = np.asarray(
-                    Image.fromarray(img, mode="RGB").resize((imgsz, imgsz), resample=Image.BILINEAR),
+                    Image.fromarray(img).resize((imgsz, imgsz), resample=Image.BILINEAR),
                     dtype=np.uint8,
                 )
             x = (np.transpose(img, (2, 0, 1))[None, ...].astype(np.float32)) * (1.0 / 255.0)
@@ -827,112 +825,127 @@ def _print_onnx_info(onnx_path: Path, prefix: str = ""):
         log.warning("Could not print ONNX info for %s: %s", onnx_path, e)
 
 
-def fix_onnx_outputs_to_match_pico(*, onnx_path: Path, nms: bool) -> None:
+def fix_onnx_outputs_to_match_pico(*, onnx_path: Path, nms: bool, imgsz: int) -> None:
     """
-    Renames/transforms ONNX outputs to match PicoDet production expectations:
-    det_boxes, det_scores, class_idx, batch_idx (if nms=True)
-    raw_boxes, raw_scores (if nms=False)
+    Renames/transforms ONNX outputs to match guidelines:
+    Consolidated [N, 7] output tensor: [x1, y1, x2, y2, score, class_id, batch_idx]
+    with coordinates rescaled to the original ONNX input resolution.
     """
     import onnx
     from onnx import helper, TensorProto, numpy_helper
     model = onnx.load(str(onnx_path))
     graph = model.graph
 
-    # Best effort to find the main output node
-    orig_output_names = [out.name for out in graph.output]
+    # GUIDELINE: Rescale coordinates to input tensor space.
+    # We use the first input (expected to be the uint8 or original float tensor).
+    input_name = graph.input[0].name
     
-    if nms:
-        # Ultralytics nms=True outputs vary, but often:
-        # [num_detections, detection_boxes, detection_scores, detection_classes]
-        # or a single combined tensor.
-        # This is a best-effort mapping for common Ultralytics export formats.
-        mapper = {
-            "output0": "det_boxes", # Generic fallback
-            "detection_boxes": "det_boxes",
-            "detection_scores": "det_scores",
-            "detection_classes": "class_idx",
-            "num_detections": "batch_idx", # Not exactly same but avoids collision
-        }
-        for out in graph.output:
-            if out.name in mapper:
-                out.name = mapper[out.name]
+    def _add_guideline_nodes(source_tensor: str, num_classes: int = 1):
+        # source_tensor is [1, N, 6] (boxes, score, class)
         
-        # Also update nodes that produce these outputs
-        for node in graph.node:
-            for i, out_name in enumerate(node.output):
-                if out_name in mapper:
-                    node.output[i] = mapper[out_name]
-    else:
-        # Raw output is usually [batch, 4 + classes, anchors]
-        # PicoDet wants raw_boxes [batch, anchors, 4] and raw_scores [batch, anchors, classes]
-        if len(graph.output) == 1 and graph.output[0].name == "output0":
-            # We need to Split the output0 tensor into boxes and scores
-            # And then Transpose both to move anchors to the middle dimension.
-            
-            # 1. Identify input to change. output0 is produced by some node.
-            # 2. We will add a Split node and two Transpose nodes.
-            input_tensor = "output0"
-            
-            # Determine split point. Assume 80 classes + 4 box coords = 84 total.
-            # If it's different, we might need more complex logic.
-            # We can try to infer from the output shape if available.
-            num_classes = 80 # default COCO
-            dim_outputs = 4 + num_classes
-            
-            # Check if we can confirm the shape
-            try:
-                shape = [d.dim_value for d in graph.output[0].type.tensor_type.shape.dim]
-                if shape[1] > 0:
-                    dim_outputs = shape[1]
-                    num_classes = dim_outputs - 4
-            except:
-                pass
+        # 1. Reshape [1, N, 6] -> [N, 6]
+        n6_name = "Guideline_Reshaped_N6"
+        n6_shape = "Guideline_N6_Shape_Const"
+        graph.initializer.append(numpy_helper.from_array(np.array([-1, 6], dtype=np.int64), name=n6_shape))
+        graph.node.append(helper.make_node("Reshape", inputs=[source_tensor, n6_shape], outputs=[n6_name], name="Guideline_ReshapeN6"))
 
-            split_out_boxes = "raw_boxes_untransposed"
-            split_out_scores = "raw_scores_untransposed"
-            
-            split_name = "Pico_SplitSizes"
-            model.graph.initializer.append(
-                numpy_helper.from_array(np.array([4, num_classes], dtype=np.int64), name=split_name)
-            )
+        # 2. Split [N, 6] into [N, 4], [N, 1], [N, 1]
+        b_raw, s_raw, c_raw = "Guideline_B_Raw", "Guideline_S_Raw", "Guideline_C_Raw"
+        split_const = "Guideline_Split_Const"
+        graph.initializer.append(numpy_helper.from_array(np.array([4, 1, 1], dtype=np.int64), name=split_const))
+        graph.node.append(helper.make_node("Split", inputs=[n6_name, split_const], outputs=[b_raw, s_raw, c_raw], axis=1, name="Guideline_SplitN6"))
 
-            # Add Split node
-            split_node = helper.make_node(
-                "Split",
-                inputs=[input_tensor, split_name],
-                outputs=[split_out_boxes, split_out_scores],
-                axis=1,
-                name="Pico_SplitRaw"
-            )
-            
-            # Add Transpose nodes
-            trans_boxes_node = helper.make_node(
-                "Transpose",
-                inputs=[split_out_boxes],
-                outputs=["raw_boxes"],
-                perm=[0, 2, 1],
-                name="Pico_TransposeBoxes"
-            )
-            trans_scores_node = helper.make_node(
-                "Transpose",
-                inputs=[split_out_scores],
-                outputs=["raw_scores"],
-                perm=[0, 2, 1],
-                name="Pico_TransposeScores"
-            )
-            
-            graph.node.extend([split_node, trans_boxes_node, trans_scores_node])
-            
-            # Update graph outputs
-            del graph.output[:]
-            graph.output.extend([
-                helper.make_tensor_value_info("raw_boxes", TensorProto.FLOAT, ["N", "anchors", 4]),
-                helper.make_tensor_value_info("raw_scores", TensorProto.FLOAT, ["N", "anchors", num_classes]),
-            ])
+        # 3. Squeeze scores/classes to 1D
+        s_1d, c_1d = "Guideline_S_1d", "Guideline_C_1d"
+        axis_const = "Guideline_Axis1_Const"
+        graph.initializer.append(numpy_helper.from_array(np.array([1], dtype=np.int64), name=axis_const))
+        graph.node.append(helper.make_node("Squeeze", inputs=[s_raw, axis_const], outputs=[s_1d], name="Guideline_SqueezeS"))
+        graph.node.append(helper.make_node("Squeeze", inputs=[c_raw, axis_const], outputs=[c_1d], name="Guideline_SqueezeC"))
+
+        # 4. Generate batch_idx [N] (all zeros, Float32)
+        b_idx = "Guideline_BatchIdx"
+        s_shape = "Guideline_S_Shape"
+        graph.node.append(helper.make_node("Shape", inputs=[s_1d], outputs=[s_shape], name="Guideline_GetSShape"))
+        graph.node.append(helper.make_node(
+            "ConstantOfShape", 
+            inputs=[s_shape], 
+            outputs=[b_idx], 
+            value=helper.make_tensor("val", TensorProto.FLOAT, [1], [0.0]),
+            name="Guideline_CreateBatchIdx"
+        ))
+
+        # 5. Rescale boxes [N, 4] by comparing input resolution to training imgsz
+        b_scaled = "Guideline_B_Rescaled"
+        in_shape = "Guideline_InputShape"
+        graph.node.append(helper.make_node("Shape", inputs=[input_name], outputs=[in_shape], name="Guideline_GetInShape"))
+        
+        # Get H(2) and W(3) from NCHW
+        h_idx = "Guideline_HIdx"
+        w_idx = "Guideline_WIdx"
+        graph.initializer.extend([
+            numpy_helper.from_array(np.array(2, dtype=np.int64), name=h_idx),
+            numpy_helper.from_array(np.array(3, dtype=np.int64), name=w_idx),
+        ])
+        h_val, w_val = "Guideline_HVal", "Guideline_WVal"
+        graph.node.append(helper.make_node("Gather", inputs=[in_shape, h_idx], outputs=[h_val], axis=0, name="Guideline_GatherH"))
+        graph.node.append(helper.make_node("Gather", inputs=[in_shape, w_idx], outputs=[w_val], axis=0, name="Guideline_GatherW"))
+        
+        h_f32, w_f32 = "Guideline_Hf32", "Guideline_Wf32"
+        graph.node.append(helper.make_node("Cast", inputs=[h_val], outputs=[h_f32], to=TensorProto.FLOAT, name="Guideline_CastH"))
+        graph.node.append(helper.make_node("Cast", inputs=[w_val], outputs=[w_f32], to=TensorProto.FLOAT, name="Guideline_CastW"))
+        
+        imgsz_name = "Guideline_TrainImgsz"
+        graph.initializer.append(numpy_helper.from_array(np.array([float(imgsz)], dtype=np.float32), name=imgsz_name))
+        h_scale, w_scale = "Guideline_HScale", "Guideline_WScale"
+        graph.node.append(helper.make_node("Div", inputs=[h_f32, imgsz_name], outputs=[h_scale], name="Guideline_DivH"))
+        graph.node.append(helper.make_node("Div", inputs=[w_f32, imgsz_name], outputs=[w_scale], name="Guideline_DivW"))
+        
+        scales = "Guideline_BoxScales"
+        graph.node.append(helper.make_node("Concat", inputs=[w_scale, h_scale, w_scale, h_scale], outputs=[scales], axis=0, name="Guideline_ConcatScales"))
+        graph.node.append(helper.make_node("Mul", inputs=[b_raw, scales], outputs=[b_scaled], name="Guideline_RescaleBoxes"))
+
+        # 6. Final Concat [N, 7]
+        # Guideline: [x1, y1, x2, y2, score, class_id, batch_idx]
+        # boxes:[N, 4], scores:[N, 1], classes:[N, 1], batch_idx:[N, 1]
+        s_2d, c_2d, b_2d = "Guideline_S_2d", "Guideline_C_2d", "Guideline_B_2d"
+        graph.node.append(helper.make_node("Unsqueeze", inputs=[s_1d, axis_const], outputs=[s_2d], name="Guideline_UnsqueezeS"))
+        graph.node.append(helper.make_node("Unsqueeze", inputs=[c_1d, axis_const], outputs=[c_2d], name="Guideline_UnsqueezeC"))
+        graph.node.append(helper.make_node("Unsqueeze", inputs=[b_idx, axis_const], outputs=[b_2d], name="Guideline_UnsqueezeB"))
+        
+        graph.node.append(helper.make_node(
+            "Concat", 
+            inputs=[b_scaled, s_2d, c_2d, b_2d], 
+            outputs=["detections"], 
+            axis=1, 
+            name="Guideline_FinalConcat"
+        ))
+
+        # Update outputs
+        del graph.output[:]
+        graph.output.append(helper.make_tensor_value_info("detections", TensorProto.FLOAT, ["N", 7]))
+
+    # Identify primary output
+    if len(graph.output) >= 1:
+        out_name = graph.output[0].name
+        try:
+            shape = [d.dim_value if d.dim_value > 0 else 0 for d in graph.output[0].type.tensor_type.shape.dim]
+        except:
+            shape = []
+
+        if len(shape) == 3 and shape[2] == 6:
+            # Matches YOLOv10/v11-NMS or Consolidated output
+            log.info("Aligning consolidated/NMS output with guidelines.")
+            _add_guideline_nodes(out_name)
+        else:
+            # Fallback or Raw format (not yet fully aligned for [N, 7] guidelines)
+            log.warning("Output format %s not recognized for automatic [N, 7] alignment; renaming.", shape)
+            for out in graph.output:
+                if "box" in out.name.lower(): out.name = "det_boxes"
+                elif "score" in out.name.lower(): out.name = "det_scores"
 
     onnx.checker.check_model(model)
     onnx.save(model, str(onnx_path))
-    log.info("Adjusted ONNX outputs in %s (nms=%s)", onnx_path, nms)
+    log.info("Guideline-aligned ONNX produced at %s", onnx_path)
 
 
 def main(argv: list[str]) -> int:
@@ -1015,8 +1028,6 @@ def main(argv: list[str]) -> int:
         out_dir=args.export_dir,
     )
     _print_onnx_info(onnx_fp32, "[Diagnostics] Post-Export: ")
-    fix_onnx_outputs_to_match_pico(onnx_path=onnx_fp32, nms=args.nms)
-    _print_onnx_info(onnx_fp32, "[Diagnostics] Post-Fix: ")
 
     onnx_for_quant = onnx_fp32
     if args.embed_preprocess:
@@ -1028,6 +1039,10 @@ def main(argv: list[str]) -> int:
             resize=args.embed_resize,
         )
         _print_onnx_info(onnx_for_quant, "[Diagnostics] Post-Preprocess: ")
+
+    # Align with GUIDELINES (rename, consolidate [N, 7], rescale coordinates)
+    fix_onnx_outputs_to_match_pico(onnx_path=onnx_for_quant, nms=args.nms, imgsz=args.imgsz)
+    _print_onnx_info(onnx_for_quant, "[Diagnostics] Post-Guideline-Fix: ")
 
     if args.quantize:
         split_dir = args.dataset_out / "images" / args.calib_split
