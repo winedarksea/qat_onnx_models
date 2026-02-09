@@ -710,6 +710,23 @@ def quantize_onnx_int8_static(
         reduce_range,
         "uint8" if expects_uint8_input else "float32",
     )
+    
+    # Guidelines: exclude post-processing and score-sensitive nodes to preserve precision
+    nodes_to_exclude = []
+    # Try to find the node that was the original output and exclude it to prevent its
+    # quantization scale from zeroing out small score values.
+    temp_model = onnx.load(str(in_onnx))
+    for node in temp_model.graph.node:
+        if "Guideline" in node.name:
+            nodes_to_exclude.append(node.name)
+        # Also exclude the node providing input to the guideline logic
+        if node.name == "Guideline_ReshapeN6":
+            nodes_to_exclude.append(node.input[0])
+            # Trace back one more to be safe if it's a simple op
+            for n2 in temp_model.graph.node:
+                if node.input[0] in n2.output:
+                    nodes_to_exclude.append(n2.name)
+
     quantize_static(
         model_input=str(in_onnx),
         model_output=str(out_onnx),
@@ -719,7 +736,9 @@ def quantize_onnx_int8_static(
         weight_type=QuantType.QInt8,
         per_channel=per_channel,
         reduce_range=reduce_range,
+        nodes_to_exclude=nodes_to_exclude,
     )
+
 
     log.info("Wrote INT8 ONNX: %s", out_onnx)
     return out_onnx
@@ -894,14 +913,8 @@ def fix_onnx_outputs_to_match_pico(*, onnx_path: Path, nms: bool, imgsz: int) ->
         graph.node.append(helper.make_node("Cast", inputs=[h_val], outputs=[h_f32], to=TensorProto.FLOAT, name="Guideline_CastH"))
         graph.node.append(helper.make_node("Cast", inputs=[w_val], outputs=[w_f32], to=TensorProto.FLOAT, name="Guideline_CastW"))
         
-        imgsz_name = "Guideline_TrainImgsz"
-        graph.initializer.append(numpy_helper.from_array(np.array([float(imgsz)], dtype=np.float32), name=imgsz_name))
-        h_scale, w_scale = "Guideline_HScale", "Guideline_WScale"
-        graph.node.append(helper.make_node("Div", inputs=[h_f32, imgsz_name], outputs=[h_scale], name="Guideline_DivH"))
-        graph.node.append(helper.make_node("Div", inputs=[w_f32, imgsz_name], outputs=[w_scale], name="Guideline_DivW"))
-        
         scales = "Guideline_BoxScales"
-        graph.node.append(helper.make_node("Concat", inputs=[w_scale, h_scale, w_scale, h_scale], outputs=[scales], axis=0, name="Guideline_ConcatScales"))
+        graph.node.append(helper.make_node("Concat", inputs=[w_f32, h_f32, w_f32, h_f32], outputs=[scales], axis=0, name="Guideline_ConcatScales"))
         graph.node.append(helper.make_node("Mul", inputs=[b_raw, scales], outputs=[b_scaled], name="Guideline_RescaleBoxes"))
 
         # 6. Final Concat [N, 7]
@@ -1069,4 +1082,5 @@ def main(argv: list[str]) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main(sys.argv[1:]))
+    # raise SystemExit(main(sys.argv[1:]))
+    main(sys.argv[1:])

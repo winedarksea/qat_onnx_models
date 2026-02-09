@@ -23,7 +23,7 @@ This document outlines the optimized input/output specifications for final ONNX 
 ### Detection Models
 - **Integrated NMS**: Models should include an integrated `NonMaxSuppression` node if NMS is used by the model, for deployment simplicity.
 - **Consolidated Output**: Return a single tensor of shape `[N, 7]`. For simplicity these will be all float32.
-    - **Indices**: `[x1, y1, x2, y2, score, class_id, batch_idx]` although most use cases are expected to just be a batch size of 1 with constant `batch_idx=0.0`.
+    - **Indices**: `[x1, y1, x2, y2, score, class_id, batch_idx]` although most use cases are expected to just be a batch size of 1 with constant `batch_idx=0.0`. Score should be in range [0, 1].
 - **Coordinate Scaling**: Output boxes must be in the coordinate space of the ONNX input tensor, not the model’s internal resized resolution. If the ONNX input tensor has shape [B,3,H_in,W_in] (for example 540x540), returned boxes must be scaled to H_in x W_in (for example 540x540), even if internal inference runs at 320x320.
 - **Max Detections**: Limit output to top 40-100 detections to minimize IPC overhead.
 
