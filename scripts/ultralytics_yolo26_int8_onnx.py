@@ -29,6 +29,8 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator
+import onnx
+import onnxruntime as ort  # type: ignore
 
 import numpy as np
 
@@ -502,7 +504,6 @@ def embed_uint8_preprocess_into_onnx(
     The Resize is a *stretch resize* to (imgsz, imgsz) using ONNX Resize "sizes" input.
     """
     try:
-        import onnx  # type: ignore
         from onnx import TensorProto, helper, numpy_helper  # type: ignore
     except Exception as e:
         raise RuntimeError("Missing `onnx` package. Install it in your env to embed preprocessing.") from e
@@ -665,7 +666,6 @@ def quantize_onnx_int8_static(
     Static INT8 quantization using onnxruntime.quantization with a small calibration set.
     """
     try:
-        import onnxruntime as ort  # type: ignore
         from onnxruntime.quantization import (  # type: ignore
             CalibrationDataReader,
             QuantFormat,
@@ -748,11 +748,6 @@ def ort_optimize_onnx(*, in_onnx: Path, out_onnx: Path) -> Path:
     """
     Save an ORT-optimized model (often helpful after quantization).
     """
-    try:
-        import onnxruntime as ort  # type: ignore
-    except Exception as e:
-        raise RuntimeError("Missing `onnxruntime` in this env; cannot ORT-optimize.") from e
-
     so = ort.SessionOptions()
     so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
     so.optimized_model_filepath = str(out_onnx)
@@ -835,7 +830,6 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 def _print_onnx_info(onnx_path: Path, prefix: str = ""):
     try:
-        import onnx
         model = onnx.load(str(onnx_path))
         inputs = [f"{i.name}{[d.dim_value or d.dim_param for d in i.type.tensor_type.shape.dim]}" for i in model.graph.input]
         outputs = [f"{o.name}{[d.dim_value or d.dim_param for d in o.type.tensor_type.shape.dim]}" for o in model.graph.output]
@@ -850,7 +844,6 @@ def fix_onnx_outputs_to_match_pico(*, onnx_path: Path, nms: bool, imgsz: int) ->
     Consolidated [N, 7] output tensor: [x1, y1, x2, y2, score, class_id, batch_idx]
     with coordinates rescaled to the original ONNX input resolution.
     """
-    import onnx
     from onnx import helper, TensorProto, numpy_helper
     model = onnx.load(str(onnx_path))
     graph = model.graph
@@ -893,7 +886,10 @@ def fix_onnx_outputs_to_match_pico(*, onnx_path: Path, nms: bool, imgsz: int) ->
             name="Guideline_CreateBatchIdx"
         ))
 
-        # 5. Rescale boxes [N, 4] by comparing input resolution to training imgsz
+        # 5. Rescale boxes [N, 4] to ONNX input coordinate space.
+        # Ultralytics exports can emit boxes in one of three regimes:
+        #   A) normalized [0,1], B) internal imgsz space, C) already input-space.
+        # We pick a scale tensor at runtime from box magnitude.
         b_scaled = "Guideline_B_Rescaled"
         in_shape = "Guideline_InputShape"
         graph.node.append(helper.make_node("Shape", inputs=[input_name], outputs=[in_shape], name="Guideline_GetInShape"))
@@ -902,8 +898,8 @@ def fix_onnx_outputs_to_match_pico(*, onnx_path: Path, nms: bool, imgsz: int) ->
         h_idx = "Guideline_HIdx"
         w_idx = "Guideline_WIdx"
         graph.initializer.extend([
-            numpy_helper.from_array(np.array(2, dtype=np.int64), name=h_idx),
-            numpy_helper.from_array(np.array(3, dtype=np.int64), name=w_idx),
+            numpy_helper.from_array(np.array([2], dtype=np.int64), name=h_idx),
+            numpy_helper.from_array(np.array([3], dtype=np.int64), name=w_idx),
         ])
         h_val, w_val = "Guideline_HVal", "Guideline_WVal"
         graph.node.append(helper.make_node("Gather", inputs=[in_shape, h_idx], outputs=[h_val], axis=0, name="Guideline_GatherH"))
@@ -913,8 +909,65 @@ def fix_onnx_outputs_to_match_pico(*, onnx_path: Path, nms: bool, imgsz: int) ->
         graph.node.append(helper.make_node("Cast", inputs=[h_val], outputs=[h_f32], to=TensorProto.FLOAT, name="Guideline_CastH"))
         graph.node.append(helper.make_node("Cast", inputs=[w_val], outputs=[w_f32], to=TensorProto.FLOAT, name="Guideline_CastW"))
         
-        scales = "Guideline_BoxScales"
-        graph.node.append(helper.make_node("Concat", inputs=[w_f32, h_f32, w_f32, h_f32], outputs=[scales], axis=0, name="Guideline_ConcatScales"))
+        # Scale candidate for internal imgsz-space boxes.
+        imgsz_const = "Guideline_ImgszConst"
+        graph.initializer.append(numpy_helper.from_array(np.array([float(imgsz)], dtype=np.float32), name=imgsz_const))
+        
+        w_scale, h_scale = "Guideline_WScale", "Guideline_HScale"
+        graph.node.append(helper.make_node("Div", inputs=[w_f32, imgsz_const], outputs=[w_scale], name="Guideline_DivW"))
+        graph.node.append(helper.make_node("Div", inputs=[h_f32, imgsz_const], outputs=[h_scale], name="Guideline_DivH"))
+        
+        scales_internal = "Guideline_BoxScales_Internal"
+        graph.node.append(helper.make_node("Concat", inputs=[w_scale, h_scale, w_scale, h_scale], outputs=[scales_internal], axis=0, name="Guideline_ConcatScalesInternal"))
+
+        # Scale candidate for normalized boxes.
+        scales_norm = "Guideline_BoxScales_Normalized"
+        graph.node.append(helper.make_node("Concat", inputs=[w_f32, h_f32, w_f32, h_f32], outputs=[scales_norm], axis=0, name="Guideline_ConcatScalesNormalized"))
+
+        # Scale candidate for already input-space boxes.
+        scales_identity = "Guideline_BoxScales_Identity"
+        graph.initializer.append(
+            numpy_helper.from_array(np.array([1.0, 1.0, 1.0, 1.0], dtype=np.float32), name=scales_identity)
+        )
+
+        # Heuristic classifier on max absolute coordinate magnitude.
+        # <= 2.0          -> normalized [0,1] (allowing slight overshoot)
+        # <= imgsz * 1.5  -> internal imgsz-space
+        # otherwise       -> already in input-space
+        b_abs = "Guideline_B_Abs"
+        b_abs_max = "Guideline_B_AbsMax"
+        graph.node.append(helper.make_node("Abs", inputs=[b_raw], outputs=[b_abs], name="Guideline_AbsBoxes"))
+        graph.node.append(helper.make_node("ReduceMax", inputs=[b_abs], outputs=[b_abs_max], keepdims=0, name="Guideline_MaxAbsBox"))
+
+        norm_thresh = "Guideline_NormThresh"
+        internal_thresh = "Guideline_InternalThresh"
+        graph.initializer.extend([
+            numpy_helper.from_array(np.array([2.0], dtype=np.float32), name=norm_thresh),
+            numpy_helper.from_array(np.array([float(imgsz) * 1.5], dtype=np.float32), name=internal_thresh),
+        ])
+        is_norm = "Guideline_IsNormScale"
+        is_internal = "Guideline_IsInternalScale"
+        graph.node.append(helper.make_node("LessOrEqual", inputs=[b_abs_max, norm_thresh], outputs=[is_norm], name="Guideline_CheckNormScale"))
+        graph.node.append(helper.make_node("LessOrEqual", inputs=[b_abs_max, internal_thresh], outputs=[is_internal], name="Guideline_CheckInternalScale"))
+
+        scales_mid = "Guideline_BoxScales_Mid"
+        scales = "Guideline_BoxScales_Selected"
+        graph.node.append(
+            helper.make_node(
+                "Where",
+                inputs=[is_internal, scales_internal, scales_identity],
+                outputs=[scales_mid],
+                name="Guideline_SelectInternalOrIdentity",
+            )
+        )
+        graph.node.append(
+            helper.make_node(
+                "Where",
+                inputs=[is_norm, scales_norm, scales_mid],
+                outputs=[scales],
+                name="Guideline_SelectFinalScale",
+            )
+        )
         graph.node.append(helper.make_node("Mul", inputs=[b_raw, scales], outputs=[b_scaled], name="Guideline_RescaleBoxes"))
 
         # 6. Final Concat [N, 7]

@@ -1421,100 +1421,134 @@ class ONNXExportablePicoDet(nn.Module):
 # ────────────────── append_nms_to_onnx ────────────────────
 def append_nms_to_onnx(in_path: str, out_path: str, score_thresh: float, iou_thresh: float, max_det: int, *,
                         raw_boxes: str = "raw_boxes", raw_scores: str = "raw_scores",
-                        top_k_before_nms: bool = True, k_value: int = 600):
+                        top_k_before_nms: bool = True, k_value: int = 600,
+                        onnx_input_name: str = "images_uint8",
+                        internal_h: int = IMG_SIZE, internal_w: int = IMG_SIZE):
+    """
+    Append NMS and emit guideline-compliant detections:
+      output shape [N, 7] float32 with columns [x1, y1, x2, y2, score, class_id, batch_idx].
+    Boxes are rescaled from the model's internal inference size to ONNX input-space.
+    """
     m = onnx.load(in_path)
     g = m.graph
-    g.initializer.extend([oh.make_tensor("nms_iou_th", TP.FLOAT, [], [iou_thresh]),
-                          oh.make_tensor("nms_score_th", TP.FLOAT, [], [score_thresh]),
-                          oh.make_tensor("nms_max_det", TP.INT64, [], [max_det]),
-                          oh.make_tensor("nms_axis1", TP.INT64, [1], [1]),
-                          oh.make_tensor("nms_axis2", TP.INT64, [1], [2]),
-                          oh.make_tensor("nms_shape_boxes3d", TP.INT64, [3], [0, -1, 4]),
-                          oh.make_tensor("nms_shape_scores3d", TP.INT64, [3], [0, 0, -1])])
+
+    input_name = onnx_input_name
+    if not any(v.name == input_name for v in g.input):
+        input_name = g.input[0].name
+        print(f"[WARN] Input '{onnx_input_name}' not found. Using '{input_name}' for box scaling.")
+
+    g.initializer.extend([
+        oh.make_tensor("nms_iou_th", TP.FLOAT, [], [float(iou_thresh)]),
+        oh.make_tensor("nms_score_th", TP.FLOAT, [], [float(score_thresh)]),
+        oh.make_tensor("nms_max_det", TP.INT64, [], [int(max_det)]),
+        oh.make_tensor("nms_axis0", TP.INT64, [1], [0]),
+        oh.make_tensor("nms_axis1", TP.INT64, [1], [1]),
+        oh.make_tensor("nms_axis2", TP.INT64, [1], [2]),
+        oh.make_tensor("nms_idx_h", TP.INT64, [1], [2]),
+        oh.make_tensor("nms_idx_w", TP.INT64, [1], [3]),
+        oh.make_tensor("nms_shape_boxes3d", TP.INT64, [3], [0, -1, 4]),
+        oh.make_tensor("nms_shape_scores3d", TP.INT64, [3], [0, 0, -1]),
+        oh.make_tensor("nms_split111", TP.INT64, [3], [1, 1, 1]),
+        oh.make_tensor("nms_internal_h", TP.FLOAT, [], [float(internal_h)]),
+        oh.make_tensor("nms_internal_w", TP.FLOAT, [], [float(internal_w)]),
+    ])
     if top_k_before_nms:
-        g.initializer.extend([oh.make_tensor("nms_k_topk", TP.INT64, [1], [k_value])])
+        g.initializer.extend([oh.make_tensor("nms_k_topk", TP.INT64, [1], [int(k_value)])])
 
     boxes3d = "nms_boxes3d"
-    g.node.append(oh.make_node("Reshape", [raw_boxes, "nms_shape_boxes3d"], [boxes3d], name="nms_Reshape_Boxes3D"))
     scores3d = "nms_scores3d"
-    g.node.append(oh.make_node("Reshape", [raw_scores, "nms_shape_scores3d"], [scores3d], name="nms_Reshape_Scores3D"))
     scores_bca = "nms_scores_bca"
+    g.node.append(oh.make_node("Reshape", [raw_boxes, "nms_shape_boxes3d"], [boxes3d], name="nms_Reshape_Boxes3D"))
+    g.node.append(oh.make_node("Reshape", [raw_scores, "nms_shape_scores3d"], [scores3d], name="nms_Reshape_Scores3D"))
     g.node.append(oh.make_node("Transpose", [scores3d], [scores_bca], perm=[0, 2, 1], name="nms_Transpose_BCA"))
 
-    # ───────── optional Top-K filter ─────────
+    # Optional Top-K on max class confidence per anchor before NMS.
     if top_k_before_nms:
         max_conf = "nms_max_conf"
-        g.node.append(oh.make_node(
-            "ReduceMax", [scores_bca, "nms_axis1"], [max_conf],
-            keepdims=0, name="nms_ReduceMax"))
-
         topk_vals = "nms_topk_vals"
-        topk_idx  = "nms_topk_idx"                 # [B , K]
-        g.node.append(oh.make_node(
-            "TopK",
-            [max_conf, "nms_k_topk"],
-            [topk_vals, topk_idx],
-            axis=1, largest=1, sorted=0,
-            name="nms_TopK"))
+        topk_idx = "nms_topk_idx"           # [B, K]
+        topk_idx_unsq = "nms_topk_idx_unsq" # [B, K, 1]
+        boxes_topk = "nms_boxes_topk"       # [B, K, 4]
+        scores_bac = "nms_scores_bac"       # [B, A, C]
+        scores_bkc = "nms_scores_bkc"       # [B, K, C]
+        scores_bck = "nms_scores_bck"       # [B, C, K]
 
-        topk_idx_unsq = "nms_topk_idx_unsq"        # [B , K , 1]
-        g.node.append(oh.make_node(
-            "Unsqueeze", [topk_idx, "nms_axis2"], [topk_idx_unsq],
-            name="nms_UnsqTopKIdx"))
+        g.node.append(oh.make_node("ReduceMax", [scores_bca, "nms_axis1"], [max_conf], keepdims=0, name="nms_ReduceMax"))
+        g.node.append(oh.make_node("TopK", [max_conf, "nms_k_topk"], [topk_vals, topk_idx], axis=1, largest=1, sorted=0, name="nms_TopK"))
+        g.node.append(oh.make_node("Unsqueeze", [topk_idx, "nms_axis2"], [topk_idx_unsq], name="nms_UnsqTopKIdx"))
+        g.node.append(oh.make_node("GatherND", [boxes3d, topk_idx_unsq], [boxes_topk], batch_dims=1, name="nms_GatherBoxesTopK"))
+        g.node.append(oh.make_node("Transpose", [scores_bca], [scores_bac], perm=[0, 2, 1], name="nms_Transpose_BAC"))
+        g.node.append(oh.make_node("GatherND", [scores_bac, topk_idx_unsq], [scores_bkc], batch_dims=1, name="nms_GatherScoresTopK"))
+        g.node.append(oh.make_node("Transpose", [scores_bkc], [scores_bck], perm=[0, 2, 1], name="nms_Transpose_BCK"))
 
-        boxes_topk = "nms_boxes_topk"              # [B , K , 4]
-        g.node.append(oh.make_node(
-            "GatherND", [boxes3d, topk_idx_unsq], [boxes_topk],
-            batch_dims=1, name="nms_GatherBoxesTopK"))
-
-        scores_bac = "nms_scores_bac"
-        g.node.append(oh.make_node(
-            "Transpose", [scores_bca], [scores_bac],
-            perm=[0, 2, 1], name="nms_Transpose_BAC"))
-
-        scores_bkc = "nms_scores_bkc"              # [B , K , C]
-        g.node.append(oh.make_node(
-            "GatherND", [scores_bac, topk_idx_unsq], [scores_bkc],
-            batch_dims=1, name="nms_GatherScoresTopK"))
-
-        scores_bck = "nms_scores_bck"              # [B , C , K]
-        g.node.append(oh.make_node(
-            "Transpose", [scores_bkc], [scores_bck],
-            perm=[0, 2, 1], name="nms_Transpose_BCK"))
-
-        nms_boxes  = boxes_topk
+        nms_boxes = boxes_topk
         nms_scores = scores_bck
     else:
-        nms_boxes  = boxes3d
+        nms_boxes = boxes3d
         nms_scores = scores_bca
 
-    sel = "nms_selected"
-    g.node.append(oh.make_node("NonMaxSuppression",
-                               [nms_boxes, nms_scores, "nms_max_det", "nms_iou_th", "nms_score_th"],
-                               [sel], name="nms_NMS"))
-    g.initializer.extend([oh.make_tensor("nms_split111", TP.INT64, [3], [1, 1, 1])])
-    b_col, c_col, a_col = "nms_b", "nms_c", "nms_a"
+    sel = "nms_selected"  # [N,3] = [batch_idx, class_idx, box_idx]
+    g.node.append(oh.make_node(
+        "NonMaxSuppression",
+        [nms_boxes, nms_scores, "nms_max_det", "nms_iou_th", "nms_score_th"],
+        [sel],
+        name="nms_NMS",
+    ))
+
+    b_col, c_col, a_col = "nms_b_col", "nms_c_col", "nms_a_col"
     g.node.append(oh.make_node("Split", [sel, "nms_split111"], [b_col, c_col, a_col], axis=1, name="nms_SplitSel"))
 
-    b_idx, class_idx, anc_idx = "batch_idx", "class_idx", "anchor_idx"
-    for src, dst in [(b_col, b_idx), (c_col, class_idx), (a_col, anc_idx)]:
-        g.node.append(oh.make_node("Squeeze", [src, "nms_axis1"], [dst], name=f"nms_Squeeze_{dst}"))
-    a_unsq = "nms_a_unsq"
-    g.node.append(oh.make_node("Unsqueeze", [anc_idx, "nms_axis1"], [a_unsq], name="nms_UnsqAnchor"))
-    det_boxes = "det_boxes"
-    g.node.append(oh.make_node("GatherND", [nms_boxes, a_unsq], [det_boxes], batch_dims=1, name="nms_GatherDetBoxes"))
+    # Gather selected boxes via explicit [batch, anchor] indices.
+    box_idx_2d = "nms_box_idx_2d"
+    det_boxes = "nms_det_boxes"
+    g.node.append(oh.make_node("Concat", [b_col, a_col], [box_idx_2d], axis=1, name="nms_ConcatBoxIdx"))
+    g.node.append(oh.make_node("GatherND", [nms_boxes, box_idx_2d], [det_boxes], name="nms_GatherDetBoxes"))
 
-    cls_unsq = "nms_cls_unsq"
-    g.node.append(oh.make_node("Unsqueeze", [class_idx, "nms_axis1"], [cls_unsq], name="nms_UnsqClass"))
-    idx_scores = "nms_idx_scores"
-    g.node.append(oh.make_node("Concat", [cls_unsq, a_unsq], [idx_scores], axis=1, name="nms_CatClassAnchor"))
-    det_scores = "det_scores"
-    g.node.append(oh.make_node("GatherND", [nms_scores, idx_scores], [det_scores], batch_dims=1, name="nms_GatherDetScores"))
+    # Gather selected class-score via explicit [batch, class, anchor] indices.
+    score_idx_2d = "nms_score_idx_2d"
+    det_scores = "nms_det_scores"
+    det_scores_col = "nms_det_scores_col"
+    g.node.append(oh.make_node("Concat", [b_col, c_col, a_col], [score_idx_2d], axis=1, name="nms_ConcatScoreIdx"))
+    g.node.append(oh.make_node("GatherND", [nms_scores, score_idx_2d], [det_scores], name="nms_GatherDetScores"))
+    g.node.append(oh.make_node("Unsqueeze", [det_scores, "nms_axis1"], [det_scores_col], name="nms_UnsqueezeDetScores"))
+
+    # Rescale XYXY from internal inference size to ONNX input-space.
+    in_shape = "nms_in_shape"
+    in_h_i64 = "nms_in_h_i64"
+    in_w_i64 = "nms_in_w_i64"
+    in_h_f = "nms_in_h_f"
+    in_w_f = "nms_in_w_f"
+    scale_y = "nms_scale_y"
+    scale_x = "nms_scale_x"
+    scale_1d = "nms_scale_1d"
+    scale_2d = "nms_scale_2d"
+    det_boxes_scaled = "nms_det_boxes_scaled"
+    g.node.append(oh.make_node("Shape", [input_name], [in_shape], name="nms_InputShape"))
+    g.node.append(oh.make_node("Gather", [in_shape, "nms_idx_h"], [in_h_i64], axis=0, name="nms_GatherInputH"))
+    g.node.append(oh.make_node("Gather", [in_shape, "nms_idx_w"], [in_w_i64], axis=0, name="nms_GatherInputW"))
+    g.node.append(oh.make_node("Cast", [in_h_i64], [in_h_f], to=TP.FLOAT, name="nms_CastInputH"))
+    g.node.append(oh.make_node("Cast", [in_w_i64], [in_w_f], to=TP.FLOAT, name="nms_CastInputW"))
+    g.node.append(oh.make_node("Div", [in_h_f, "nms_internal_h"], [scale_y], name="nms_ScaleY"))
+    g.node.append(oh.make_node("Div", [in_w_f, "nms_internal_w"], [scale_x], name="nms_ScaleX"))
+    g.node.append(oh.make_node("Concat", [scale_x, scale_y, scale_x, scale_y], [scale_1d], axis=0, name="nms_ConcatScale"))
+    g.node.append(oh.make_node("Unsqueeze", [scale_1d, "nms_axis0"], [scale_2d], name="nms_UnsqueezeScale"))
+    g.node.append(oh.make_node("Mul", [det_boxes, scale_2d], [det_boxes_scaled], name="nms_ScaleBoxesToInput"))
+
+    class_col_f = "nms_class_col_f"
+    batch_col_f = "nms_batch_col_f"
+    detections = "detections"
+    g.node.append(oh.make_node("Cast", [c_col], [class_col_f], to=TP.FLOAT, name="nms_CastClassFloat"))
+    g.node.append(oh.make_node("Cast", [b_col], [batch_col_f], to=TP.FLOAT, name="nms_CastBatchFloat"))
+    g.node.append(oh.make_node(
+        "Concat",
+        [det_boxes_scaled, det_scores_col, class_col_f, batch_col_f],
+        [detections],
+        axis=1,
+        name="nms_ConcatDetections",
+    ))
+
     del g.output[:]
-    g.output.extend([oh.make_tensor_value_info(det_boxes, TP.FLOAT, ['N', 4]),
-                     oh.make_tensor_value_info(det_scores, TP.FLOAT, ['N']),
-                     oh.make_tensor_value_info(class_idx, TP.INT64, ['N']),
-                     oh.make_tensor_value_info(b_idx, TP.INT64, ['N'])])
+    g.output.extend([oh.make_tensor_value_info(detections, TP.FLOAT, ['N', 7])])
     onnx.checker.check_model(m)
     onnx.save(m, out_path)
     print(f"[SAVE] Final ONNX with NMS → {out_path}")
@@ -1561,12 +1595,20 @@ def save_fp32_onnx_reference(model, cfg):
     
     # Also create NMS version of FP32 model
     fp32_nms_path = cfg.out.replace(".onnx", "_fp32_reference_with_nms.onnx")
+    internal_size = getattr(model.head, "img_size", IMG_SIZE)
+    if isinstance(internal_size, (tuple, list)) and len(internal_size) >= 2:
+        internal_h, internal_w = int(internal_size[0]), int(internal_size[1])
+    else:
+        internal_h = internal_w = int(internal_size)
     append_nms_to_onnx(
         in_path=fp32_onnx_path,
         out_path=fp32_nms_path,
         score_thresh=float(model.head.score_th),
         iou_thresh=float(model.head.iou_th),
         max_det=int(model.head.max_det),
+        onnx_input_name="images_uint8",
+        internal_h=internal_h,
+        internal_w=internal_w,
     )
     print(f'[SAVE] FP32 reference ONNX with NMS → {fp32_nms_path}')
     
@@ -1791,7 +1833,7 @@ def main(argv: List[str] | None = None):
     pa.add_argument('--background_weight', type=float, default=1.1, help="Extra VarifocalLoss penalty for background (FP suppression).")
     pa.add_argument('--focal_warmup_epochs', type=int, default=6,
                     help="Epochs to use sigmoid focal loss before switching to Varifocal Loss. Set to -1 to disable warmup.")
-    pa.add_argument('--vfl_q_gamma_after_warmup', type=float, default=1.2,
+    pa.add_argument('--vfl_q_gamma_after_warmup', type=float, default=1.05,
                     help="Exponent for IoU→quality target after warmup (higher emphasizes high-IoU positives; tends to improve precision).")
     pa.add_argument('--vfl_q_gamma_refine', type=float, default=1.5,
                     help="Exponent for IoU→quality target during late refinement (higher generally increases precision).")
@@ -2573,12 +2615,20 @@ def main(argv: List[str] | None = None):
     out_dest = cfg.out
     # out_dest = "picodet_int8.onnx"
     # temp_onnx_path = "picodet_int8_temp_no_nms.onnx"
+    internal_size = getattr(model.head, "img_size", IMG_SIZE)
+    if isinstance(internal_size, (tuple, list)) and len(internal_size) >= 2:
+        internal_h, internal_w = int(internal_size[0]), int(internal_size[1])
+    else:
+        internal_h = internal_w = int(internal_size)
     append_nms_to_onnx(
         in_path=temp_onnx_path,
         out_path=out_dest,
         score_thresh=float(model.head.score_th), # 0.05
         iou_thresh=float(model.head.iou_th),  # 0.6
         max_det=int(model.head.max_det),  # 100
+        onnx_input_name="images_uint8",
+        internal_h=internal_h,
+        internal_w=internal_w,
     )
     
     # ---------------- Create optimized versions ------------------------------

@@ -23,19 +23,19 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--tflite",
         type=Path,
-        default=repo_root / "model_saves" / "maip_vertexai_2nodehrs_medium.tflite",
+        default=repo_root / "model_saves" / "vertex_person_fast.tflite",
         help="Path to input TFLite model.",
     )
     p.add_argument(
         "--output",
         type=Path,
-        default=repo_root / "model_saves" / "maip_vertexai_2nodehrs_medium_guideline.onnx",
+        default=repo_root / "model_saves" / "vertex_person_fast.onnx",
         help="Path to final ONNX model.",
     )
     p.add_argument(
         "--raw-onnx",
         type=Path,
-        default=repo_root / "model_saves" / "maip_vertexai_2nodehrs_medium_raw_tf2onnx.onnx",
+        default=repo_root / "model_saves" / "vertex_person_fast_raw_tf2onnx.onnx",
         help="Intermediate ONNX path produced by tf2onnx.",
     )
     p.add_argument("--opset", type=int, default=17, help="ONNX opset to use for tf2onnx conversion.")
