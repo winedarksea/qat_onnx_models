@@ -2270,7 +2270,7 @@ def main(argv: List[str] | None = None):
         elif ep == 22:
             # quality_floor_vfl = 0.005
             # assigner.cls_cost_weight = 3.5
-            pass
+            assigner.power = 0.1
             # q_gamma = max(q_gamma, float(cfg.vfl_q_gamma_refine))
             # assigner.dynamic_k_min = 1
         elif ep == 55:

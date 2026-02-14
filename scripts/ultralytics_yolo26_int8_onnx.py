@@ -445,6 +445,7 @@ def export_onnx_with_ultralytics(
     opset: int,
     simplify: bool,
     nms: bool,
+    max_det: int,
     device: str | None,
     out_dir: Path,
 ) -> Path:
@@ -455,13 +456,14 @@ def export_onnx_with_ultralytics(
     model = YOLO(str(weights_pt))
     _ensure_dir(out_dir)
 
-    log.info("Exporting ONNX (opset=%d simplify=%s nms=%s) ...", opset, simplify, nms)
+    log.info("Exporting ONNX (opset=%d simplify=%s nms=%s max_det=%d) ...", opset, simplify, nms, max_det)
     exported = model.export(
         format="onnx",
         imgsz=imgsz,
         opset=opset,
         simplify=simplify,
         nms=nms,
+        max_det=max_det,
         device=device,
     )
 
@@ -711,21 +713,49 @@ def quantize_onnx_int8_static(
         "uint8" if expects_uint8_input else "float32",
     )
     
-    # Guidelines: exclude post-processing and score-sensitive nodes to preserve precision
-    nodes_to_exclude = []
-    # Try to find the node that was the original output and exclude it to prevent its
-    # quantization scale from zeroing out small score values.
+    # Guidelines: keep post-processing path in float to preserve small score/box values.
+    nodes_to_exclude: set[str] = set()
     temp_model = onnx.load(str(in_onnx))
+
+    # Always exclude the guideline wrapper nodes.
     for node in temp_model.graph.node:
-        if "Guideline" in node.name:
-            nodes_to_exclude.append(node.name)
-        # Also exclude the node providing input to the guideline logic
-        if node.name == "Guideline_ReshapeN6":
-            nodes_to_exclude.append(node.input[0])
-            # Trace back one more to be safe if it's a simple op
-            for n2 in temp_model.graph.node:
-                if node.input[0] in n2.output:
-                    nodes_to_exclude.append(n2.name)
+        if node.name.startswith("Guideline_"):
+            nodes_to_exclude.add(node.name)
+
+    # Also exclude the immediate postprocess path feeding Guideline_ReshapeN6's source tensor.
+    # This avoids QDQ around score/box consolidation that can collapse scores to zero.
+    output_to_node: dict[str, onnx.NodeProto] = {}
+    for node in temp_model.graph.node:
+        for out_name in node.output:
+            output_to_node[out_name] = node
+
+    reshape_node = next((n for n in temp_model.graph.node if n.name == "Guideline_ReshapeN6"), None)
+    if reshape_node is not None and reshape_node.input:
+        source_tensor = reshape_node.input[0]
+        frontier = [source_tensor]
+        seen_tensors: set[str] = set()
+        stop_ops = {"Conv", "ConvTranspose", "Gemm", "MatMul", "QLinearConv", "QLinearMatMul"}
+
+        while frontier:
+            tensor_name = frontier.pop()
+            if tensor_name in seen_tensors:
+                continue
+            seen_tensors.add(tensor_name)
+
+            producer = output_to_node.get(tensor_name)
+            if producer is None or not producer.name:
+                continue
+
+            if producer.op_type in stop_ops:
+                continue
+
+            nodes_to_exclude.add(producer.name)
+            for src in producer.input:
+                if src:
+                    frontier.append(src)
+
+    nodes_to_exclude_list = sorted(nodes_to_exclude)
+    log.info("Quantization nodes_to_exclude=%d", len(nodes_to_exclude_list))
 
     quantize_static(
         model_input=str(in_onnx),
@@ -736,7 +766,7 @@ def quantize_onnx_int8_static(
         weight_type=QuantType.QInt8,
         per_channel=per_channel,
         reduce_range=reduce_range,
-        nodes_to_exclude=nodes_to_exclude,
+        nodes_to_exclude=nodes_to_exclude_list,
     )
 
 
@@ -806,7 +836,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--opset", type=int, default=17)
     p.set_defaults(simplify=True)
     p.add_argument("--no_simplify", action="store_false", dest="simplify")
-    p.add_argument("--nms", action="store_true", default=False, help="Export with NMS (not recommended for NMS-free models).")
+    p.set_defaults(nms=True)
+    p.add_argument("--nms", action="store_true", dest="nms", help="Export with NMS-like postprocessing enabled.")
+    p.add_argument("--no_nms", action="store_false", dest="nms",
+                   help="Disable NMS-like postprocessing in export (advanced/debug only).")
+    p.add_argument("--max_det", type=int, default=100,
+                   help="Maximum detections emitted by Ultralytics export when NMS/postprocess is enabled.")
 
     p.set_defaults(embed_preprocess=True)
     p.add_argument("--no_embed_preprocess", action="store_false", dest="embed_preprocess",
@@ -848,145 +883,79 @@ def fix_onnx_outputs_to_match_pico(*, onnx_path: Path, nms: bool, imgsz: int) ->
     model = onnx.load(str(onnx_path))
     graph = model.graph
 
-    # GUIDELINE: Rescale coordinates to input tensor space.
-    # We use the first input (expected to be the uint8 or original float tensor).
+    # GUIDELINE: rescale coordinates to input tensor space.
     input_name = graph.input[0].name
-    
-    def _add_guideline_nodes(source_tensor: str, num_classes: int = 1):
-        # source_tensor is [1, N, 6] (boxes, score, class)
-        
-        # 1. Reshape [1, N, 6] -> [N, 6]
+
+    def _add_guideline_nodes(source_tensor: str) -> None:
+        # source_tensor is [1, N, 6] where columns are [x1, y1, x2, y2, score, class]
+
+        # 1) Reshape [1, N, 6] -> [N, 6]
         n6_name = "Guideline_Reshaped_N6"
         n6_shape = "Guideline_N6_Shape_Const"
         graph.initializer.append(numpy_helper.from_array(np.array([-1, 6], dtype=np.int64), name=n6_shape))
         graph.node.append(helper.make_node("Reshape", inputs=[source_tensor, n6_shape], outputs=[n6_name], name="Guideline_ReshapeN6"))
 
-        # 2. Split [N, 6] into [N, 4], [N, 1], [N, 1]
+        # 2) Split [N, 6] -> boxes/scores/classes
         b_raw, s_raw, c_raw = "Guideline_B_Raw", "Guideline_S_Raw", "Guideline_C_Raw"
         split_const = "Guideline_Split_Const"
         graph.initializer.append(numpy_helper.from_array(np.array([4, 1, 1], dtype=np.int64), name=split_const))
         graph.node.append(helper.make_node("Split", inputs=[n6_name, split_const], outputs=[b_raw, s_raw, c_raw], axis=1, name="Guideline_SplitN6"))
 
-        # 3. Squeeze scores/classes to 1D
-        s_1d, c_1d = "Guideline_S_1d", "Guideline_C_1d"
-        axis_const = "Guideline_Axis1_Const"
-        graph.initializer.append(numpy_helper.from_array(np.array([1], dtype=np.int64), name=axis_const))
-        graph.node.append(helper.make_node("Squeeze", inputs=[s_raw, axis_const], outputs=[s_1d], name="Guideline_SqueezeS"))
-        graph.node.append(helper.make_node("Squeeze", inputs=[c_raw, axis_const], outputs=[c_1d], name="Guideline_SqueezeC"))
-
-        # 4. Generate batch_idx [N] (all zeros, Float32)
-        b_idx = "Guideline_BatchIdx"
+        # 3) Generate batch_idx [N, 1] (all zeros, float32)
         s_shape = "Guideline_S_Shape"
-        graph.node.append(helper.make_node("Shape", inputs=[s_1d], outputs=[s_shape], name="Guideline_GetSShape"))
-        graph.node.append(helper.make_node(
-            "ConstantOfShape", 
-            inputs=[s_shape], 
-            outputs=[b_idx], 
-            value=helper.make_tensor("val", TensorProto.FLOAT, [1], [0.0]),
-            name="Guideline_CreateBatchIdx"
-        ))
+        b_idx_2d = "Guideline_BatchIdx_2d"
+        graph.node.append(helper.make_node("Shape", inputs=[s_raw], outputs=[s_shape], name="Guideline_GetSShape"))
+        graph.node.append(
+            helper.make_node(
+                "ConstantOfShape",
+                inputs=[s_shape],
+                outputs=[b_idx_2d],
+                value=helper.make_tensor("val", TensorProto.FLOAT, [1], [0.0]),
+                name="Guideline_CreateBatchIdx",
+            )
+        )
 
-        # 5. Rescale boxes [N, 4] to ONNX input coordinate space.
-        # Ultralytics exports can emit boxes in one of three regimes:
-        #   A) normalized [0,1], B) internal imgsz space, C) already input-space.
-        # We pick a scale tensor at runtime from box magnitude.
+        # 4) Rescale boxes from training imgsz space to ONNX input-space.
         b_scaled = "Guideline_B_Rescaled"
         in_shape = "Guideline_InputShape"
         graph.node.append(helper.make_node("Shape", inputs=[input_name], outputs=[in_shape], name="Guideline_GetInShape"))
-        
-        # Get H(2) and W(3) from NCHW
+
         h_idx = "Guideline_HIdx"
         w_idx = "Guideline_WIdx"
         graph.initializer.extend([
-            numpy_helper.from_array(np.array([2], dtype=np.int64), name=h_idx),
-            numpy_helper.from_array(np.array([3], dtype=np.int64), name=w_idx),
+            numpy_helper.from_array(np.array(2, dtype=np.int64), name=h_idx),
+            numpy_helper.from_array(np.array(3, dtype=np.int64), name=w_idx),
         ])
+
         h_val, w_val = "Guideline_HVal", "Guideline_WVal"
         graph.node.append(helper.make_node("Gather", inputs=[in_shape, h_idx], outputs=[h_val], axis=0, name="Guideline_GatherH"))
         graph.node.append(helper.make_node("Gather", inputs=[in_shape, w_idx], outputs=[w_val], axis=0, name="Guideline_GatherW"))
-        
+
         h_f32, w_f32 = "Guideline_Hf32", "Guideline_Wf32"
         graph.node.append(helper.make_node("Cast", inputs=[h_val], outputs=[h_f32], to=TensorProto.FLOAT, name="Guideline_CastH"))
         graph.node.append(helper.make_node("Cast", inputs=[w_val], outputs=[w_f32], to=TensorProto.FLOAT, name="Guideline_CastW"))
-        
-        # Scale candidate for internal imgsz-space boxes.
-        imgsz_const = "Guideline_ImgszConst"
-        graph.initializer.append(numpy_helper.from_array(np.array([float(imgsz)], dtype=np.float32), name=imgsz_const))
-        
-        w_scale, h_scale = "Guideline_WScale", "Guideline_HScale"
-        graph.node.append(helper.make_node("Div", inputs=[w_f32, imgsz_const], outputs=[w_scale], name="Guideline_DivW"))
-        graph.node.append(helper.make_node("Div", inputs=[h_f32, imgsz_const], outputs=[h_scale], name="Guideline_DivH"))
-        
-        scales_internal = "Guideline_BoxScales_Internal"
-        graph.node.append(helper.make_node("Concat", inputs=[w_scale, h_scale, w_scale, h_scale], outputs=[scales_internal], axis=0, name="Guideline_ConcatScalesInternal"))
 
-        # Scale candidate for normalized boxes.
-        scales_norm = "Guideline_BoxScales_Normalized"
-        graph.node.append(helper.make_node("Concat", inputs=[w_f32, h_f32, w_f32, h_f32], outputs=[scales_norm], axis=0, name="Guideline_ConcatScalesNormalized"))
+        train_imgsz = "Guideline_TrainImgsz"
+        graph.initializer.append(numpy_helper.from_array(np.array([float(imgsz)], dtype=np.float32), name=train_imgsz))
+        h_scale, w_scale = "Guideline_HScale", "Guideline_WScale"
+        graph.node.append(helper.make_node("Div", inputs=[h_f32, train_imgsz], outputs=[h_scale], name="Guideline_DivH"))
+        graph.node.append(helper.make_node("Div", inputs=[w_f32, train_imgsz], outputs=[w_scale], name="Guideline_DivW"))
 
-        # Scale candidate for already input-space boxes.
-        scales_identity = "Guideline_BoxScales_Identity"
-        graph.initializer.append(
-            numpy_helper.from_array(np.array([1.0, 1.0, 1.0, 1.0], dtype=np.float32), name=scales_identity)
-        )
-
-        # Heuristic classifier on max absolute coordinate magnitude.
-        # <= 2.0          -> normalized [0,1] (allowing slight overshoot)
-        # <= imgsz * 1.5  -> internal imgsz-space
-        # otherwise       -> already in input-space
-        b_abs = "Guideline_B_Abs"
-        b_abs_max = "Guideline_B_AbsMax"
-        graph.node.append(helper.make_node("Abs", inputs=[b_raw], outputs=[b_abs], name="Guideline_AbsBoxes"))
-        graph.node.append(helper.make_node("ReduceMax", inputs=[b_abs], outputs=[b_abs_max], keepdims=0, name="Guideline_MaxAbsBox"))
-
-        norm_thresh = "Guideline_NormThresh"
-        internal_thresh = "Guideline_InternalThresh"
-        graph.initializer.extend([
-            numpy_helper.from_array(np.array([2.0], dtype=np.float32), name=norm_thresh),
-            numpy_helper.from_array(np.array([float(imgsz) * 1.5], dtype=np.float32), name=internal_thresh),
-        ])
-        is_norm = "Guideline_IsNormScale"
-        is_internal = "Guideline_IsInternalScale"
-        graph.node.append(helper.make_node("LessOrEqual", inputs=[b_abs_max, norm_thresh], outputs=[is_norm], name="Guideline_CheckNormScale"))
-        graph.node.append(helper.make_node("LessOrEqual", inputs=[b_abs_max, internal_thresh], outputs=[is_internal], name="Guideline_CheckInternalScale"))
-
-        scales_mid = "Guideline_BoxScales_Mid"
-        scales = "Guideline_BoxScales_Selected"
-        graph.node.append(
-            helper.make_node(
-                "Where",
-                inputs=[is_internal, scales_internal, scales_identity],
-                outputs=[scales_mid],
-                name="Guideline_SelectInternalOrIdentity",
-            )
-        )
-        graph.node.append(
-            helper.make_node(
-                "Where",
-                inputs=[is_norm, scales_norm, scales_mid],
-                outputs=[scales],
-                name="Guideline_SelectFinalScale",
-            )
-        )
+        scales = "Guideline_BoxScales"
+        graph.node.append(helper.make_node("Concat", inputs=[w_scale, h_scale, w_scale, h_scale], outputs=[scales], axis=0, name="Guideline_ConcatScales"))
         graph.node.append(helper.make_node("Mul", inputs=[b_raw, scales], outputs=[b_scaled], name="Guideline_RescaleBoxes"))
 
-        # 6. Final Concat [N, 7]
-        # Guideline: [x1, y1, x2, y2, score, class_id, batch_idx]
-        # boxes:[N, 4], scores:[N, 1], classes:[N, 1], batch_idx:[N, 1]
-        s_2d, c_2d, b_2d = "Guideline_S_2d", "Guideline_C_2d", "Guideline_B_2d"
-        graph.node.append(helper.make_node("Unsqueeze", inputs=[s_1d, axis_const], outputs=[s_2d], name="Guideline_UnsqueezeS"))
-        graph.node.append(helper.make_node("Unsqueeze", inputs=[c_1d, axis_const], outputs=[c_2d], name="Guideline_UnsqueezeC"))
-        graph.node.append(helper.make_node("Unsqueeze", inputs=[b_idx, axis_const], outputs=[b_2d], name="Guideline_UnsqueezeB"))
-        
-        graph.node.append(helper.make_node(
-            "Concat", 
-            inputs=[b_scaled, s_2d, c_2d, b_2d], 
-            outputs=["detections"], 
-            axis=1, 
-            name="Guideline_FinalConcat"
-        ))
+        # 5) Final consolidated output [N, 7]
+        graph.node.append(
+            helper.make_node(
+                "Concat",
+                inputs=[b_scaled, s_raw, c_raw, b_idx_2d],
+                outputs=["detections"],
+                axis=1,
+                name="Guideline_FinalConcat",
+            )
+        )
 
-        # Update outputs
         del graph.output[:]
         graph.output.append(helper.make_tensor_value_info("detections", TensorProto.FLOAT, ["N", 7]))
 
@@ -1090,6 +1059,7 @@ def main(argv: list[str]) -> int:
         opset=args.opset,
         simplify=args.simplify,
         nms=args.nms,
+        max_det=args.max_det,
         device=args.device,
         out_dir=args.export_dir,
     )
