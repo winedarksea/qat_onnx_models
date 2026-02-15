@@ -37,7 +37,7 @@ except Exception:
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_ONNX = REPO_ROOT / "model_saves" / "yolo26_coco_320_int8.onnx"
+DEFAULT_ONNX = REPO_ROOT / "model_saves" / "picodet_v5_int8.onnx"   # "yolo26_coco_320_int8.onnx" maip_vertexai_2nodehrs_medium_guideline
 DEFAULT_IMAGE = REPO_ROOT / "scripts" / "test_image_2.jpg"
 
 
@@ -56,6 +56,23 @@ class DetectionOutput:
     class_ids: np.ndarray
     batch_idx: np.ndarray
     source_format: str
+
+
+@dataclass
+class PrecisionAudit:
+    total_nodes: int
+    total_initializers: int
+    total_initializer_bytes: int
+    int8_initializers: int
+    int8_initializer_bytes: int
+    qdq_nodes: int
+    total_compute_nodes: int
+    quantized_compute_nodes: int
+    float_compute_nodes: int
+    prepost_float_nodes: int
+    advisory_level: str
+    advisory_message: str
+    reasons: list[str]
 
 
 def parse_args() -> argparse.Namespace:
@@ -151,6 +168,7 @@ def _collect_graph_checks(onnx_path: Path) -> tuple[list[CheckResult], dict[str,
     graph = model.graph
     op_counts = Counter(n.op_type for n in graph.node)
     ctx["op_counts"] = op_counts
+    ctx["precision_audit"] = _collect_precision_audit(model, op_counts)
 
     if not graph.input:
         checks.append(CheckResult("Model Has Input", False, "No graph inputs found."))
@@ -254,6 +272,210 @@ def _collect_graph_checks(onnx_path: Path) -> tuple[list[CheckResult], dict[str,
         )
 
     return checks, ctx
+
+
+def _initializer_nbytes(init: Any) -> int:
+    if hasattr(init, "raw_data") and init.raw_data:
+        return int(len(init.raw_data))
+
+    # Fall back to array materialization for non-raw tensor encodings.
+    try:
+        arr = onnx.numpy_helper.to_array(init)
+        return int(arr.nbytes)
+    except Exception:
+        return 0
+
+
+def _collect_precision_audit(model: Any, op_counts: Counter[str]) -> PrecisionAudit:
+    graph = model.graph
+    int8_types = {TensorProto.INT8, TensorProto.UINT8}
+    explicit_qcompute_ops = {"QLinearConv", "QLinearMatMul", "ConvInteger", "MatMulInteger", "QGemm"}
+    base_compute_ops = {"Conv", "MatMul", "Gemm", "ConvTranspose"}
+
+    total_initializer_bytes = 0
+    int8_initializer_bytes = 0
+    int8_initializers = 0
+    for init in graph.initializer:
+        nbytes = _initializer_nbytes(init)
+        total_initializer_bytes += nbytes
+        if init.data_type in int8_types:
+            int8_initializers += 1
+            int8_initializer_bytes += nbytes
+
+    producer_by_output: dict[str, Any] = {}
+    for node in graph.node:
+        for out in node.output:
+            if out:
+                producer_by_output[out] = node
+    initializer_dtype = {i.name: i.data_type for i in graph.initializer}
+
+    def _input_from_int8_qdq(name: str) -> bool:
+        prod = producer_by_output.get(name)
+        if prod is None or prod.op_type != "DequantizeLinear" or not prod.input:
+            return False
+
+        source = prod.input[0]
+        if initializer_dtype.get(source) in int8_types:
+            return True
+
+        src_prod = producer_by_output.get(source)
+        return bool(src_prod is not None and src_prod.op_type == "QuantizeLinear")
+
+    total_compute_nodes = 0
+    quantized_compute_nodes = 0
+    for node in graph.node:
+        op = node.op_type
+        if op in explicit_qcompute_ops:
+            total_compute_nodes += 1
+            quantized_compute_nodes += 1
+            continue
+        if op in base_compute_ops:
+            total_compute_nodes += 1
+            if any(_input_from_int8_qdq(inp_name) for inp_name in node.input if inp_name):
+                quantized_compute_nodes += 1
+
+    float_compute_nodes = max(0, total_compute_nodes - quantized_compute_nodes)
+    qdq_nodes = int(op_counts.get("QuantizeLinear", 0) + op_counts.get("DequantizeLinear", 0))
+    prepost_float_nodes = int(
+        op_counts.get("Cast", 0) + op_counts.get("Resize", 0) + op_counts.get("NonMaxSuppression", 0)
+    )
+
+    int8_param_ratio = (
+        float(int8_initializer_bytes) / float(total_initializer_bytes)
+        if total_initializer_bytes > 0
+        else 0.0
+    )
+    quantized_compute_ratio = (
+        float(quantized_compute_nodes) / float(total_compute_nodes)
+        if total_compute_nodes > 0
+        else 0.0
+    )
+
+    reasons: list[str] = []
+    reasons.append(
+        "int8_param_ratio={:.1%}, quantized_compute_ratio={:.1%}".format(
+            int8_param_ratio, quantized_compute_ratio
+        )
+    )
+    if prepost_float_nodes > 0:
+        reasons.append(
+            "Found {} float-leaning pre/post nodes (Cast/Resize/NMS), often left on CPU/GPU.".format(
+                prepost_float_nodes
+            )
+        )
+
+    if total_compute_nodes == 0:
+        advisory_level = "UNKNOWN"
+        advisory_message = "No Conv/MatMul/Gemm-style compute nodes found; offload estimate is inconclusive."
+    elif int8_param_ratio >= 0.70 and quantized_compute_ratio >= 0.80:
+        advisory_level = "LIKELY_MOSTLY_NPU"
+        advisory_message = "Model core looks strongly quantized; many INT8 NPUs should offload most core compute."
+    elif int8_param_ratio >= 0.40 or quantized_compute_ratio >= 0.40:
+        advisory_level = "MIXED_OFFLOAD"
+        advisory_message = (
+            "Model appears partially quantized; likely mixed execution with some CPU/GPU fallback on many NPUs."
+        )
+    else:
+        advisory_level = "LOW_NPU_OFFLOAD"
+        advisory_message = "Model core looks mostly float; many INT8 NPUs may offload little or none of inference."
+
+    return PrecisionAudit(
+        total_nodes=len(graph.node),
+        total_initializers=len(graph.initializer),
+        total_initializer_bytes=total_initializer_bytes,
+        int8_initializers=int8_initializers,
+        int8_initializer_bytes=int8_initializer_bytes,
+        qdq_nodes=qdq_nodes,
+        total_compute_nodes=total_compute_nodes,
+        quantized_compute_nodes=quantized_compute_nodes,
+        float_compute_nodes=float_compute_nodes,
+        prepost_float_nodes=prepost_float_nodes,
+        advisory_level=advisory_level,
+        advisory_message=advisory_message,
+        reasons=reasons,
+    )
+
+
+def _print_precision_audit(audit: PrecisionAudit | None) -> list[CheckResult]:
+    checks: list[CheckResult] = []
+    if audit is None:
+        print("\n=== Quantization / NPU Audit ===")
+        print("- Not available (ONNX graph inspection disabled).")
+        checks.append(
+            CheckResult(
+                name="Quantization / NPU Audit Available",
+                passed=None,
+                detail="ONNX package not available for graph precision analysis.",
+                required=False,
+            )
+        )
+        return checks
+
+    int8_param_ratio = (
+        float(audit.int8_initializer_bytes) / float(audit.total_initializer_bytes)
+        if audit.total_initializer_bytes > 0
+        else 0.0
+    )
+    quantized_compute_ratio = (
+        float(audit.quantized_compute_nodes) / float(audit.total_compute_nodes)
+        if audit.total_compute_nodes > 0
+        else 0.0
+    )
+
+    print("\n=== Quantization / NPU Audit ===")
+    print(
+        "- Initializers: total={}, int8={} | int8 bytes={}/{} ({:.1%})".format(
+            audit.total_initializers,
+            audit.int8_initializers,
+            audit.int8_initializer_bytes,
+            audit.total_initializer_bytes,
+            int8_param_ratio,
+        )
+    )
+    print(
+        "- Compute nodes (Conv/MatMul/Gemm family): total={}, estimated quantized={}, float-leaning={} | quantized ratio={:.1%}".format(
+            audit.total_compute_nodes,
+            audit.quantized_compute_nodes,
+            audit.float_compute_nodes,
+            quantized_compute_ratio,
+        )
+    )
+    print(
+        "- Quantization plumbing nodes (Q/DQ): {} | float pre/post nodes (Cast/Resize/NMS): {}".format(
+            audit.qdq_nodes, audit.prepost_float_nodes
+        )
+    )
+    print(f"- NPU advisory: {audit.advisory_level} | {audit.advisory_message}")
+    for reason in audit.reasons:
+        print(f"  {reason}")
+
+    checks.append(
+        CheckResult(
+            name="INT8 Initializer Byte Coverage",
+            passed=int8_param_ratio >= 0.70,
+            detail="int8_initializer_bytes_ratio={:.1%}".format(int8_param_ratio),
+            required=False,
+        )
+    )
+    if audit.total_compute_nodes > 0:
+        checks.append(
+            CheckResult(
+                name="Estimated Quantized Compute Coverage",
+                passed=quantized_compute_ratio >= 0.80,
+                detail="estimated_quantized_compute_ratio={:.1%}".format(quantized_compute_ratio),
+                required=False,
+            )
+        )
+    checks.append(
+        CheckResult(
+            name="NPU Offload Risk",
+            passed=audit.advisory_level not in {"LOW_NPU_OFFLOAD"},
+            detail=f"advisory_level={audit.advisory_level}",
+            required=False,
+        )
+    )
+
+    return checks
 
 
 def _select_runtime_provider(provider: str) -> list[str]:
@@ -638,7 +860,8 @@ def main() -> int:
     print(f"Model: {onnx_path}")
     print(f"Image: {image_path}")
 
-    checks, _ = _collect_graph_checks(onnx_path)
+    checks, graph_ctx = _collect_graph_checks(onnx_path)
+    precision_audit = graph_ctx.get("precision_audit")
 
     providers = _select_runtime_provider(args.provider)
     session = ort.InferenceSession(str(onnx_path), providers=providers if providers else None)
@@ -721,6 +944,7 @@ def main() -> int:
     print("\n=== Runtime Output Summary ===")
     for line in output_summary:
         print(f"- {line}")
+    checks.extend(_print_precision_audit(precision_audit))
     if times_ms:
         print("\n=== Single-Image Inference Timing ===")
         print(f"- Runs: warmup={max(0, int(args.warmup_runs))}, timed={len(times_ms)}")

@@ -187,7 +187,7 @@ def evaluate(session: ort.InferenceSession,
     """
     inp_name = session.get_inputs()[0].name
     # Expected output names from ONNX model with NMS appended
-    out_names_expected = ["det_boxes", "det_scores", "class_idx", "batch_idx"]
+    out_names_expected = ["detections"]
     actual_out_names = [o.name for o in session.get_outputs()]
     
     # Verify output names match
@@ -232,16 +232,14 @@ def evaluate(session: ort.InferenceSession,
         total_inference_time += (time.perf_counter() - start_time)
         num_images_processed += input_feed_np.shape[0]
 
-        # Unpack ONNX outputs (order matters, based on out_names_expected)
-        # These are for the *entire batch* after NMS.
-        # pred_boxes_nms_batch: [TotalNumDetsInBatch, 4] (XYXY at IMG_SIZE scale)
-        # pred_scores_nms_batch: [TotalNumDetsInBatch]
-        # pred_labels_contig_nms_batch: [TotalNumDetsInBatch] (contiguous 0..N-1)
-        # pred_batch_indices_nms: [TotalNumDetsInBatch] (indicates which image in batch each det belongs to)
-        pred_boxes_nms_batch = ort_outputs_list[actual_out_names.index("det_boxes")]
-        pred_scores_nms_batch = ort_outputs_list[actual_out_names.index("det_scores")]
-        pred_labels_contig_nms_batch = ort_outputs_list[actual_out_names.index("class_idx")]
-        pred_batch_indices_nms = ort_outputs_list[actual_out_names.index("batch_idx")]
+        # Unpack ONNX outputs (the [N, 7] detections tensor)
+        # detections: [N, 7] tensor with columns [x1, y1, x2, y2, score, class_id, batch_idx]
+        detections = ort_outputs_list[actual_out_names.index("detections")]
+        
+        pred_boxes_nms_batch = detections[:, 0:4]
+        pred_scores_nms_batch = detections[:, 4]
+        pred_labels_contig_nms_batch = detections[:, 5].astype(np.int64)
+        pred_batch_indices_nms = detections[:, 6].astype(np.int64)
 
 
         # Process each image in the batch

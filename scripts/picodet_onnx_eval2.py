@@ -210,17 +210,11 @@ def evaluate_onnx_model(onnx_model_path: str, coco_root_dir: str, batch_size: in
 
     # Define the expected output names (must match the ONNX model's actual output tensor names)
     # Based on your training script's append_nms_to_onnx and the previous error log.
-    # The ONNX model's outputs are:
-    # 1. Detected boxes: 'det_boxes'
-    # 2. Detected scores: 'det_scores'
-    # 3. Detected class indices (contiguous 0-79): 'class_idx'
-    # 4. Batch index for each detection: 'batch_idx'
+    # The ONNX model's output is:
+    # A single tensor [N, 7] where columns are [x1, y1, x2, y2, score, class_id, batch_idx]
     
     expected_output_node_names = {
-        "boxes": "det_boxes",
-        "scores": "det_scores",
-        "labels": "class_idx", # THIS IS THE CRUCIAL NAME
-        "batch_indices": "batch_idx"
+        "detections": "detections",
     }
     
     # Verify that the session's output names contain our expected names
@@ -242,25 +236,22 @@ def evaluate_onnx_model(onnx_model_path: str, coco_root_dir: str, batch_size: in
         # Create a dictionary mapping the session's output names to the numpy arrays
         output_map = {name: data for name, data in zip(output_names_from_session, raw_ort_outputs_list)}
 
-        det_boxes_batch = output_map[expected_output_node_names["boxes"]]    # (N_total_dets_in_batch, 4) XYXY
-        det_scores_batch = output_map[expected_output_node_names["scores"]]  # (N_total_dets_in_batch,)
-        cls_idx_batch = output_map[expected_output_node_names["labels"]]     # (N_total_dets_in_batch,) contiguous 0-79
-        batch_idx_onnx = output_map[expected_output_node_names["batch_indices"]] # (N_total_dets_in_batch,) image index in batch
+        detections = output_map[expected_output_node_names["detections"]]
+        # [x1, y1, x2, y2, score, class_id, batch_idx]
+        det_boxes_batch  = detections[:, 0:4]
+        det_scores_batch = detections[:, 4]
+        cls_idx_batch    = detections[:, 5].astype(np.int64)
+        batch_idx_onnx   = detections[:, 6].astype(np.int64)
 
         # debug
         if batch_idx == 0: # Only for the first batch
             print("\nDEBUG: First batch raw outputs from ONNX:")
-            print(f"  det_boxes_batch shape: {det_boxes_batch.shape}")
-            print(f"  det_scores_batch shape: {det_scores_batch.shape}")
-            print(f"  cls_idx_batch shape: {cls_idx_batch.shape}")
-            print(f"  batch_idx_onnx shape: {batch_idx_onnx.shape}")
+            print(f"  detections shape: {detections.shape}")
+            print(f"  Sample detections (first 5): \n{detections[:5]}")
         
             # Show some values if there are any detections in the batch
-            if det_scores_batch.shape[0] > 0:
-                print(f"  Sample det_scores_batch: {det_scores_batch[:20]}") # First 20 scores
-                print(f"  Min/Max scores: {np.min(det_scores_batch) if det_scores_batch.size > 0 else 'N/A'}, {np.max(det_scores_batch) if det_scores_batch.size > 0 else 'N/A'}")
-                print(f"  Sample cls_idx_batch: {cls_idx_batch[:20]}")
-                print(f"  Sample batch_idx_onnx: {batch_idx_onnx[:20]}")
+            if detections.shape[0] > 0:
+                print(f"  Min/Max scores: {np.min(det_scores_batch):.4f}, {np.max(det_scores_batch):.4f}")
                 # Find detections for the first image in the batch (i=0)
                 first_img_mask_debug = (batch_idx_onnx == 0)
                 print(f"  Detections for first image in batch (count: {np.sum(first_img_mask_debug)}):")
