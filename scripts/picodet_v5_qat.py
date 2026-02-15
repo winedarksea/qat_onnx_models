@@ -783,6 +783,8 @@ def train_epoch(
     ema: ModelEMA | None = None,
     require_anchor_inside_gt_for_cls: bool = True,
     anchor_inside_gt_margin: float = 0.0,
+    hard_neg_k: int = 0,  # Top-K hard negatives per image for extra cls penalty (0=disabled)
+    hard_neg_weight: float = 2.0,  # Extra weight multiplier on the top-K hard-negative anchors
 ):
     """
     Runs a single training epoch, refactored for batch-centric loss calculation
@@ -917,7 +919,9 @@ def train_epoch(
                         quality = iou_pred.clamp_min(quality_floor_vfl).pow(q_gamma)
                         batch_cls_targets[b_idx, pos_indices, gt_labels_assigned[pos_indices]] = quality
 
-        loss_normalizer = total_num_fg_batch if total_num_fg_batch > 0 else bs
+        # Use max(num_fg, bs) as normalizer floor to prevent gradient spikes
+        # in batches with many true-negative images and few foreground anchors.
+        loss_normalizer = max(total_num_fg_batch, bs)
 
         if use_focal_loss:
             loss_cls = tvops.sigmoid_focal_loss(
@@ -927,6 +931,29 @@ def train_epoch(
             vfl_calc = VarifocalLoss(alpha=alpha_loss, gamma=gamma_loss, 
                                      background_weight=background_weight, reduction='sum')
             loss_cls = vfl_calc(cls_p_batch, batch_cls_targets) / loss_normalizer
+
+        # --- Hard-negative mining: extra penalty on top-K highest-scoring bg anchors ---
+        if hard_neg_k > 0 and not use_focal_loss:
+            with torch.no_grad():
+                bg_mask = ~batch_fg_mask  # (bs, A) - all background anchors
+                bg_scores_max = cls_p_batch.detach().sigmoid().max(dim=-1).values  # (bs, A)
+                bg_scores_max = bg_scores_max.masked_fill(~bg_mask, -1.0)  # ignore fg
+            # Per-image top-K hard negatives
+            hard_neg_loss_accum = torch.tensor(0.0, device=device)
+            for b_idx in range(bs):
+                bg_scores_img = bg_scores_max[b_idx]
+                num_bg = bg_mask[b_idx].sum().item()
+                k = min(hard_neg_k, int(num_bg))
+                if k > 0:
+                    _, topk_indices = bg_scores_img.topk(k)
+                    hn_logits = cls_p_batch[b_idx, topk_indices]  # (K, NC)
+                    hn_targets = batch_cls_targets[b_idx, topk_indices]  # (K, NC) - all zeros
+                    hn_loss = F.binary_cross_entropy_with_logits(
+                        hn_logits, hn_targets, reduction='sum'
+                    )
+                    hard_neg_loss_accum = hard_neg_loss_accum + hn_loss
+            # Scale: extra weight beyond what VFL already contributes for these anchors
+            loss_cls = loss_cls + (hard_neg_weight - 1.0) * hard_neg_loss_accum / loss_normalizer
 
         if total_num_fg_batch > 0:
             reg_p_fg_batch = reg_p_batch[batch_fg_mask]
@@ -1283,6 +1310,83 @@ def quick_val_iou(
         final_accuracy = 0.0
 
     return final_mean_iou, final_accuracy, recall_cls, precision_cls
+
+@torch.no_grad()
+def sweep_nms_operating_point(
+    model: nn.Module,
+    loader,
+    device: torch.device,
+    head_ref: PicoDetHead,
+    *,
+    score_thresholds: List[float] | None = None,
+    nms_iou_thresholds: List[float] | None = None,
+    min_recall: float = 0.40,
+    class_agnostic_nms: bool = False,
+) -> dict:
+    """
+    Sweep score_thresh × nms_iou_thresh on validation data to find the
+    operating point that maximises precision subject to a recall floor.
+
+    Returns the best configuration dict with keys:
+        best_score_thresh, best_nms_iou, precision, recall, iou, accuracy
+    Also prints a full grid for manual inspection.
+    """
+    if score_thresholds is None:
+        score_thresholds = [0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.50]
+    if nms_iou_thresholds is None:
+        nms_iou_thresholds = [0.35, 0.40, 0.45, 0.50]
+
+    model.eval()
+    best = {'precision': -1.0}
+    results_grid = []
+
+    print(f"\n{'='*70}")
+    print(f"  NMS Operating Point Sweep (min_recall={min_recall:.2f})")
+    print(f"{'='*70}")
+    print(f"{'score_th':>10} {'nms_iou':>8} {'Recall':>8} {'Precision':>10} {'IoU':>8} {'Acc':>8}")
+    print(f"{'-'*10} {'-'*8} {'-'*8} {'-'*10} {'-'*8} {'-'*8}")
+
+    for nms_iou in nms_iou_thresholds:
+        for score_th in score_thresholds:
+            iou_val, acc_val, rec_val, pr_val = quick_val_iou(
+                model, loader, device,
+                score_thresh=score_th,
+                iou_thresh=nms_iou,
+                max_detections=head_ref.max_det,
+                epoch_num=-1,
+                run_name=f"sweep_s{score_th}_n{nms_iou}",
+                debug_prints=False,
+                class_agnostic_nms=class_agnostic_nms,
+            )
+            marker = ''
+            if rec_val >= min_recall and pr_val > best['precision']:
+                best = {
+                    'best_score_thresh': score_th,
+                    'best_nms_iou': nms_iou,
+                    'precision': pr_val,
+                    'recall': rec_val,
+                    'iou': iou_val,
+                    'accuracy': acc_val,
+                }
+                marker = ' <-- BEST'
+            print(f"{score_th:>10.2f} {nms_iou:>8.2f} {rec_val:>8.3f} {pr_val:>10.4f} {iou_val:>8.4f} {acc_val:>8.3f}{marker}")
+            results_grid.append({
+                'score_thresh': score_th, 'nms_iou': nms_iou,
+                'recall': rec_val, 'precision': pr_val,
+                'iou': iou_val, 'accuracy': acc_val,
+            })
+
+    print(f"{'='*70}")
+    if best['precision'] > 0:
+        print(f"  BEST: score_thresh={best['best_score_thresh']:.2f}, "
+              f"nms_iou={best['best_nms_iou']:.2f} → "
+              f"P={best['precision']:.4f}, R={best['recall']:.3f}, "
+              f"IoU={best['iou']:.4f}")
+    else:
+        print(f"  No configuration met min_recall={min_recall:.2f}")
+    print(f"{'='*70}\n")
+    return best
+
 
 @torch.no_grad()
 def run_epoch_validation(model: nn.Module, loader, device, epoch_num: int, head_ref: PicoDetHead, *, class_agnostic_nms: bool = False):
@@ -1856,6 +1960,12 @@ def main(argv: List[str] | None = None):
     pa.add_argument('--data_root', default='test')
     pa.add_argument('--ann', default='test/annotations/instances.json')
     pa.add_argument('--val_pct', type=float, default=0.05)
+    pa.add_argument('--cls_conv_depth', type=int, default=None,
+                    help="Override classification head conv depth (default: auto based on IMG_SIZE). Try 2 for faster/leaner models.")
+    pa.add_argument('--hard_neg_k', type=int, default=64,
+                    help="Top-K hard-negative background anchors per image for extra cls loss penalty (0=disabled).")
+    pa.add_argument('--hard_neg_weight', type=float, default=2.0,
+                    help="Extra weight multiplier applied to the hard-negative cls loss term.")
     cfg = pa.parse_args(argv)
 
     TRAIN_SUBSET = None
@@ -1887,6 +1997,10 @@ def main(argv: List[str] | None = None):
         lat_k = 5
         cls_conv_depth = 3
         # assigner ctr often needs to be larger with larger images as well
+    # CLI override for cls_conv_depth ablation
+    if cfg.cls_conv_depth is not None:
+        cls_conv_depth = cfg.cls_conv_depth
+        print(f"[INFO] cls_conv_depth overridden to {cls_conv_depth} via --cls_conv_depth")
     gamma_loss = 2.0
     alpha_loss = 0.75
     quality_floor_vfl = 0.04
@@ -2224,6 +2338,7 @@ def main(argv: List[str] | None = None):
                 quality_floor_vfl = quality_floor_vfl / 2
         else:
             use_focal_loss_for_epoch = use_focal_loss
+        # EPOCH SCHEDULE START
         if ep < 2:
             # Bootstrap phase: prioritize localization, many anchors per GT
             assigner.k = 12
@@ -2292,6 +2407,8 @@ def main(argv: List[str] | None = None):
             # assigner.r = 2.5
             # CLS_WEIGHT = 4.0
 
+        ### EPOCH SCHEDULE END
+
         model.train()
         l, diag = train_epoch(
             model, tr_loader, opt, scaler, assigner, dev, ep, coco_label_map,
@@ -2311,6 +2428,8 @@ def main(argv: List[str] | None = None):
             ema=ema,
             require_anchor_inside_gt_for_cls=not cfg.no_anchor_inside_gt_for_cls,
             anchor_inside_gt_margin=cfg.anchor_inside_gt_margin,
+            hard_neg_k=cfg.hard_neg_k,
+            hard_neg_weight=cfg.hard_neg_weight,
         )
         model.eval()
         try:
@@ -2380,6 +2499,22 @@ def main(argv: List[str] | None = None):
     except Exception as e:
         print(repr(e))
     
+    # --- Sweep NMS operating point for best precision at acceptable recall ---
+    best_op = {}
+    try:
+        print("[INFO] Running NMS operating-point sweep on FP32 model...")
+        best_op = sweep_nms_operating_point(
+            model, vl_loader, dev, model.head,
+            min_recall=0.35,
+            class_agnostic_nms=bool(cfg.class_agnostic_nms),
+        )
+        if best_op.get('precision', -1) > 0:
+            print(f"[INFO] Recommended ONNX export settings: "
+                f"score_thresh={best_op['best_score_thresh']:.2f}, "
+                f"nms_iou={best_op['best_nms_iou']:.2f}")
+    except Exception as e:
+        print(repr(e))
+
     # --- Export FP32 reference ONNX for comparison ---
     print("[INFO] Exporting FP32 reference ONNX models...")
     fp32_onnx_path, fp32_nms_path = save_fp32_onnx_reference(model, cfg)
@@ -2466,6 +2601,8 @@ def main(argv: List[str] | None = None):
             ema=ema_qat,
             require_anchor_inside_gt_for_cls=not cfg.no_anchor_inside_gt_for_cls,
             anchor_inside_gt_margin=cfg.anchor_inside_gt_margin,
+            hard_neg_k=cfg.hard_neg_k,
+            hard_neg_weight=cfg.hard_neg_weight,
         )
         scheduler_q.step() # Step the QAT LR scheduler
 
@@ -2636,6 +2773,26 @@ def main(argv: List[str] | None = None):
     # Optimize the final model (with NMS)
     final_optimized_path = out_dest.replace(".onnx", "_optimized.onnx")
     optimize_onnx_with_ort(out_dest, final_optimized_path)
+
+    # ---------------- Export secondary ONNX based on NMS sweep ------------------
+    if best_op and best_op.get('precision', -1) > 0:
+        s_th = best_op['best_score_thresh']
+        i_th = best_op['best_nms_iou']
+        m_det = int(model.head.max_det)
+        
+        # Use a naming convention similar to the one being replaced
+        sweep_out_name = f'picodet_v5_int8_{str(s_th).replace(".", "_")}_{str(i_th).replace(".", "_")}_{m_det}.onnx'
+        print(f"[INFO] Exporting secondary sweep-optimized ONNX: {sweep_out_name}")
+        append_nms_to_onnx(
+            in_path=temp_onnx_path,
+            out_path=sweep_out_name,
+            score_thresh=float(s_th),
+            iou_thresh=float(i_th),
+            max_det=m_det,
+            onnx_input_name="images_uint8",
+            internal_h=internal_h,
+            internal_w=internal_w,
+        )
     
     return training_history
 
@@ -2789,20 +2946,6 @@ if __name__ == '__main__':
     plot_training_history(final_history, title="PicoDet Training Progress")
     plot_assignment_history(final_history, title="Assignment Diagnostics")
 
-    temp_onnx_path = "picodet_v5_int8_temp_no_nms.onnx"
-
-    score_th = 0.5
-    iou_th = 0.3
-    max_det = 100
-    out_dest = f'picodet_v5_int8_{str(score_th).replace(".", "_")}_{str(iou_th).replace(".", "_")}_{max_det}.onnx'
-    append_nms_to_onnx(
-        in_path=temp_onnx_path,
-        out_path=out_dest,
-        score_thresh=float(score_th), # 0.05
-        iou_thresh=float(iou_th),  # 0.6
-        max_det=max_det,  # 100
-    )
-
 """
 Next steps to try:
 Using FusedInvertedBottleneck and RepConv1x1 more frequently in the architecture
@@ -2819,4 +2962,64 @@ Investigate:
     dynamic_k_scale down to 1.1 or 1.0 or even 0.9
     simota_cls_cost_weight around 2.0-2.6, and add mild --simota_cls_cost_iou_power 0.1
 Deeper architecture upgrade worth testing: add a P2 (stride-4) level
+Replacing GhostConv in cls head
+
+Faster runtime:
+    k_value=300 or 200 in pre-nms
+    Neck channels down to smaller, ie 48 or 64 or 80 instead of 96
+    Reduce cls_conv_depth from 3 to 2 (1 for small class models), head_reg_max from 9 to 7 or even 5
+    Remove ESE (Effective Squeeze-Excitation)
+
+
+Suggested alternative epoch schedule:
+```python
+        # ── Smooth schedule ramps (replaces brittle per-epoch elif ladder) ──
+        # t ∈ [0, 1] is normalized training progress
+        t = ep / max(fp32_epochs - 1, 1)
+
+        # CLS_WEIGHT: ramp 0.5 → cfg target over first 40% of training
+        CLS_WEIGHT = 0.5 + (cfg.simota_cls_cost_weight - 0.5) * min(t / 0.4, 1.0)
+
+        # IOU_WEIGHT: hold at 4.0 for first 50%, then ease to 2.5
+        IOU_WEIGHT = 4.0 if t < 0.5 else 4.0 - 1.5 * ((t - 0.5) / 0.5)
+
+        # assigner.r: ramp from 5.25 → cfg.simota_ctr over full training
+        assigner.r = 5.25 - (5.25 - cfg.simota_ctr) * t
+
+        # assigner.k: start 12, step down to 10 at 20%, then to cfg.simota_topk at 60%
+        if t < 0.2:
+            assigner.k = 12
+        elif t < 0.6:
+            assigner.k = 10
+        else:
+            assigner.k = cfg.simota_topk
+
+        # assigner.dynamic_k_min: 5 → 3 → cfg target
+        if t < 0.1:
+            assigner.dynamic_k_min = 5
+        elif t < 0.25:
+            assigner.dynamic_k_min = 3
+        else:
+            assigner.dynamic_k_min = cfg.simota_dynamic_k_min
+
+        # assigner.cls_cost_weight: ramp 0.5 → cfg target over first 40%
+        assigner.cls_cost_weight = 0.5 + (cfg.simota_cls_cost_weight - 0.5) * min(t / 0.4, 1.0)
+
+        # q_gamma: ramp after focal warmup ends
+        if not use_focal_loss_for_epoch and t > 0.5:
+            q_gamma = max(q_gamma, float(cfg.vfl_q_gamma_after_warmup))
+
+        # quality_floor_vfl: lower in second half for sharper targets
+        if t > 0.6:
+            quality_floor_vfl = 0.02
+
+        # assigner.min_iou_threshold: gently tighten in second half
+        if t > 0.65:
+            assigner.min_iou_threshold = max(cfg.simota_min_iou_threshold, 0.06)
+
+        if debug_prints and ep % max(1, fp32_epochs // 10) == 0:
+            print(f"[Schedule] ep={ep} t={t:.2f} | CLS_W={CLS_WEIGHT:.2f} IOU_W={IOU_WEIGHT:.2f} "
+                  f"r={assigner.r:.2f} k={assigner.k} dk_min={assigner.dynamic_k_min} "
+                  f"cls_cost_w={assigner.cls_cost_weight:.2f} q_gamma={q_gamma:.2f}")
+```
 """
