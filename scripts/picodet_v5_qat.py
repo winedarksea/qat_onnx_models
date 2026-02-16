@@ -785,6 +785,7 @@ def train_epoch(
     anchor_inside_gt_margin: float = 0.0,
     hard_neg_k: int = 0,  # Top-K hard negatives per image for extra cls penalty (0=disabled)
     hard_neg_weight: float = 2.0,  # Extra weight multiplier on the top-K hard-negative anchors
+    hard_neg_iou_cap: float = 0.3,  # Only penalise bg anchors whose max IoU with any GT < this
 ):
     """
     Runs a single training epoch, refactored for batch-centric loss calculation
@@ -854,11 +855,19 @@ def train_epoch(
         batch_box_targets = torch.zeros(bs, reg_p_batch.shape[1], 4, device=device)
         batch_fg_mask = torch.zeros_like(cls_p_batch[..., 0], dtype=torch.bool)
         total_num_fg_batch = 0
+        # Per-anchor max IoU with any GT in the image (used by hard-neg filter)
+        anchor_max_iou_with_gt = torch.zeros(bs, cls_p_batch.shape[1], device=device)
 
         for b_idx in range(bs):
             tgt_i = tgts_batch[b_idx]
             gt_boxes_img = tgt_i["boxes"].to(dtype=torch.float32, device=device)
             gt_labels_img = tgt_i["labels"].to(device=device)
+
+            # Compute max IoU of every anchor with any GT (for hard-neg filtering)
+            if hard_neg_k > 0 and gt_boxes_img.numel() > 0:
+                with torch.no_grad():
+                    iou_all = tvops.box_iou(ap_xyxy[b_idx], gt_boxes_img)  # (A, num_gt)
+                    anchor_max_iou_with_gt[b_idx] = iou_all.max(dim=1).values
 
             fg_mask_img, gt_labels_assigned, gt_boxes_assigned, iou_out_img = assigner(
                 fmap_shapes, device, {'boxes': gt_boxes_img, 'labels': gt_labels_img},
@@ -933,17 +942,21 @@ def train_epoch(
             loss_cls = vfl_calc(cls_p_batch, batch_cls_targets) / loss_normalizer
 
         # --- Hard-negative mining: extra penalty on top-K highest-scoring bg anchors ---
+        # Only penalises anchors whose max IoU with any GT < hard_neg_iou_cap,
+        # avoiding contradictory loss on near-miss anchors that overlap real objects.
         if hard_neg_k > 0 and not use_focal_loss:
             with torch.no_grad():
                 bg_mask = ~batch_fg_mask  # (bs, A) - all background anchors
+                # Exclude near-miss anchors: keep only true background
+                true_bg_mask = bg_mask & (anchor_max_iou_with_gt < hard_neg_iou_cap)
                 bg_scores_max = cls_p_batch.detach().sigmoid().max(dim=-1).values  # (bs, A)
-                bg_scores_max = bg_scores_max.masked_fill(~bg_mask, -1.0)  # ignore fg
+                bg_scores_max = bg_scores_max.masked_fill(~true_bg_mask, -1.0)  # ignore fg + near-misses
             # Per-image top-K hard negatives
             hard_neg_loss_accum = torch.tensor(0.0, device=device)
             for b_idx in range(bs):
                 bg_scores_img = bg_scores_max[b_idx]
-                num_bg = bg_mask[b_idx].sum().item()
-                k = min(hard_neg_k, int(num_bg))
+                num_eligible = true_bg_mask[b_idx].sum().item()
+                k = min(hard_neg_k, int(num_eligible))
                 if k > 0:
                     _, topk_indices = bg_scores_img.topk(k)
                     hn_logits = cls_p_batch[b_idx, topk_indices]  # (K, NC)
@@ -1962,8 +1975,9 @@ def main(argv: List[str] | None = None):
     pa.add_argument('--val_pct', type=float, default=0.05)
     pa.add_argument('--cls_conv_depth', type=int, default=None,
                     help="Override classification head conv depth (default: auto based on IMG_SIZE). Try 2 for faster/leaner models.")
-    pa.add_argument('--hard_neg_k', type=int, default=64,
-                    help="Top-K hard-negative background anchors per image for extra cls loss penalty (0=disabled).")
+    pa.add_argument('--hard_neg_k', type=int, default=8,
+                    help="Top-K hard-negative background anchors per image for extra cls loss penalty (0=disabled). "
+                         "WARNING: values above ~8 can suppress all class scores and destroy recall. Try 4-8 if enabling.")
     pa.add_argument('--hard_neg_weight', type=float, default=2.0,
                     help="Extra weight multiplier applied to the hard-negative cls loss term.")
     cfg = pa.parse_args(argv)
@@ -2408,6 +2422,10 @@ def main(argv: List[str] | None = None):
             # CLS_WEIGHT = 4.0
 
         ### EPOCH SCHEDULE END
+        # Only enable hard-negative mining in the final 30% of training
+        current_hard_neg_k = 0
+        if ep > (cfg.epochs * 0.7):
+            current_hard_neg_k = cfg.hard_neg_k  # e.g., 8
 
         model.train()
         l, diag = train_epoch(
@@ -2428,7 +2446,7 @@ def main(argv: List[str] | None = None):
             ema=ema,
             require_anchor_inside_gt_for_cls=not cfg.no_anchor_inside_gt_for_cls,
             anchor_inside_gt_margin=cfg.anchor_inside_gt_margin,
-            hard_neg_k=cfg.hard_neg_k,
+            hard_neg_k=current_hard_neg_k,
             hard_neg_weight=cfg.hard_neg_weight,
         )
         model.eval()
@@ -2601,7 +2619,7 @@ def main(argv: List[str] | None = None):
             ema=ema_qat,
             require_anchor_inside_gt_for_cls=not cfg.no_anchor_inside_gt_for_cls,
             anchor_inside_gt_margin=cfg.anchor_inside_gt_margin,
-            hard_neg_k=cfg.hard_neg_k,
+            hard_neg_k=current_hard_neg_k,
             hard_neg_weight=cfg.hard_neg_weight,
         )
         scheduler_q.step() # Step the QAT LR scheduler
