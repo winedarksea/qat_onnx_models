@@ -928,9 +928,8 @@ def train_epoch(
                         quality = iou_pred.clamp_min(quality_floor_vfl).pow(q_gamma)
                         batch_cls_targets[b_idx, pos_indices, gt_labels_assigned[pos_indices]] = quality
 
-        # Use max(num_fg, bs) as normalizer floor to prevent gradient spikes
-        # in batches with many true-negative images and few foreground anchors.
-        loss_normalizer = max(total_num_fg_batch, bs)
+        loss_normalizer = total_num_fg_batch if total_num_fg_batch > 0 else bs
+        # alternative: loss_normalizer = max(total_num_fg_batch, 1.0) has been suggested here, but I am skeptical
 
         if use_focal_loss:
             loss_cls = tvops.sigmoid_focal_loss(
@@ -961,8 +960,16 @@ def train_epoch(
                     _, topk_indices = bg_scores_img.topk(k)
                     hn_logits = cls_p_batch[b_idx, topk_indices]  # (K, NC)
                     hn_targets = batch_cls_targets[b_idx, topk_indices]  # (K, NC) - all zeros
+                    
+                    # For consistency, use the same VFL/Focal weighting logic as the main loss.
+                    # Adding a raw BCE penalty on top of VFL is many orders of magnitude stronger
+                    # than the main loss and likely to destroy recall.
+                    with torch.no_grad():
+                        hn_p = hn_logits.sigmoid()
+                        hn_weight = alpha_loss * hn_p.pow(gamma_loss)
+                    
                     hn_loss = F.binary_cross_entropy_with_logits(
-                        hn_logits, hn_targets, reduction='sum'
+                        hn_logits, hn_targets, weight=hn_weight, reduction='sum'
                     )
                     hard_neg_loss_accum = hard_neg_loss_accum + hn_loss
             # Scale: extra weight beyond what VFL already contributes for these anchors
@@ -1975,10 +1982,10 @@ def main(argv: List[str] | None = None):
     pa.add_argument('--val_pct', type=float, default=0.05)
     pa.add_argument('--cls_conv_depth', type=int, default=None,
                     help="Override classification head conv depth (default: auto based on IMG_SIZE). Try 2 for faster/leaner models.")
-    pa.add_argument('--hard_neg_k', type=int, default=8,
+    pa.add_argument('--hard_neg_k', type=int, default=4,
                     help="Top-K hard-negative background anchors per image for extra cls loss penalty (0=disabled). "
                          "WARNING: values above ~8 can suppress all class scores and destroy recall. Try 4-8 if enabling.")
-    pa.add_argument('--hard_neg_weight', type=float, default=2.0,
+    pa.add_argument('--hard_neg_weight', type=float, default=1.1,
                     help="Extra weight multiplier applied to the hard-negative cls loss term.")
     cfg = pa.parse_args(argv)
 
@@ -2397,9 +2404,8 @@ def main(argv: List[str] | None = None):
             pass
             # assigner.power = 0.4  # this if uncommented makes it worse
         elif ep == 22:
-            # quality_floor_vfl = 0.005
-            # assigner.cls_cost_weight = 3.5
-            assigner.power = 0.1
+            pass
+            # assigner.power = 0.1
             # q_gamma = max(q_gamma, float(cfg.vfl_q_gamma_refine))
             # assigner.dynamic_k_min = 1
         elif ep == 55:
@@ -2407,7 +2413,7 @@ def main(argv: List[str] | None = None):
             # q_gamma = 0.8
         elif ep == 60:
             pass
-            # assigner.r = 3.0
+            # background_weight = 1.2
         elif ep == 65 and assigner.mean_fg_iou > 0.45:
             pass
             # assigner.power = 0.2
