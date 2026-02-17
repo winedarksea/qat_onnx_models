@@ -1354,7 +1354,7 @@ def sweep_nms_operating_point(
     if score_thresholds is None:
         score_thresholds = [0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.50]
     if nms_iou_thresholds is None:
-        nms_iou_thresholds = [0.35, 0.40, 0.45, 0.50]
+        nms_iou_thresholds = [0.35, 0.40, 0.45, 0.50, 0.55, 0.60]
 
     model.eval()
     best = {'precision': -1.0}
@@ -1970,7 +1970,7 @@ def main(argv: List[str] | None = None):
     pa.add_argument('--simota_ctr', type=float, default=4.0)
     pa.add_argument('--simota_topk', type=int, default=10)
     pa.add_argument('--simota_dynamic_k_min', type=int, default=1)
-    pa.add_argument('--simota_dynamic_k_scale', type=float, default=1.2,
+    pa.add_argument('--simota_dynamic_k_scale', type=float, default=1.0,
                     help="Scale factor applied to SimOTA dynamic_k (1.0=baseline ceil(iou_sum)).")
     pa.add_argument('--simota_min_iou_threshold', type=float, default=0.05)
     pa.add_argument('--simota_cls_cost_weight', type=float, default=2.5)
@@ -2371,7 +2371,7 @@ def main(argv: List[str] | None = None):
         elif ep < 4:
             # Gentle warmup of classification influence
             assigner.cls_cost_weight = 1.0
-            CLS_WEIGHT = 1.0
+            CLS_WEIGHT = 1.2
         elif ep < 6:
             # Begin tightening anchor selection
             assigner.dynamic_k_min = 4
