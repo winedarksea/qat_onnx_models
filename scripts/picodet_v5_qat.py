@@ -2404,7 +2404,7 @@ def main(argv: List[str] | None = None):
             pass
             # assigner.power = 0.4  # this if uncommented makes it worse
         elif ep == 22:
-            pass
+            assigner.cls_cost_weight = 1.6  # ramp back down a bit
             # assigner.power = 0.1
             # q_gamma = max(q_gamma, float(cfg.vfl_q_gamma_refine))
             # assigner.dynamic_k_min = 1
