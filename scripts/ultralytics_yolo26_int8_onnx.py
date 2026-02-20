@@ -66,6 +66,15 @@ def _ensure_dir(p: Path) -> None:
     p.mkdir(parents=True, exist_ok=True)
 
 
+def build_label_map_and_names_from_ann(ann_path: Path):
+    with open(ann_path, 'r') as f:
+        d = json.load(f)
+    cats = sorted(d['categories'], key=lambda c: c['id'])
+    catid2contig = {c['id']: i for i, c in enumerate(cats)}
+    id2name = {i: c['name'] for i, c in enumerate(cats)}
+    return catid2contig, id2name
+
+
 def _safe_symlink_dir(src: Path, dst: Path) -> None:
     """
     Create dst as a symlink to src. Falls back to copying the directory if symlinks are unavailable.
@@ -327,6 +336,204 @@ def prepare_coco2017_yolo_dataset(
 
     meta_path.write_text(json.dumps(meta, indent=2, ensure_ascii=False) + "\n")
     log.info("Wrote dataset meta: %s", meta_path)
+    return data_yaml
+
+
+def prepare_custom_yolo_dataset(
+    *,
+    data_root: Path,
+    ann_path: Path,
+    out_root: Path,
+    imgsz: int,
+    min_box_size: int,
+    val_pct: float,
+    write_empty_labels: bool,
+    drop_became_empty: bool,
+    letterbox_filter: bool,
+    seed: int,
+    force: bool = False,
+) -> Path:
+    """
+    Prepare a custom dataset (non-COCO) for Ultralytics YOLO.
+    Performs random split and (optional) class-balanced oversampling if desired.
+    """
+    out_root = out_root.absolute()
+    data_root = data_root.absolute()
+    ann_path = ann_path.absolute()
+
+    catid2contig, id2name = build_label_map_and_names_from_ann(ann_path)
+    num_classes = len(id2name)
+
+    meta = {
+        "data_root": data_root.as_posix(),
+        "ann_path": ann_path.as_posix(),
+        "imgsz": int(imgsz),
+        "min_box_size": int(min_box_size),
+        "val_pct": float(val_pct),
+        "num_classes": num_classes,
+        "class_names": [id2name[i] for i in range(num_classes)],
+    }
+
+    data_yaml_existing = out_root / "data.yaml"
+    if not force and data_yaml_existing.exists() and (out_root / "dataset_meta.json").exists():
+        try:
+            existing = json.loads((out_root / "dataset_meta.json").read_text())
+        except Exception:
+            existing = None
+        if existing == meta:
+            log.info("Custom dataset already prepared. Reusing: %s", data_yaml_existing)
+            return data_yaml_existing
+
+    log.info("Preparing custom dataset at %s ...", out_root)
+    _ensure_dir(out_root)
+    _ensure_dir(out_root / "images")
+    _ensure_dir(out_root / "labels")
+    _ensure_dir(out_root / "labels" / "train")
+    _ensure_dir(out_root / "labels" / "val")
+
+    with ann_path.open("r") as f:
+        d = json.load(f)
+
+    images = d.get("images", [])
+    annotations = d.get("annotations", [])
+    img_by_id = {int(im["id"]): im for im in images}
+    ann_by_img = {}
+    for a in annotations:
+        if a.get("iscrowd", 0):
+            continue
+        img_id = int(a["image_id"])
+        ann_by_img.setdefault(img_id, []).append(a)
+
+    all_ids = sorted(img_by_id.keys())
+    random.seed(seed)
+    random.shuffle(all_ids)
+    
+    val_n = max(1, int(val_pct * len(all_ids)))
+    val_ids = set(all_ids[:val_n])
+    train_ids = all_ids[val_n:]
+
+    filter_cfg = FilterConfig(imgsz=imgsz, min_box_size=min_box_size, letterbox=letterbox_filter)
+
+    def process_split(ids: list[int] | set[int], split: str) -> list[str]:
+        log.info("Processing split '%s' (%d images) ...", split, len(ids))
+        list_lines = []
+        
+        # Track samples per class for possible oversampling
+        sample_weights = []
+        temp_list = []
+        
+        for img_id in sorted(list(ids)):
+            im = img_by_id[img_id]
+            file_name = im["file_name"]
+            w, h = int(im["width"]), int(im["height"])
+            
+            yolo_lines = []
+            anns = ann_by_img.get(img_id, [])
+            primary_cls = -1
+            if anns:
+                # Use the first valid annotation's class as the primary class for balancing (matching picodet behavior)
+                cid = int(anns[0]["category_id"])
+                if cid in catid2contig:
+                    primary_cls = catid2contig[cid]
+
+            for a in anns:
+                cid = int(a["category_id"])
+                if cid not in catid2contig: continue
+                cls = catid2contig[cid]
+                box = _filter_and_convert_coco_box_to_yolo(a["bbox"], img_w=w, img_h=h, cfg=filter_cfg)
+                if box is None: continue
+                cx, cy, bw, bh = box
+                yolo_lines.append(f"{cls} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}")
+
+            out_txt = out_root / "labels" / split / (Path(file_name).with_suffix(".txt").name)
+            
+            # Decide if we keep this image
+            is_empty = (len(yolo_lines) == 0)
+            originally_had_boxes = (len(anns) > 0)
+            became_empty = originally_had_boxes and is_empty
+            
+            keep = True
+            if became_empty and drop_became_empty:
+                keep = False
+
+            if keep:
+                img_src = data_root / "images" / file_name
+                img_dst = out_root / "images" / split / file_name
+                img_dst.parent.mkdir(parents=True, exist_ok=True)
+                if not img_dst.exists():
+                    try:
+                        img_dst.symlink_to(img_src)
+                    except:
+                        shutil.copy2(img_src, img_dst)
+
+                if yolo_lines:
+                    out_txt.write_text("\n".join(yolo_lines) + "\n")
+                elif write_empty_labels:
+                    out_txt.write_text("")
+                
+                img_path = img_dst.absolute().as_posix()
+                temp_list.append((img_path, primary_cls))
+
+        if split == "train" and num_classes == 3:
+            log.info("Applying class-balanced oversampling (target 3:1:1) ...")
+            # Following picodet_v5_qat: target weights {0: 3.0, 1: 1.0, 2: 1.0}
+            target_weights = {0: 3.0, 1: 1.0, 2: 1.0}
+            class_counts = {c: 0 for c in range(3)}
+            for _, cls in temp_list:
+                if cls >= 0:
+                    class_counts[cls] += 1
+            
+            # Calculate weight per class: weight = target / count
+            weights_per_class = {}
+            for c in range(3):
+                if class_counts[c] > 0:
+                    weights_per_class[c] = target_weights[c] / class_counts[c]
+                else:
+                    weights_per_class[c] = 0.0
+            
+            # Calculate image weights
+            img_weights = []
+            for _, cls in temp_list:
+                if cls >= 0:
+                    img_weights.append(weights_per_class[cls])
+                else:
+                    img_weights.append(min(weights_per_class.values()) if weights_per_class else 1.0)
+            
+            # Resample with replacement to keep the original training set size
+            total_weight = sum(img_weights)
+            if total_weight > 0:
+                img_probs = [w / total_weight for w in img_weights]
+                # Use random.choices for weighted sampling with replacement
+                # This approximates the WeightedRandomSampler behavior
+                indices = random.choices(range(len(temp_list)), weights=img_probs, k=len(temp_list))
+                list_lines = [temp_list[i][0] for i in indices]
+            else:
+                list_lines = [x[0] for x in temp_list]
+        else:
+            list_lines = [x[0] for x in temp_list]
+            
+        return list_lines
+
+    train_list = process_split(train_ids, "train")
+    val_list = process_split(val_ids, "val")
+
+    (out_root / "train.txt").write_text("\n".join(train_list) + "\n")
+    (out_root / "val.txt").write_text("\n".join(val_list) + "\n")
+
+    yaml_lines = [
+        f"path: {out_root.as_posix()}",
+        "train: train.txt",
+        "val: val.txt",
+        "names:",
+    ]
+    for i in range(num_classes):
+        yaml_lines.append(f"  {i}: {id2name[i]}")
+    
+    data_yaml = out_root / "data.yaml"
+    data_yaml.write_text("\n".join(yaml_lines) + "\n")
+    (out_root / "dataset_meta.json").write_text(json.dumps(meta, indent=2) + "\n")
+    
+    log.info("Custom dataset preparation complete: %s", data_yaml)
     return data_yaml
 
 
@@ -802,6 +1009,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Train Ultralytics YOLO26n on COCO (filtered small boxes) and export INT8 ONNX."
     )
+    p.add_argument("--no_coco", action="store_false", dest="use_coco", default=True,
+                   help="Use custom dataset source instead of COCO 2017.")
+    p.add_argument("--data_root", type=Path, default=Path("test"), help="Root for custom dataset (non-COCO).")
+    p.add_argument("--ann", type=Path, default=Path("test/annotations/instances.json"), help="Annotation JSON for custom dataset.")
+    p.add_argument("--val_pct", type=float, default=0.05, help="Validation percentage for custom dataset split.")
     p.add_argument("--coco_root", type=Path, default=Path("coco"), help="COCO root with train2017/val2017/annotations/")
     p.add_argument("--imgsz", type=int, default=320, help="Square train/export size. Recommended multiple of 32.")
     p.add_argument("--min_box_size", type=int, default=8, help="Drop GT boxes smaller than this after resize to imgsz.")
@@ -999,17 +1211,33 @@ def main(argv: list[str]) -> int:
     args.project = str(Path(args.project).resolve())
     log.info("Using project directory: %s", args.project)
 
-    data_yaml = prepare_coco2017_yolo_dataset(
-        coco_root=args.coco_root,
-        out_root=args.dataset_out,
-        imgsz=args.imgsz,
-        min_box_size=args.min_box_size,
-        write_empty_labels=args.write_empty_labels,
-        drop_became_empty=args.drop_became_empty,
-        letterbox_filter=args.letterbox_filter,
-        seed=args.seed,
-        force=args.force_dataset_prep,
-    )
+    if args.use_coco:
+        data_yaml = prepare_coco2017_yolo_dataset(
+            coco_root=args.coco_root,
+            out_root=args.dataset_out,
+            imgsz=args.imgsz,
+            min_box_size=args.min_box_size,
+            write_empty_labels=args.write_empty_labels,
+            drop_became_empty=args.drop_became_empty,
+            letterbox_filter=args.letterbox_filter,
+            seed=args.seed,
+            force=args.force_dataset_prep,
+        )
+    else:
+        # Use custom dataset source (matching picodet_v5_qat behavior)
+        data_yaml = prepare_custom_yolo_dataset(
+            data_root=args.data_root,
+            ann_path=args.ann,
+            out_root=args.dataset_out,
+            imgsz=args.imgsz,
+            min_box_size=args.min_box_size,
+            val_pct=args.val_pct,
+            write_empty_labels=args.write_empty_labels,
+            drop_became_empty=args.drop_became_empty,
+            letterbox_filter=args.letterbox_filter,
+            seed=args.seed,
+            force=args.force_dataset_prep,
+        )
 
     if args.skip_train:
         if args.weights_pt is None:
