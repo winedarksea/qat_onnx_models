@@ -469,7 +469,7 @@ class SimOTACache:
         print(f"  Assignment Switch Rate: {switch_rate:.2f}% (Rate classification cost changed the assignment from IoU)")
         if switch_rate < 2:
             print("  May need to increase cls_cost_weight")
-        elif switch_rate > 20:
+        elif switch_rate > 25:
             print("  May need to decrease cls_cost_weight")
         print("─" * 40 + "\n")
     
@@ -940,39 +940,33 @@ def train_epoch(
                                      background_weight=background_weight, reduction='sum')
             loss_cls = vfl_calc(cls_p_batch, batch_cls_targets) / loss_normalizer
 
-        # --- Hard-negative mining: extra penalty on top-K highest-scoring bg anchors ---
-        # Only penalises anchors whose max IoU with any GT < hard_neg_iou_cap,
-        # avoiding contradictory loss on near-miss anchors that overlap real objects.
+        # --- Hard-negative mining: extra penalty on top-K highest-scoring suppressed activations ---
+        # This catches both (1) high scores on pure background anchors and
+        # (2) "secondary" incorrect labels on anchors assigned to a different class.
         if hard_neg_k > 0 and not use_focal_loss:
             with torch.no_grad():
-                bg_mask = ~batch_fg_mask  # (bs, A) - all background anchors
-                # Exclude near-miss anchors: keep only true background
-                true_bg_mask = bg_mask & (anchor_max_iou_with_gt < hard_neg_iou_cap)
-                bg_scores_max = cls_p_batch.detach().sigmoid().max(dim=-1).values  # (bs, A)
-                bg_scores_max = bg_scores_max.masked_fill(~true_bg_mask, -1.0)  # ignore fg + near-misses
-            # Per-image top-K hard negatives
+                # Identify EVERY (anchor, class) pair where the target is 0.
+                suppress_mask = (batch_cls_targets < 1e-4) # (bs, A, NC)
+                iou_safety_mask = (anchor_max_iou_with_gt < hard_neg_iou_cap).unsqueeze(-1) # (bs, A, 1)
+                eligible_mask = suppress_mask & (batch_fg_mask.unsqueeze(-1) | iou_safety_mask)
+                scores_to_mine = cls_p_batch.detach().sigmoid()
+                scores_to_mine = scores_to_mine.masked_fill(~eligible_mask, -1.0)
+                
             hard_neg_loss_accum = torch.tensor(0.0, device=device)
             for b_idx in range(bs):
-                bg_scores_img = bg_scores_max[b_idx]
-                num_eligible = true_bg_mask[b_idx].sum().item()
-                k = min(hard_neg_k, int(num_eligible))
+                scores_img = scores_to_mine[b_idx].view(-1)
+                num_eligible = int((eligible_mask[b_idx]).sum())
+                k = min(hard_neg_k, num_eligible)
                 if k > 0:
-                    _, topk_indices = bg_scores_img.topk(k)
-                    hn_logits = cls_p_batch[b_idx, topk_indices]  # (K, NC)
-                    hn_targets = batch_cls_targets[b_idx, topk_indices]  # (K, NC) - all zeros
-                    
-                    # For consistency, use the same VFL/Focal weighting logic as the main loss.
-                    # Adding a raw BCE penalty on top of VFL is many orders of magnitude stronger
-                    # than the main loss and likely to destroy recall.
+                    _, topk_indices = scores_img.topk(k)
+                    hn_logits = cls_p_batch[b_idx].view(-1)[topk_indices]
+                    hn_targets = batch_cls_targets[b_idx].view(-1)[topk_indices]
                     with torch.no_grad():
                         hn_p = hn_logits.sigmoid()
                         hn_weight = alpha_loss * hn_p.pow(gamma_loss)
-                    
-                    hn_loss = F.binary_cross_entropy_with_logits(
-                        hn_logits, hn_targets, weight=hn_weight, reduction='sum'
-                    )
+                    hn_loss = F.binary_cross_entropy_with_logits(hn_logits, hn_targets, weight=hn_weight, reduction='sum')
                     hard_neg_loss_accum = hard_neg_loss_accum + hn_loss
-            # Scale: extra weight beyond what VFL already contributes for these anchors
+            # Scale extra weight
             loss_cls = loss_cls + (hard_neg_weight - 1.0) * hard_neg_loss_accum / loss_normalizer
 
         if total_num_fg_batch > 0:
@@ -1987,6 +1981,10 @@ def main(argv: List[str] | None = None):
                          "WARNING: values above ~8 can suppress all class scores and destroy recall. Try 4-8 if enabling.")
     pa.add_argument('--hard_neg_weight', type=float, default=1.1,
                     help="Extra weight multiplier applied to the hard-negative cls loss term.")
+    pa.add_argument('--use_ghost_cls', action='store_true', default=False,
+                    help="Enable GhostConv in the classification head (lighter but potentially less discriminative).")
+    pa.add_argument('--no_spatial_attention', action='store_true', default=False,
+                    help="Disable SpatialAttention module (saves latency on some NPUs).")
     cfg = pa.parse_args(argv)
 
     TRAIN_SUBSET = None
@@ -2119,8 +2117,12 @@ def main(argv: List[str] | None = None):
         reg_conv_depth=reg_conv_depth,
         cls_conv_depth=cls_conv_depth,
         lat_k=lat_k,
-        inplace_act_for_head_neck=not cfg.no_inplace_head_neck # Control from arg
+        inplace_act_for_head_neck=not cfg.no_inplace_head_neck, # Control from arg
+        use_ghost_cls=bool(cfg.use_ghost_cls),
+        use_spatial_attention=not cfg.no_spatial_attention
     ).to(dev)
+    print(f"[INFO] Architecture: GhostConv in head={'ON' if cfg.use_ghost_cls else 'OFF'}, "
+          f"SpatialAttention={'OFF' if cfg.no_spatial_attention else 'ON'}")
     if hasattr(model, "head") and hasattr(model.head, "max_det"):
         model.head.max_det = int(cfg.head_max_det)
     
@@ -2463,6 +2465,7 @@ def main(argv: List[str] | None = None):
                 class_agnostic_nms=bool(cfg.class_agnostic_nms),
             )
             epoch_metrics['train_loss'] = l if l is not None else -1.0
+            epoch_metrics['is_qat'] = False
             epoch_metrics.update(diag)
             training_history[ep + 1] = epoch_metrics
             current_lr = opt.param_groups[0]['lr']
@@ -2643,22 +2646,20 @@ def main(argv: List[str] | None = None):
             eval_compatible_qat_model = ONNXExportablePicoDet(qat_eval_core, PostprocessorForONNX(model.head))
             eval_compatible_qat_model.to(dev).eval() # Ensure it's on device and in eval mode
 
-            # Track at multiple thresholds for fair comparison with FP32
-            for q_score_th in [0.05, 0.25]:
-                q_iou, q_acc, q_rec, q_pr = quick_val_iou(
-                    eval_compatible_qat_model, vl_loader, dev,
-                    score_thresh=q_score_th,
-                    iou_thresh=model.head.iou_th,
-                    max_detections=model.head.max_det,
-                    epoch_num=qep + 1,
-                    run_name=f"QAT_ep{qep+1}_score{q_score_th}",
-                    debug_prints=False,
-                    class_agnostic_nms=bool(cfg.class_agnostic_nms),
-                )
-                print(f"[QAT Eval] Epoch {qep + 1}/{qat_epochs} | Score > {q_score_th:0.2f} | Val IoU: {q_iou:.4f}  Acc: {q_acc:.3f}  Rec: {q_rec:.3f}  Pr: {q_pr:.3f}")
-                
-                if q_score_th == 0.05:
-                    current_qat_val_iou = q_iou # Use 0.05 for "best" tracking to match logic
+            # Track comprehensive metrics to match FP32 history
+            qat_epoch_metrics = run_epoch_validation(
+                eval_compatible_qat_model, vl_loader, dev, qep + 1, model.head,
+                class_agnostic_nms=bool(cfg.class_agnostic_nms),
+            )
+            qat_epoch_metrics['train_loss'] = lq if lq is not None else -1.0
+            qat_epoch_metrics['is_qat'] = True
+            qat_epoch_metrics.update(diag)
+            
+            # Record in global history (offset by FP32 epochs for chronological tracking)
+            abs_qep = fp32_epochs + qep + 1
+            training_history[abs_qep] = qat_epoch_metrics
+
+            current_qat_val_iou = qat_epoch_metrics.get('iou_at_5', 0.0)
 
             if current_qat_val_iou > best_qat_iou:
                 best_qat_iou = current_qat_val_iou
@@ -2995,7 +2996,7 @@ Faster runtime:
     Remove ESE (Effective Squeeze-Excitation)
 
 
-Suggested alternative epoch schedule:
+Possible alternative epoch schedule:
 ```python
         # ── Smooth schedule ramps (replaces brittle per-epoch elif ladder) ──
         # t ∈ [0, 1] is normalized training progress
@@ -3032,6 +3033,65 @@ Suggested alternative epoch schedule:
         # q_gamma: ramp after focal warmup ends
         if not use_focal_loss_for_epoch and t > 0.5:
             q_gamma = max(q_gamma, float(cfg.vfl_q_gamma_after_warmup))
+
+        # quality_floor_vfl: lower in second half for sharper targets
+        if t > 0.6:
+            quality_floor_vfl = 0.02
+
+        # assigner.min_iou_threshold: gently tighten in second half
+        if t > 0.65:
+            assigner.min_iou_threshold = max(cfg.simota_min_iou_threshold, 0.06)
+
+        if debug_prints and ep % max(1, fp32_epochs // 10) == 0:
+            print(f"[Schedule] ep={ep} t={t:.2f} | CLS_W={CLS_WEIGHT:.2f} IOU_W={IOU_WEIGHT:.2f} "
+                  f"r={assigner.r:.2f} k={assigner.k} dk_min={assigner.dynamic_k_min} "
+                  f"cls_cost_w={assigner.cls_cost_weight:.2f} q_gamma={q_gamma:.2f}")
+```
+and another way to do this:
+```python
+        # ── Smooth schedule ramps (replaces brittle per-epoch elif ladder) ──
+        # t ∈ [0, 1] is normalized training progress
+        t = ep / max(fp32_epochs - 1, 1)
+
+        # CLS_WEIGHT: ramp 0.5 → cfg target over first 40% of training
+        # This addresses the "destroying training" early on by introducing cls cost slowly.
+        CLS_WEIGHT = 0.5 + (cfg.simota_cls_cost_weight - 0.5) * min(t / 0.4, 1.0)
+        assigner.cls_cost_weight = CLS_WEIGHT
+
+        # IOU_WEIGHT: hold at 4.0 for first 50%, then ease to 2.5
+        IOU_WEIGHT = 4.0 if t < 0.5 else 4.0 - 1.5 * ((t - 0.5) / 0.5)
+
+        # assigner.r: ramp from 5.25 → cfg.simota_ctr over full training
+        assigner.r = 5.25 - (5.25 - cfg.simota_ctr) * t
+
+        # assigner.k: start 12, step down to 10 at 20%, then to cfg.simota_topk at 60%
+        if t < 0.2:
+            assigner.k = 12
+        elif t < 0.6:
+            assigner.k = 10
+        else:
+            assigner.k = cfg.simota_topk
+
+        # assigner.dynamic_k_min: 5 → 3 → cfg target
+        if t < 0.1:
+            assigner.dynamic_k_min = 5
+        elif t < 0.25:
+            assigner.dynamic_k_min = 3
+        else:
+            assigner.dynamic_k_min = cfg.simota_dynamic_k_min
+
+        # q_gamma & focal logic: ramp after focal warmup ends
+        if not use_focal_loss_for_epoch and t > 0.5:
+            q_gamma = max(q_gamma, float(cfg.vfl_q_gamma_after_warmup))
+            if t > 0.8:
+                q_gamma = max(q_gamma, float(cfg.vfl_q_gamma_after_warmup) + 0.5) # Sharpen late
+                gamma_loss = 2.5 # Extra bg suppression late
+
+        # background_weight: ramp up later to punish FPs more aggressively
+        if t > 0.6:
+            background_weight = max(background_weight, 1.25)
+            if t > 0.8:
+                background_weight = max(background_weight, 1.6)
 
         # quality_floor_vfl: lower in second half for sharper targets
         if t > 0.6:

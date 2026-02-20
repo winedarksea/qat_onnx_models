@@ -399,7 +399,8 @@ class PicoDetHead(nn.Module):
                  img_size: int = 224,
                  cls_conv_depth: int = 3,
                  reg_conv_depth: int = 2,
-                 inplace_act: bool = False):
+                 inplace_act: bool = False,
+                 use_ghost_cls: bool = True):
         super().__init__()
         self.nc = num_classes
         self.reg_max = reg_max
@@ -432,17 +433,19 @@ class PicoDetHead(nn.Module):
         dfl_project_tensor = torch.arange(self.reg_max + 1, dtype=torch.float32)
         self.register_buffer('dfl_project_buffer', dfl_project_tensor, persistent=False)
 
+        # Classification branch: optional standard Conv for better discrimination
+        ClsBlock = GhostConv if use_ghost_cls else ConvBNAct
         if self.cls_conv_depth <= 1:
             self.cls_conv = nn.ModuleList([
                 nn.Sequential(
-                    GhostConv(num_feats, num_feats, k=first_cls_conv_k, inplace_act=inplace_act)
+                    ClsBlock(num_feats, num_feats, k=first_cls_conv_k, inplace_act=inplace_act)
                 ) for _ in range(self.nl)
             ])
         else:
             self.cls_conv = nn.ModuleList([
                 nn.Sequential(
-                    GhostConv(num_feats, num_feats, k=first_cls_conv_k, inplace_act=inplace_act),
-                    *[GhostConv(num_feats, num_feats, inplace_act=inplace_act) for _ in range(self.cls_conv_depth - 1)]
+                    ClsBlock(num_feats, num_feats, k=first_cls_conv_k, inplace_act=inplace_act),
+                    *[ClsBlock(num_feats, num_feats, inplace_act=inplace_act) for _ in range(self.cls_conv_depth - 1)]
                 ) for _ in range(self.nl)
             ])
         self.reg_conv = nn.ModuleList([
@@ -605,7 +608,9 @@ class PicoDet(nn.Module):
                  cls_conv_depth: int = 3,
                  reg_conv_depth: int = 2,
                  lat_k: int = 5,
-                 inplace_act_for_head_neck: bool = False):
+                 inplace_act_for_head_neck: bool = False,
+                 use_ghost_cls: bool = False,
+                 use_spatial_attention: bool = True):
         super().__init__()
         self.pre = ResizeNorm(size=(img_size, img_size)) 
         self.backbone = backbone
@@ -613,6 +618,11 @@ class PicoDet(nn.Module):
         num_fpn_levels = len(feat_chs)
         self.num_fpn_levels = num_fpn_levels
         self.img_size = img_size
+
+        if use_spatial_attention:
+            self.sa = nn.ModuleList([SpatialAttention() for _ in range(num_fpn_levels)])
+        else:
+            self.sa = None
         
         self.head = PicoDetHead(
             num_classes=num_classes, 
@@ -627,13 +637,20 @@ class PicoDet(nn.Module):
             reg_conv_depth=reg_conv_depth,
             cls_conv_depth=cls_conv_depth,
             inplace_act=inplace_act_for_head_neck,
+            use_ghost_cls=use_ghost_cls
         )
 
     def forward(self, x: torch.Tensor):
         x = self.pre(x)
         backbone_features = self.backbone(x)
-        neck_outputs = self.neck(backbone_features)
-        return self.head(neck_outputs)
+        neck_outputs = list(self.neck(backbone_features))
+        
+        # Apply Spatial Attention to neck features before head
+        if self.sa is not None:
+            for i in range(len(neck_outputs)):
+                neck_outputs[i] = self.sa[i](neck_outputs[i])
+
+        return self.head(tuple(neck_outputs))
 
 
 class ResizeNorm(nn.Module):
